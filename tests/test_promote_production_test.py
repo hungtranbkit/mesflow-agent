@@ -145,6 +145,13 @@ class PromoteProductionTestFlowTests(unittest.TestCase):
         self.assertTrue(state.get("test_pass"))
         self.assertEqual(state.get("test_target"), target_url)
 
+        # PROMOTION.json is mutable (unlike release.json/checksums.txt/the
+        # ZIP) and external tooling (scripts/promote-test.sh) reads it
+        # directly -- it must not silently drift from what the Agent itself
+        # believes.
+        release_promotion = agent.load_json(self.releases_dir / self.version / "PROMOTION.json", {})
+        self.assertEqual(release_promotion.get("production_test", {}).get("status"), "success")
+
     def test_promote_test_refuses_without_local_pass(self):
         agent.save_json(self.promo_file, {"version": self.version, "local_pass": False})
         with patch.object(agent, "MES_VERIFY_TIMEOUT", 5):

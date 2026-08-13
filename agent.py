@@ -13,7 +13,7 @@ from werkzeug.security import check_password_hash, generate_password_hash
 from werkzeug.utils import secure_filename
 import ota_control as ota
 
-AGENT_VERSION="2.17.1-docker-runtime"
+AGENT_VERSION="2.17.2-docker-runtime"
 AGENT_HOME=Path(os.environ.get("WORKSHOP_AGENT_HOME","/opt/mesflow-agent"))
 TARGET_HOME=Path(os.environ.get("WORKSHOP_TARGET_HOME","/opt/mesflow"))
 QA_HOME=Path(os.environ.get("MESFLOW_QA_HOME","/opt/mesflow-qa-center"))
@@ -227,6 +227,27 @@ def _reset_promotion_state(version,artifact):
         save_json(PROMOTION_STATE_FILE,state)
     return state
 
+def _sync_release_promotion_json(version,state):
+    """Mirror the tracked promotion state into
+    artifacts/releases/<version>/PROMOTION.json.
+
+    That per-release file (unlike release.json/checksums.txt/the ZIP) is
+    meant to be mutated as promotion progresses -- scripts/promote-test.sh
+    and any external tooling read it directly, so it must not silently
+    drift from what the Agent itself believes.
+    """
+    path=_release_dir_for(version)/"PROMOTION.json"
+    doc=load_json(path,{})
+    doc.update(version=version,image_digest=state.get("image_digest",""),source_commit=state.get("source_commit",""))
+    doc["local"]={"status":"success" if state.get("local_pass") else (state.get("local_status") or "NOT_DEPLOYED"),
+                  "message":state.get("local_message","")}
+    doc["production_test"]={"status":"success" if state.get("test_pass") else (state.get("test_status") or "NOT_DEPLOYED"),
+                             "message":state.get("test_message","")}
+    doc["production"]={"status":"success" if state.get("production_pass") else (state.get("production_status") or "NOT_DEPLOYED"),
+                        "message":state.get("production_message","")}
+    try: save_json(path,doc)
+    except OSError: pass  # best-effort; the Agent's own promotion-state.json remains authoritative
+
 def _update_promotion_state(version,artifact,**fields):
     """Merge fields into the tracked promotion state for `version`.
 
@@ -240,6 +261,7 @@ def _update_promotion_state(version,artifact,**fields):
     state.update(fields)
     with _promotion_lock:
         save_json(PROMOTION_STATE_FILE,state)
+    _sync_release_promotion_json(version,state)
     return state
 
 def _actual_running_mes_image_id():
