@@ -5,7 +5,7 @@ LABEL org.opencontainers.image.title="MESFlow Deploy Agent" \
       org.opencontainers.image.version="$AGENT_VERSION"
 
 RUN apk add --no-cache \
-      bash ca-certificates curl docker-cli docker-cli-compose openssh-client tzdata \
+      bash ca-certificates curl docker-cli docker-cli-compose git openssh-client tzdata \
     && apk add --no-cache --virtual .build-deps \
       build-base linux-headers python3-dev \
     && addgroup -S mesflow-agent \
