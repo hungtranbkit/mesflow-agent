@@ -1,0 +1,74 @@
+MESFlow Deploy Agent 2.19.0
+
+Agent version compatibility reporting + safe, no-SSH remote Agent updates.
+
+New:
+- API_PROTOCOL_VERSION (2) and AGENT_CAPABILITIES now reported on
+  /health and /api/status: image_release_receive, digest_verify,
+  remote_deploy, deploy_status, health_status, agent_self_update.
+  Compatibility is judged by these, never by comparing AGENT_VERSION
+  strings.
+- mes_status() now also reports migration_head (added in 2.18.0's
+  Production preflight work) directly on every /health/status call.
+- _agent_compatibility(): classifies a target as COMPATIBLE /
+  UPDATE_AVAILABLE / INCOMPATIBLE / OFFLINE / NOT_CONFIGURED. A legacy
+  Agent that predates capability reporting (no capabilities field at all)
+  is treated as UPDATE_AVAILABLE, not blocked -- it is not positively
+  verifiable, but existing legacy behavior (image-release receive/deploy)
+  has been demonstrated to work. Only a target that explicitly reports
+  capabilities and is missing a required one is INCOMPATIBLE.
+- Promote Production Test now runs this gate before uploading anything:
+  refuses with TARGET_AGENT_INCOMPATIBLE (naming the missing
+  capability), TARGET_AGENT_WRONG_ROLE, or TARGET_AGENT_BUILD_ENABLED as
+  appropriate. None of these ever fire solely because of a version
+  string mismatch.
+- New "Target Agents" table in the Release Manager UI: LOCAL /
+  PRODUCTION TEST / PRODUCTION rows showing Agent version, role,
+  protocol, capabilities-derived compatibility, MESFlow version, and
+  health. Refreshed on demand (read-only GET /api/status per target).
+- New safe Agent update artifact + pipeline (build once on DEV, never
+  copy source to a target):
+  - scripts/build-agent-release.sh: builds the Deploy Agent image once,
+    same immutable-once guard as mesflow/scripts/build-release.sh
+    (refuses to rebuild an already-released Agent version or retag an
+    existing image id). Produces
+    artifacts/deploy-agent/releases/<version>/AGENT_UPDATE_<version>.zip
+    (image tar + agent-release.json manifest + checksums.txt).
+  - updater/updater.py: a small, dependency-free (stdlib only) host-side
+    service, entirely independent of the mesflow-deploy-agent container
+    it manages -- so it survives an in-progress or failed update instead
+    of taking down its own recovery mechanism. Verifies checksums +
+    image id, `docker load`s the new image, runs `docker compose ... up
+    -d --no-build --force-recreate mesflow-deploy-agent` (scoped to that
+    one service only -- never mesflow-app, PostgreSQL, QA Center, or
+    nginx), polls /agent/health for the expected version+role, and
+    automatically rolls back to the previously recorded image if health
+    never comes up.
+  - updater/install-updater.sh: the ONE step in this whole flow that
+    uses SSH (first bootstrap only, per policy). Detects the target's
+    current compose layout (new single compose.yml+.env, or the older
+    layered docker/compose.linux.yml+overrides) without restructuring
+    it, bootstraps an env file from the currently running container's
+    real environment (read-only inspection), generates a bearer token,
+    and installs a systemd unit. After this one-time step, all normal
+    updates go over HTTP only.
+  - agent.py: POST /api/release-manager/update-agent pushes the latest
+    built artifact to a target's updater over HTTP (Authorization:
+    Bearer <token>, no SSH). Production requires
+    MESFLOW_PRODUCTION_PROMOTE_ENABLED=1 on this Agent AND an explicit
+    {"confirm": true} on every call.
+  - MESFLOW_PRODUCTION_TEST_AGENT_UPDATER_URL/_TOKEN and
+    MESFLOW_PRODUCTION_AGENT_UPDATER_URL/_TOKEN env vars configure the
+    targets (no values committed).
+- New docker/compose.production.override.yml (SERVER_ROLE=PRODUCTION,
+  MESFLOW_BUILD_ENABLED=0) -- Production Test already had one.
+
+Persistence: the updater only ever swaps AGENT_IMAGE in an env file and
+recreates the one container; /var/lib/mesflow-deploy-agent (release
+targets, promotion state, OTA metadata, ESP tutorial metadata, job
+history, config) is a bind mount untouched by container recreation.
+Covered by tests/test_updater.py.
+
+87/87 deploy-agent pytest (70 prior + 17 new: 9 for compatibility/gate,
+8 for the updater's artifact verification / update / rollback state
+machine).

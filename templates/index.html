@@ -32,6 +32,38 @@ body{font-family:Arial;margin:0;background:#f3f6fa;color:#172033}.top{background
 {% if release_summary.blocked.test %}<div>Promote Test blocked: {{release_summary.blocked.test}}</div>{% endif %}
 {% if release_summary.blocked.production %}<div>Promote Production blocked: {{release_summary.blocked.production}}</div>{% endif %}
 </div>
+<h3>Target Agents</h3>
+<p><button id="targetAgentsButton" class="secondary" type="button">Refresh Target Agents</button></p>
+{% set tat=target_agents %}
+{% if tat and tat.rows %}
+<div class="grid" style="grid-template-columns:repeat(3,1fr)">
+{% for row in tat.rows %}
+<div style="border:1px solid #2a2f3a;border-radius:8px;padding:10px">
+<b>{{row.name}}</b><br>
+{% if row.configured %}
+Agent: {{row.agent_version or '—'}}{% if row.latest_agent_version and row.agent_version and row.agent_version != row.latest_agent_version %} <span class="label">(latest: {{row.latest_agent_version}})</span>{% endif %}<br>
+Role: {{row.role or '—'}} · Protocol: {{row.api_protocol_version if row.api_protocol_version is not none else '—'}}<br>
+Build enabled: {{row.build_enabled}}<br>
+MESFlow: {{row.mesflow_version or '—'}} · healthy={{row.mesflow_healthy}}<br>
+Compatibility: <span class="{{'ok' if row.compatibility.status=='COMPATIBLE' else 'bad' if row.compatibility.status in ['INCOMPATIBLE','OFFLINE'] else 'run'}}">{{row.compatibility.status}}</span>
+{% if row.compatibility.reason %}<div class="label">{{row.compatibility.reason}}</div>{% endif %}
+{% if row.name != 'LOCAL' %}
+<p>
+{% set update_disabled = row.compatibility.status in ['OFFLINE','NOT_CONFIGURED','INCOMPATIBLE'] or not row.updater_configured %}
+<button class="{{'danger' if row.name=='PRODUCTION' else 'secondary'}} update-agent-btn" data-role="{{'PRODUCTION_TEST' if row.name=='PRODUCTION TEST' else 'PRODUCTION'}}" type="button" {% if update_disabled %}disabled{% endif %}>Update Agent</button>
+{% if not row.updater_configured %}<div class="label">Updater not configured (set MESFLOW_{{ 'PRODUCTION_TEST' if row.name=='PRODUCTION TEST' else 'PRODUCTION' }}_AGENT_UPDATER_URL/_TOKEN)</div>{% endif %}
+</p>
+{% endif %}
+{% else %}
+<span class="label">{{row.compatibility.reason}}</span>
+{% endif %}
+</div>
+{% endfor %}
+</div>
+{% if tat.checked_at %}<p class="label">Last checked: {{tat.checked_at}}</p>{% endif %}
+{% else %}<p class="label">Not checked yet this session.</p>{% endif %}
+{% if agent_update_job %}<p class="label" id="agentUpdateStatus">Agent update ({{agent_update_job.role}} {{agent_update_job.version or ''}}): <b>{{agent_update_job.status}}</b> — {{agent_update_job.message}}</p>{% endif %}
+
 <h3>Production Preflight <span class="label">(read-only — never uploads or deploys)</span></h3>
 <p><button id="releaseProdPreflightButton" class="secondary" type="button" {% if not release_summary.production_target_configured %}disabled{% endif %}>Run Production Preflight</button>
 {% if not release_summary.production_target_configured %}<span class="label"> — no target configured (set MESFLOW_PRODUCTION_AGENT_URL/_USER/_PASSWORD)</span>{% endif %}</p>
@@ -119,6 +151,34 @@ body{font-family:Arial;margin:0;background:#f3f6fa;color:#172033}.top{background
   runReleaseAction('releaseLocalButton','{{url_for("release_manager_deploy_local")}}','LOCAL_DEPLOYING — Đang deploy image release…','Local deploy failed',1200);
   runReleaseAction('releaseTestButton','{{url_for("release_manager_promote_test")}}','UPLOADING — Đang promote sang Production Test…','Promote Test failed',1500);
   runReleaseAction('releaseProdPreflightButton','{{url_for("release_manager_production_preflight")}}','Đang kiểm tra Production (read-only)…','Production preflight failed',700);
+  runReleaseAction('targetAgentsButton','{{url_for("release_manager_target_agents")}}','Đang kiểm tra Target Agents…','Refresh failed',700);
+  (function(){
+    document.querySelectorAll('.update-agent-btn').forEach(function(button){
+      button.onclick=async()=>{
+        const role=button.dataset.role;
+        const status=document.getElementById('releaseBuildStatus');
+        let confirmed=true, body={role:role};
+        if(role==='PRODUCTION'){
+          confirmed=confirm('Xác nhận cập nhật Deploy Agent trên PRODUCTION? Cần phê duyệt của con người và MESFLOW_PRODUCTION_PROMOTE_ENABLED=1 trên Agent này.');
+          body.confirm=true;
+        }
+        if(!confirmed)return;
+        button.disabled=true; if(status) status.textContent='Đang gửi Agent update artifact tới '+role+' (không qua SSH)…';
+        try{
+          const response=await fetch('{{url_for("release_manager_update_agent")}}',{method:'POST',credentials:'same-origin',
+            headers:{'Content-Type':'application/json','X-CSRF-Token':'{{csrf}}','X-Requested-With':'XMLHttpRequest'},
+            body:JSON.stringify(body)});
+          const payload=await response.json().catch(()=>({}));
+          if(!response.ok) throw new Error(payload.error||payload.detail||('HTTP '+response.status));
+          if(status) status.textContent='Agent update queued for '+role+'.';
+          setTimeout(()=>location.reload(),1500);
+        }catch(err){
+          if(status) status.textContent='Agent update failed: '+(err&&err.message?err.message:String(err));
+          button.disabled=false;
+        }
+      };
+    });
+  })();
   (function(){
     const button=document.getElementById('releaseProdButton'), status=document.getElementById('releaseBuildStatus');
     if(!button)return;

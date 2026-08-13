@@ -13,7 +13,17 @@ from werkzeug.security import check_password_hash, generate_password_hash
 from werkzeug.utils import secure_filename
 import ota_control as ota
 
-AGENT_VERSION="2.18.0-docker-runtime"
+AGENT_VERSION="2.19.0-docker-runtime"
+# Bumped when the wire contract changes in a way a caller might need to
+# branch on (new required fields, new endpoints a promotion depends on).
+# Independent of AGENT_VERSION: two different AGENT_VERSION builds can
+# share the same API_PROTOCOL_VERSION. Compatibility is judged by protocol
+# + capabilities, never by comparing version strings.
+API_PROTOCOL_VERSION=2
+# Capabilities this Agent build actually implements. A promotion (or the
+# DEV Target Agents table) checks REQUIRED_CAPABILITIES against this list
+# -- never AGENT_VERSION strings -- to decide COMPATIBLE/INCOMPATIBLE.
+AGENT_CAPABILITIES=["image_release_receive","digest_verify","remote_deploy","deploy_status","health_status","agent_self_update"]
 AGENT_HOME=Path(os.environ.get("WORKSHOP_AGENT_HOME","/opt/mesflow-agent"))
 TARGET_HOME=Path(os.environ.get("WORKSHOP_TARGET_HOME","/opt/mesflow"))
 QA_HOME=Path(os.environ.get("MESFLOW_QA_HOME","/opt/mesflow-qa-center"))
@@ -552,6 +562,147 @@ def _production_target():
     password=(os.environ.get("MESFLOW_PRODUCTION_AGENT_PASSWORD") or "").strip()
     return url,user,password
 
+# Capabilities a target Agent must have before DEV will promote a MESFlow
+# release to it. Deliberately excludes agent_self_update: a target can
+# receive MESFlow releases perfectly well without supporting the Agent
+# self-update protocol.
+REQUIRED_PROMOTION_CAPABILITIES={"image_release_receive","digest_verify","remote_deploy","deploy_status","health_status"}
+
+def _agent_compatibility(target_status):
+    """Classify a target Agent's /api/status (or None/error on unreachable)
+    as COMPATIBLE / UPDATE_AVAILABLE / INCOMPATIBLE / OFFLINE / NOT_CONFIGURED.
+
+    Never blocks solely because AGENT_VERSION strings differ -- only a
+    genuinely missing required capability makes it INCOMPATIBLE."""
+    if not target_status or target_status.get("_unreachable"):
+        return {"status":"OFFLINE","reason":str((target_status or {}).get("error") or "Target Agent unreachable"),"missing":[]}
+    caps=target_status.get("capabilities")
+    protocol=target_status.get("api_protocol_version")
+    if caps is None and protocol is None:
+        # Legacy Agent, predates capability reporting (API protocol 2). Its
+        # actual capabilities cannot be positively confirmed from this
+        # field alone -- but image-release receive/deploy/status/health
+        # have existed since well before this reporting feature, so treat
+        # it as usable and recommend an update rather than blocking it.
+        return {"status":"UPDATE_AVAILABLE",
+                "reason":f"Target Agent {target_status.get('agent_version','?')} does not report capabilities (predates API protocol {API_PROTOCOL_VERSION}). Treated as compatible based on legacy behavior; update recommended for explicit verification.",
+                "missing":[]}
+    caps=set(caps or [])
+    missing=sorted(REQUIRED_PROMOTION_CAPABILITIES-caps)
+    if missing:
+        return {"status":"INCOMPATIBLE",
+                "reason":f"Target Agent {target_status.get('agent_version','?')} lacks {', '.join(missing)}",
+                "missing":missing}
+    if canonical_version(str(target_status.get("agent_version") or ""))!=canonical_version(AGENT_VERSION):
+        return {"status":"UPDATE_AVAILABLE",
+                "reason":f"Target is {target_status.get('agent_version')}; DEV has {AGENT_VERSION} available",
+                "missing":[]}
+    return {"status":"COMPATIBLE","reason":"","missing":[]}
+
+def _query_target_agent(label,url_env,user_env,password_env):
+    """Read-only: login (if a target is configured) + GET /api/status only."""
+    url=(os.environ.get(url_env) or "").strip().rstrip("/")
+    row={"name":label,"role":None,"agent_version":None,"api_protocol_version":None,"capabilities":[],
+         "mesflow_version":None,"mesflow_healthy":None,"build_enabled":None,"configured":bool(url)}
+    if not url:
+        row["compatibility"]={"status":"NOT_CONFIGURED","reason":f"No target configured (set {url_env}/{user_env}/{password_env})","missing":[]}
+        return row
+    user=(os.environ.get(user_env) or "admin").strip(); password=(os.environ.get(password_env) or "").strip()
+    try:
+        if not password: raise _RemoteAgentError("no password configured")
+        opener,base,csrf=_remote_agent_client(url,user,password)
+        status=_remote_agent_get_json(opener,base,"/api/status")
+    except Exception as ex:
+        row["compatibility"]=_agent_compatibility({"_unreachable":True,"error":str(ex)})
+        return row
+    mes=status.get("mes") or {}
+    row.update(role=status.get("server_role"),agent_version=status.get("agent_version"),
+               api_protocol_version=status.get("api_protocol_version"),capabilities=status.get("capabilities") or [],
+               mesflow_version=mes.get("version"),mesflow_healthy=mes.get("healthy"),build_enabled=status.get("build_enabled"))
+    row["compatibility"]=_agent_compatibility(status)
+    return row
+
+def _target_agents_table():
+    local_mes=mes_status()
+    rows=[{"name":"LOCAL","role":SERVER_ROLE,"agent_version":AGENT_VERSION,"api_protocol_version":API_PROTOCOL_VERSION,
+           "capabilities":AGENT_CAPABILITIES,"mesflow_version":local_mes.get("version"),"mesflow_healthy":local_mes.get("healthy"),
+           "build_enabled":MESFLOW_BUILD_ENABLED,"configured":True,
+           "compatibility":{"status":"COMPATIBLE","reason":"","missing":[]}}]
+    rows.append(_query_target_agent("PRODUCTION TEST","MESFLOW_PRODUCTION_TEST_AGENT_URL","MESFLOW_PRODUCTION_TEST_AGENT_USER","MESFLOW_PRODUCTION_TEST_AGENT_PASSWORD"))
+    rows.append(_query_target_agent("PRODUCTION","MESFLOW_PRODUCTION_AGENT_URL","MESFLOW_PRODUCTION_AGENT_USER","MESFLOW_PRODUCTION_AGENT_PASSWORD"))
+    for row in rows[1:]:
+        row["latest_agent_version"]=AGENT_VERSION
+        row["updater_configured"]=bool(_agent_updater_target("PRODUCTION_TEST" if row["name"]=="PRODUCTION TEST" else "PRODUCTION")[0])
+    return rows
+
+# ---------------- Safe remote Agent update (no SSH) ----------------
+def _agent_releases_root():
+    return MESFLOW_SOURCE_DIR.parent/"artifacts"/"deploy-agent"/"releases"
+
+def _latest_agent_release():
+    root=_agent_releases_root()
+    if not root.is_dir(): return {}
+    candidates=sorted(root.glob("*/agent-release.json"),key=lambda p:p.stat().st_mtime,reverse=True)
+    if not candidates: return {}
+    manifest=load_json(candidates[0],{})
+    version=str(manifest.get("version") or "")
+    package=candidates[0].parent/f"AGENT_UPDATE_{version}.zip"
+    return {**manifest,"package":str(package),"package_exists":package.is_file()}
+
+def _agent_updater_target(role):
+    prefix="MESFLOW_PRODUCTION_TEST_AGENT" if role=="PRODUCTION_TEST" else "MESFLOW_PRODUCTION_AGENT"
+    url=(os.environ.get(f"{prefix}_UPDATER_URL") or "").strip().rstrip("/")
+    token=(os.environ.get(f"{prefix}_UPDATER_TOKEN") or "").strip()
+    return url,token
+
+def _push_agent_update(url,token,zip_path,timeout=300):
+    data=Path(zip_path).read_bytes()
+    req=urllib.request.Request(url+"/updater/update",data=data,method="POST",
+        headers={"Authorization":f"Bearer {token}","Content-Type":"application/zip","User-Agent":"MESFlow-Deploy-Agent-Updater"})
+    try:
+        with urllib.request.urlopen(req,timeout=timeout) as r:
+            return json.loads(r.read().decode("utf-8",errors="replace"))
+    except urllib.error.HTTPError as e:
+        body=e.read().decode("utf-8",errors="replace")
+        try: return json.loads(body)
+        except json.JSONDecodeError: return {"ok":False,"status":"FAILED","error":f"HTTP {e.code}: {body[:500]}"}
+
+def agent_update_job_update(status,message,**extra):
+    def mutate(s):
+        j=dict(s.get("agent_update_job") or {});j.update(status=status,message=message,updated_at=now_text(),**extra);s["agent_update_job"]=j
+    return update_state(mutate).get("agent_update_job")
+
+_agent_update_lock=threading.Lock()
+
+def _run_agent_update(role):
+    try:
+        release=_latest_agent_release()
+        if not release.get("package_exists"):
+            raise _RemoteAgentError("AGENT_ARTIFACT_NOT_FOUND: run scripts/build-agent-release.sh first")
+        url,token=_agent_updater_target(role)
+        if not url or not token:
+            raise _RemoteAgentError(f"AGENT_UPDATER_NOT_CONFIGURED: set the updater URL/token env vars for {role}")
+        if role=="PRODUCTION" and os.environ.get("MESFLOW_PRODUCTION_PROMOTE_ENABLED","").strip().lower() not in {"1","true","yes","on"}:
+            raise _RemoteAgentError("PRODUCTION_AGENT_UPDATE_NOT_APPROVED: set MESFLOW_PRODUCTION_PROMOTE_ENABLED=1 on this Agent for a Production Agent update")
+        agent_update_job_update("UPDATING",f"Pushing Agent update {release.get('version')} to {url} (no SSH)",role=role,version=release.get("version"))
+        result=_push_agent_update(url,token,release["package"])
+        status=str(result.get("status") or "FAILED")
+        if status not in {"SUCCESS","ROLLED_BACK"}: status="FAILED"
+        agent_update_job_update(status,json.dumps(result)[:1000],role=role,version=release.get("version"),result=result)
+    except Exception as exc:
+        code=str(exc) if isinstance(exc,_RemoteAgentError) else f"{type(exc).__name__}: {exc}"
+        agent_update_job_update("FAILED",code,role=role)
+    finally:
+        if _agent_update_lock.locked(): _agent_update_lock.release()
+
+def start_agent_update(role):
+    if not _agent_update_lock.acquire(False): raise RuntimeError("AGENT_UPDATE_ALREADY_RUNNING")
+    try:
+        agent_update_job_update("QUEUED","Agent update queued",role=role)
+        threading.Thread(target=_run_agent_update,args=(role,),daemon=True).start()
+    except Exception:
+        _agent_update_lock.release(); raise
+
 def _remote_agent_get_json(opener,base,path,timeout=20):
     req=urllib.request.Request(base+path,headers={"User-Agent":"MESFlow-Deploy-Agent-Promote"})
     with opener.open(req,timeout=timeout) as r:
@@ -625,8 +776,19 @@ def _run_promote_test(version):
         local_sha=sha(zip_path)
         if artifact.get("package_sha256") and artifact["package_sha256"]!=local_sha:
             raise _RemoteAgentError("PACKAGE_SHA_SELF_CHECK_FAILED")
-        promote_test_update("UPLOADING",f"Uploading {zip_path.name} (sha256={local_sha[:12]}...) to {url}",version=version)
         opener,base,csrf=_remote_agent_client(url,user,password)
+        # Version compatibility gate: online, correct role, required
+        # capabilities present, build disabled -- never blocks solely
+        # because AGENT_VERSION strings differ.
+        target_status=_remote_agent_get_json(opener,base,"/api/status")
+        compat=_agent_compatibility(target_status)
+        if compat["status"]=="INCOMPATIBLE":
+            raise _RemoteAgentError(f"TARGET_AGENT_INCOMPATIBLE: {compat['reason']}")
+        if target_status.get("server_role") not in ("PRODUCTION_TEST",):
+            raise _RemoteAgentError(f"TARGET_AGENT_WRONG_ROLE: expected PRODUCTION_TEST, target reports {target_status.get('server_role')!r}")
+        if target_status.get("build_enabled"):
+            raise _RemoteAgentError("TARGET_AGENT_BUILD_ENABLED: Production Test must not have source-build capability (MESFLOW_BUILD_ENABLED must be false)")
+        promote_test_update("UPLOADING",f"Uploading {zip_path.name} (sha256={local_sha[:12]}...) to {url}",version=version)
         _remote_agent_upload(opener,base,csrf,zip_path)
         promote_test_update("DEPLOYING",f"Deploying {version} on target (--no-build; server enforces image-release contract)",version=version)
         _remote_agent_deploy(opener,base,csrf,version)
@@ -2348,9 +2510,9 @@ def index():
     if tj and tj.get("log_file"): tj=dict(tj); tj["log_tail"]=tail(tj["log_file"],180)
     host=(request.host or "localhost").split(":",1)[0]
     ptj=st.get("promote_test_job")
-    return render_template("index.html",releases=list_releases(),mes=mes_status(),target_home=str(TARGET_HOME),job=j,history=st.get("history",[]),qa=qa_status(),qa_releases=list_qa_releases(),qa_home=str(QA_HOME),qa_job=qj,qa_history=st.get("qa_history",[]),tutorial_job=tj,tutorial_history=tj and st.get("tutorial_history",[]) or [],esp_tutorial=esp_tutorial_status(),esp_tutorial_job=st.get("esp_tutorial_job"),esp_builder_job=st.get("esp_builder_job"),esp_build_enabled=ESP_BUILD_ENABLED,esp_kiosk_source=str(ESP_KIOSK_SOURCE_DIR),release_build_job=st.get("release_build_job"),promote_test_job=ptj,release_summary=_release_summary(),mes_build_enabled=MESFLOW_BUILD_ENABLED,server_role=SERVER_ROLE,release_targets=_release_targets(),esp_tutorial_view_url=(os.environ.get("WORKSHOP_MES_PUBLIC_URL") or "").rstrip("/")+"/app?guide=esp-kiosk" if os.environ.get("WORKSHOP_MES_PUBLIC_URL") else "/app?guide=esp-kiosk",qa_open_url=f"http://{host}:{QA_PORT}/",csrf=session.get("csrf",""),agent_log=tail(AGENT_LOG,80),qa_log=tail(QA_LOG,100),agent_version=AGENT_VERSION)
+    return render_template("index.html",releases=list_releases(),mes=mes_status(),target_home=str(TARGET_HOME),job=j,history=st.get("history",[]),qa=qa_status(),qa_releases=list_qa_releases(),qa_home=str(QA_HOME),qa_job=qj,qa_history=st.get("qa_history",[]),tutorial_job=tj,tutorial_history=tj and st.get("tutorial_history",[]) or [],esp_tutorial=esp_tutorial_status(),esp_tutorial_job=st.get("esp_tutorial_job"),esp_builder_job=st.get("esp_builder_job"),esp_build_enabled=ESP_BUILD_ENABLED,esp_kiosk_source=str(ESP_KIOSK_SOURCE_DIR),release_build_job=st.get("release_build_job"),promote_test_job=ptj,agent_update_job=st.get("agent_update_job"),target_agents=load_json(CONFIG_DIR/"target-agents.json",{}),release_summary=_release_summary(),mes_build_enabled=MESFLOW_BUILD_ENABLED,server_role=SERVER_ROLE,release_targets=_release_targets(),esp_tutorial_view_url=(os.environ.get("WORKSHOP_MES_PUBLIC_URL") or "").rstrip("/")+"/app?guide=esp-kiosk" if os.environ.get("WORKSHOP_MES_PUBLIC_URL") else "/app?guide=esp-kiosk",qa_open_url=f"http://{host}:{QA_PORT}/",csrf=session.get("csrf",""),agent_log=tail(AGENT_LOG,80),qa_log=tail(QA_LOG,100),agent_version=AGENT_VERSION)
 @app.get("/api/status")
-def api_status():return jsonify({"agent_version":AGENT_VERSION,"runtime_mode":RUNTIME_MODE,"server_role":SERVER_ROLE,"build_enabled":MESFLOW_BUILD_ENABLED,"source_dir":str(MESFLOW_SOURCE_DIR),"deploy_enabled":DEPLOY_ENABLED,"host_ops_enabled":HOST_OPS_ENABLED,"mes":mes_status(),"qa":qa_status(),"job":load_state().get("job"),"qa_job":load_state().get("qa_job"),"tutorial_job":load_state().get("tutorial_job"),"esp_tutorial":esp_tutorial_status(),"esp_tutorial_job":load_state().get("esp_tutorial_job"),"release_build":load_state().get("release_build_job"),"promote_test_job":load_state().get("promote_test_job"),"release_summary":_release_summary()})
+def api_status():return jsonify({"agent_version":AGENT_VERSION,"api_protocol_version":API_PROTOCOL_VERSION,"capabilities":AGENT_CAPABILITIES,"runtime_mode":RUNTIME_MODE,"server_role":SERVER_ROLE,"build_enabled":MESFLOW_BUILD_ENABLED,"source_dir":str(MESFLOW_SOURCE_DIR),"deploy_enabled":DEPLOY_ENABLED,"host_ops_enabled":HOST_OPS_ENABLED,"mes":mes_status(),"qa":qa_status(),"job":load_state().get("job"),"qa_job":load_state().get("qa_job"),"tutorial_job":load_state().get("tutorial_job"),"esp_tutorial":esp_tutorial_status(),"esp_tutorial_job":load_state().get("esp_tutorial_job"),"release_build":load_state().get("release_build_job"),"promote_test_job":load_state().get("promote_test_job"),"agent_update_job":load_state().get("agent_update_job"),"release_summary":_release_summary()})
 
 @app.get("/api/release-manager")
 def release_manager():
@@ -2442,6 +2604,41 @@ def release_manager_production_preflight():
         return jsonify(ok=True,preflight=report)
     except Exception as exc:
         return jsonify(ok=False,error=str(exc)),409
+
+@app.post("/api/release-manager/target-agents")
+def release_manager_target_agents():
+    """Read-only: refreshes and returns the LOCAL/PRODUCTION TEST/PRODUCTION
+    compatibility table. Logs in + GET /api/status against each configured
+    target only."""
+    if not logged_in(): return jsonify(ok=False,error="AUTH_REQUIRED"),401
+    verify_csrf()
+    rows=_target_agents_table()
+    save_json(CONFIG_DIR/"target-agents.json",{"checked_at":now_text(),"rows":rows})
+    return jsonify(ok=True,rows=rows)
+
+@app.get("/api/release-manager/target-agents")
+def release_manager_target_agents_get():
+    if not logged_in(): return jsonify(ok=False,error="AUTH_REQUIRED"),401
+    return jsonify(ok=True,**load_json(CONFIG_DIR/"target-agents.json",{"checked_at":None,"rows":[]}))
+
+@app.post("/api/release-manager/update-agent")
+def release_manager_update_agent():
+    """Pushes the latest built Agent update artifact (scripts/build-agent-release.sh)
+    to the target's host-side updater over HTTP -- no SSH. Production
+    requires MESFLOW_PRODUCTION_PROMOTE_ENABLED=1 on this Agent AND an
+    explicit {"confirm": true} in the request body."""
+    if not logged_in(): return jsonify(ok=False,error="AUTH_REQUIRED"),401
+    verify_csrf()
+    role=str((request.get_json(silent=True) or {}).get("role") or request.form.get("role") or "").strip().upper()
+    if role not in ("PRODUCTION_TEST","PRODUCTION"):
+        return jsonify(ok=False,error="INVALID_ROLE"),400
+    if role=="PRODUCTION":
+        confirmed=bool((request.get_json(silent=True) or {}).get("confirm"))
+        if not confirmed:
+            return jsonify(ok=False,error="PRODUCTION_AGENT_UPDATE_REQUIRES_CONFIRM",
+                            detail="Production Agent update requires explicit human confirmation on every call."),403
+    try: start_agent_update(role); return jsonify(ok=True,role=role),202
+    except RuntimeError as exc: return jsonify(ok=False,error=str(exc)),409
 
 @app.get("/api/release-manager/production-preflight")
 def release_manager_production_preflight_get():
@@ -3037,7 +3234,7 @@ def change_password():
 @app.get("/live")
 def live():return {"ok":True,"agent_version":AGENT_VERSION,"runtime_mode":RUNTIME_MODE}
 @app.get("/health")
-def health():return {"ok":True,"agent_version":AGENT_VERSION,"runtime_mode":RUNTIME_MODE,"server_role":SERVER_ROLE,"build_enabled":MESFLOW_BUILD_ENABLED,"source_dir":str(MESFLOW_SOURCE_DIR),"deploy_enabled":DEPLOY_ENABLED,"host_ops_enabled":HOST_OPS_ENABLED,"mes":mes_status(),"qa":qa_status(),"job_running":job_running(),"qa_job_running":qa_job_running(),"tutorial_job_running":tutorial_job_running(),"esp_tutorial_job_running":_esp_tutorial_job_lock.locked(),"esp_tutorial":esp_tutorial_status()}
+def health():return {"ok":True,"agent_version":AGENT_VERSION,"api_protocol_version":API_PROTOCOL_VERSION,"capabilities":AGENT_CAPABILITIES,"runtime_mode":RUNTIME_MODE,"server_role":SERVER_ROLE,"build_enabled":MESFLOW_BUILD_ENABLED,"source_dir":str(MESFLOW_SOURCE_DIR),"deploy_enabled":DEPLOY_ENABLED,"host_ops_enabled":HOST_OPS_ENABLED,"mes":mes_status(),"qa":qa_status(),"job_running":job_running(),"qa_job_running":qa_job_running(),"tutorial_job_running":tutorial_job_running(),"esp_tutorial_job_running":_esp_tutorial_job_lock.locked(),"esp_tutorial":esp_tutorial_status()}
 def main():
     recover_interrupted_deploy(); job_running()
     append_log(f"Agent {AGENT_VERSION} start {HOST}:{PORT}, MES={MES_URL}, QA={QA_URL}")

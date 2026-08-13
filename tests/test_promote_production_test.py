@@ -56,6 +56,8 @@ class _FakeTargetAgent(http.server.BaseHTTPRequestHandler):
                 self.end_headers()
                 return
             self._send(200, json.dumps({
+                "server_role": "PRODUCTION_TEST", "build_enabled": False,
+                "agent_version": "2.16.10-docker-runtime",
                 "job": {"status": "success", "version": type(self).version},
                 "mes": {"healthy": True, "version": type(self).version,
                         "health_payload": {"schema_version": "x"}},
