@@ -43,6 +43,18 @@ class _FakeTargetAgent(http.server.BaseHTTPRequestHandler):
         if self.path in ("/login", "/"):
             self._send(200, '<input name="csrf" value="FAKECSRF123">')
         elif self.path == "/api/status":
+            # Mirrors the real Agent: /api/status is not login-exempt. An
+            # unauthenticated request must NOT get the JSON success payload
+            # -- it must be redirected to /login instead, exactly like the
+            # real Agent's @app.before_request protect(). This is what
+            # exposed the real bug: _remote_agent_status() used to build a
+            # bare, cookie-less request.
+            if "session=fake" not in (self.headers.get("Cookie") or ""):
+                self.send_response(302)
+                self.send_header("Location", "/login")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
             self._send(200, json.dumps({
                 "job": {"status": "success", "version": type(self).version},
                 "mes": {"healthy": True, "version": type(self).version,
@@ -126,6 +138,26 @@ class PromoteProductionTestFlowTests(unittest.TestCase):
         for k, v in self.old.items():
             setattr(agent, k, v)
         self.tmp.cleanup()
+
+    def test_release_summary_shows_live_promote_test_job_state(self):
+        # Real bug found live: the Production Test pipeline indicator sat
+        # at NOT_DEPLOYED through the entire upload+deploy (which visibly
+        # succeeded on the real remote target), only ever jumping straight
+        # to PASS/FAILED at the very end -- because _release_summary() read
+        # only the *persisted* promotion-state.json test_status, never the
+        # actively-running promote_test_job.
+        agent.save_json(agent.STATE_FILE, {
+            "promote_test_job": {"status": "DEPLOYING", "version": self.version},
+        })
+        summary = agent._release_summary()
+        self.assertEqual(summary["states"]["test"], "DEPLOYING")
+
+    def test_release_summary_ignores_live_job_for_a_different_version(self):
+        agent.save_json(agent.STATE_FILE, {
+            "promote_test_job": {"status": "DEPLOYING", "version": "1.2.3.4"},
+        })
+        summary = agent._release_summary()
+        self.assertNotEqual(summary["states"]["test"], "DEPLOYING")
 
     def test_promote_test_flow_logs_in_uploads_deploys_and_records_pass(self):
         target_url = f"http://127.0.0.1:{self.port}"

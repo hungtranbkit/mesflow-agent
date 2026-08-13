@@ -13,7 +13,7 @@ from werkzeug.security import check_password_hash, generate_password_hash
 from werkzeug.utils import secure_filename
 import ota_control as ota
 
-AGENT_VERSION="2.17.3-docker-runtime"
+AGENT_VERSION="2.17.4-docker-runtime"
 AGENT_HOME=Path(os.environ.get("WORKSHOP_AGENT_HOME","/opt/mesflow-agent"))
 TARGET_HOME=Path(os.environ.get("WORKSHOP_TARGET_HOME","/opt/mesflow"))
 QA_HOME=Path(os.environ.get("MESFLOW_QA_HOME","/opt/mesflow-qa-center"))
@@ -381,10 +381,21 @@ def _release_summary():
     elif not production_promote_enabled:
         production_block="Gate PASS, but production execution is disabled on this Agent until a human sets MESFLOW_PRODUCTION_PROMOTE_ENABLED=1 and clicks confirm."
     production_status=promotion.get("production_status") or ("READY" if gate_ok else "NOT_DEPLOYED")
+    # While a promote-test job is actively running (QUEUED/UPLOADING/
+    # DEPLOYING/VERIFYING) for this exact version, surface its live status
+    # instead of the last *persisted* test_status -- otherwise the UI's
+    # Production Test indicator sits at its old value (e.g. NOT_DEPLOYED)
+    # through the entire upload+deploy, only ever jumping straight to
+    # PASS/FAILED at the very end, never showing UPLOADING/DEPLOYING.
+    test_job=load_state().get("promote_test_job") or {}
+    tracked_version=str(promotion.get("version") or build.get("version") or "")
+    test_job_live=(test_job.get("status") in {"QUEUED","UPLOADING","DEPLOYING","VERIFYING"}
+                   and tracked_version and canonical_version(str(test_job.get("version") or ""))==canonical_version(tracked_version))
+    test_state=test_job.get("status") if test_job_live else promotion.get("test_status","NOT_DEPLOYED")
     return {"source_path":str(MESFLOW_SOURCE_DIR),"source_exists":MESFLOW_SOURCE_DIR.is_dir(),"source_version":version,"git":commit,
             "status":"clean" if MESFLOW_SOURCE_DIR.is_dir() else "missing","latest":build,"contamination":contamination,
             "states":{"build":build_state,"local":promotion.get("local_status","NOT_TESTED"),
-                      "test":promotion.get("test_status","NOT_DEPLOYED"),"production":production_status},
+                      "test":test_state,"production":production_status},
             "blocked":{"build":build_block,"local":local_block,"test":test_block,"production":production_block},
             "promotion":{**promotion,"expected_schema_revision":expected,"actual_schema_revision":actual,"schema_pass":schema_pass,
                         "production_gate":gate_ok,"production_promote_enabled":production_promote_enabled,
@@ -498,9 +509,14 @@ def _remote_agent_deploy(opener,base,csrf,version,timeout=600):
     with opener.open(req,timeout=timeout) as r:
         return r.status,r.read().decode("utf-8",errors="replace")
 
-def _remote_agent_status(base,timeout=15):
+def _remote_agent_status(opener,base,timeout=15):
+    # Must reuse the authenticated opener (session cookie from
+    # _remote_agent_client): /api/status is not in the Agent's login-exempt
+    # route list, so an unauthenticated request gets redirected to the
+    # login page's HTML instead of JSON, which then fails to parse as JSON
+    # -- silently masking a real remote success as a bogus timeout.
     req=urllib.request.Request(base+"/api/status",headers={"User-Agent":"MESFlow-Deploy-Agent-Promote"})
-    with urllib.request.urlopen(req,timeout=timeout) as r:
+    with opener.open(req,timeout=timeout) as r:
         return json.loads(r.read().decode("utf-8",errors="replace"))
 
 def _production_test_target():
@@ -541,7 +557,7 @@ def _run_promote_test(version):
         last={}
         while time.time()<deadline:
             time.sleep(3)
-            try: last=_remote_agent_status(base)
+            try: last=_remote_agent_status(opener,base)
             except Exception as ex: last={"error":str(ex)}; continue
             job=last.get("job") or {}
             if job.get("status")=="success" and canonical_version(str(job.get("version") or ""))==canonical_version(version):

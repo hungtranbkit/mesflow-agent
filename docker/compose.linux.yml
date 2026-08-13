@@ -3,7 +3,7 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile
-    image: ${AGENT_IMAGE:-mesflow-deploy-agent:2.17.3}
+    image: ${AGENT_IMAGE:-mesflow-deploy-agent:2.17.4}
     container_name: mesflow-deploy-agent
     restart: unless-stopped
     environment:
