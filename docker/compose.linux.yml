@@ -20,6 +20,13 @@ services:
       MESFLOW_INTERNAL_API_TOKEN: ${MESFLOW_INTERNAL_API_TOKEN:-}
       MESFLOW_DEPLOY_AGENT_TOKEN: ${MESFLOW_DEPLOY_AGENT_TOKEN:-}
       MESFLOW_QA_URL: http://mesflow-qa-center:8095
+      # Production Test promotion target. Values come only from the calling
+      # shell's environment (or an untracked, gitignored env file) at
+      # `docker compose up` time -- never hardcoded here and never
+      # committed. See docs/operations/BUILD_AND_PROMOTE.md.
+      MESFLOW_PRODUCTION_TEST_AGENT_URL: ${MESFLOW_PRODUCTION_TEST_AGENT_URL:-}
+      MESFLOW_PRODUCTION_TEST_AGENT_USER: ${MESFLOW_PRODUCTION_TEST_AGENT_USER:-}
+      MESFLOW_PRODUCTION_TEST_AGENT_PASSWORD: ${MESFLOW_PRODUCTION_TEST_AGENT_PASSWORD:-}
     volumes:
       - ${MESFLOW_AGENT_DATA_DIR:-/var/lib/mesflow-deploy-agent}:/data
       - /var/run/docker.sock:/var/run/docker.sock
