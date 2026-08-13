@@ -13,7 +13,7 @@ from werkzeug.security import check_password_hash, generate_password_hash
 from werkzeug.utils import secure_filename
 import ota_control as ota
 
-AGENT_VERSION="2.17.2-docker-runtime"
+AGENT_VERSION="2.17.3-docker-runtime"
 AGENT_HOME=Path(os.environ.get("WORKSHOP_AGENT_HOME","/opt/mesflow-agent"))
 TARGET_HOME=Path(os.environ.get("WORKSHOP_TARGET_HOME","/opt/mesflow"))
 QA_HOME=Path(os.environ.get("MESFLOW_QA_HOME","/opt/mesflow-qa-center"))
@@ -2266,16 +2266,21 @@ def release_manager_build():
 @app.post("/api/release-manager/deploy-local")
 def release_manager_deploy_local():
     if not logged_in(): return jsonify(ok=False,error="AUTH_REQUIRED"),401
-    job=load_state().get("release_build_job") or {}; artifact=job.get("latest") or {}
-    if not artifact.get("version"):
-        latest=_release_summary().get("latest") or {}
-        if latest.get("version"): artifact=_artifact_for_release(str(latest["version"])); job={"status":"SUCCESS","latest":artifact}
+    # Resolve the artifact to deploy straight from disk (release.json /
+    # image-info.json / the ZIP), not from the last release_build_job's
+    # transient status. A build attempt can legitimately end in FAILED (for
+    # example the immutable-release guard correctly refusing to rebuild an
+    # already-released version) while a perfectly valid, previously-built
+    # release for that same or another version still exists and remains
+    # deployable -- gating on "was the most recent build attempt SUCCESS"
+    # incorrectly blocked Deploy Local in exactly that situation.
     requested=(request.get_json(silent=True) or {}).get("version") or request.form.get("version")
     if requested:
         try: artifact=_artifact_for_release(norm(str(requested)))
         except Exception: artifact={}
-        if artifact.get("package_sha256"):
-            job={"status":"SUCCESS","latest":artifact}
+    else:
+        latest=_release_summary().get("latest") or {}
+        artifact=_artifact_for_release(str(latest["version"])) if latest.get("version") else {}
     if artifact.get("package") and Path(artifact["package"]).is_file():
         package=Path(artifact["package"]); extract=UPLOAD_DIR/f"local_release_{uuid.uuid4().hex}"; extract.mkdir(parents=True)
         try:
@@ -2287,7 +2292,8 @@ def release_manager_deploy_local():
             save_json(target/"agent_manifest.json",{"version":version,"source_name":package.name,"uploaded_at":now_text(),"sha256":sha(package)})
         finally: shutil.rmtree(extract,ignore_errors=True)
     version=str(artifact.get("version") or "")
-    if not version or job.get("status")!="SUCCESS": return jsonify(ok=False,error="LOCAL_BUILD_REQUIRED"),409
+    if not version or not artifact.get("package_sha256"):
+        return jsonify(ok=False,error="LOCAL_BUILD_REQUIRED"),409
     contamination=_release_contamination(version)
     if contamination.get("contaminated"):
         return jsonify(ok=False,error=f"RELEASE_CONTAMINATED: {contamination.get('reason')}"),409
