@@ -24,7 +24,14 @@ mkdir -p "$dist"
 build_tag="${image}__building_$$"
 cleanup_build_tag(){ docker rmi "$build_tag" >/dev/null 2>&1 || true; }
 trap cleanup_build_tag EXIT
-docker build -f docker/Dockerfile -t "$build_tag" .
+# --provenance=false --sbom=false: modern BuildKit embeds a build
+# attestation (timestamps, build info) in the image manifest by default,
+# which makes the final image id differ between separate `docker build`
+# invocations even when every layer is a 100% cache hit -- discovered live
+# when this guard correctly refused a rebuild it should have recognized as
+# idempotent. Disabling attestations restores byte-identical image ids for
+# byte-identical source, which the immutable-once guard depends on.
+docker build --provenance=false --sbom=false -f docker/Dockerfile -t "$build_tag" .
 new_id="$(docker image inspect "$build_tag" --format '{{.Id}}')"
 [[ "$new_id" == sha256:* ]] || die "IMAGE_ID_UNAVAILABLE"
 if docker image inspect "$image" >/dev/null 2>&1; then
