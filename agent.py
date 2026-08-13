@@ -39,10 +39,40 @@ QA_RELEASES_DIR=DATA_DIR/"qa_releases"; QA_UPLOAD_DIR=DATA_DIR/"qa_uploads"; QA_
 ESP_TUTORIAL_UPLOAD_DIR=DATA_DIR/"esp_tutorial_uploads"
 ESP_TUTORIAL_HOME=Path(os.environ.get("MESFLOW_ESP_TUTORIAL_HOME",str(TARGET_HOME/"runtime/tutorials/esp-kiosk")))
 ESP_TUTORIAL_MAX_MB=max(32,int(os.environ.get("MESFLOW_ESP_TUTORIAL_MAX_MB","512")))
+def _default_workspace_root() -> Path:
+    """Resolve the MESFlow workspace root when no explicit env var is set.
+
+    The Agent frequently runs as root (systemd `User=root`, or root inside
+    the Docker image), where `Path.home()` resolves to `/root` and silently
+    produces a non-existent `/root/workspace/mesflow` instead of the real
+    invoking user's workspace (e.g. `/home/dell/workspace/mesflow`). Prefer,
+    in order: an explicit override, the sudo-invoking user's home, the
+    login-owner of the controlling terminal, then finally `Path.home()`.
+    """
+    override = os.environ.get("MESFLOW_WORKSPACE_ROOT")
+    if override:
+        return Path(override).expanduser()
+    sudo_user = os.environ.get("SUDO_USER")
+    if sudo_user and sudo_user != "root":
+        candidate = Path(f"/home/{sudo_user}/workspace/mesflow")
+        if candidate.exists():
+            return candidate
+    if os.geteuid() == 0:
+        try:
+            login = os.getlogin()
+        except OSError:
+            login = ""
+        if login and login != "root":
+            candidate = Path(f"/home/{login}/workspace/mesflow")
+            if candidate.exists():
+                return candidate
+    return Path.home()/"workspace/mesflow"
+
+WORKSPACE_ROOT=_default_workspace_root()
 ESP_BUILD_ENABLED=os.environ.get("ESP_BUILD_ENABLED","1").strip().lower() in {"1","true","yes","on"}
-ESP_KIOSK_SOURCE_DIR=Path(os.environ.get("ESP_KIOSK_SOURCE_DIR",str(Path.home()/"workspace/mesflow/esp-kiosk"))).expanduser()
+ESP_KIOSK_SOURCE_DIR=Path(os.environ.get("ESP_KIOSK_SOURCE_DIR",str(WORKSPACE_ROOT/"esp-kiosk"))).expanduser()
 ESP_BUILDER_LOCK=threading.Lock()
-MESFLOW_SOURCE_DIR=Path(os.environ.get("MESFLOW_SOURCE_DIR",str(Path.home()/"workspace/mesflow/mesflow"))).expanduser()
+MESFLOW_SOURCE_DIR=Path(os.environ.get("MESFLOW_SOURCE_DIR",str(WORKSPACE_ROOT/"mesflow"))).expanduser()
 MESFLOW_BUILD_ENABLED=os.environ.get("MESFLOW_BUILD_ENABLED","1").strip().lower() in {"1","true","yes","on"}
 MESFLOW_BUILD_LOCK=threading.Lock()
 SERVER_ROLE=os.environ.get("SERVER_ROLE","DEV").strip().upper()

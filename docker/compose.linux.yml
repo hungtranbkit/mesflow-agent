@@ -3,7 +3,7 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile
-    image: ${AGENT_IMAGE:-mesflow-deploy-agent:2.16.1}
+    image: ${AGENT_IMAGE:-mesflow-deploy-agent:2.16.11}
     container_name: mesflow-deploy-agent
     restart: unless-stopped
     environment:
@@ -21,7 +21,7 @@ services:
       MESFLOW_DEPLOY_AGENT_TOKEN: ${MESFLOW_DEPLOY_AGENT_TOKEN:-}
       MESFLOW_QA_URL: http://mesflow-qa-center:8095
     volumes:
-      - ./runtime/agent-data:/data
+      - ${MESFLOW_AGENT_DATA_DIR:-/var/lib/mesflow-deploy-agent}:/data
       - /var/run/docker.sock:/var/run/docker.sock
       # Same absolute host/container path is intentional so Compose bind paths remain valid.
       - /opt/mesflow:/opt/mesflow

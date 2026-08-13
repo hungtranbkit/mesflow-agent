@@ -13,6 +13,25 @@ PORT="${WORKSHOP_AGENT_PORT:-8090}"
 MES_URL="${WORKSHOP_MES_URL:-http://127.0.0.1:8080}"
 QA_URL="${MESFLOW_QA_URL:-http://127.0.0.1:8095}"
 
+# Resolve the real invoking user's workspace so the Agent process (which runs
+# as root under systemd, where $HOME=/root) never guesses /root/workspace/mesflow.
+# Explicit MESFLOW_WORKSPACE_ROOT=/path always wins.
+if [ -n "${MESFLOW_WORKSPACE_ROOT:-}" ]; then
+  RESOLVED_WORKSPACE_ROOT="$MESFLOW_WORKSPACE_ROOT"
+elif [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
+  RESOLVED_WORKSPACE_ROOT="/home/$SUDO_USER/workspace/mesflow"
+else
+  LOGIN_USER="$(logname 2>/dev/null || true)"
+  if [ -n "$LOGIN_USER" ] && [ "$LOGIN_USER" != "root" ]; then
+    RESOLVED_WORKSPACE_ROOT="/home/$LOGIN_USER/workspace/mesflow"
+  else
+    echo "WARNING: could not detect invoking non-root user; workspace source paths" >&2
+    echo "         will default under \$HOME (root). Set MESFLOW_WORKSPACE_ROOT=/path to fix." >&2
+    RESOLVED_WORKSPACE_ROOT="$HOME/workspace/mesflow"
+  fi
+fi
+echo "Resolved MESFLOW_WORKSPACE_ROOT=$RESOLVED_WORKSPACE_ROOT"
+
 command -v python3 >/dev/null || { echo "python3 is required"; exit 1; }
 if ! python3 -m venv --help >/dev/null 2>&1; then
   apt-get update
@@ -43,6 +62,7 @@ WORKSHOP_AGENT_URL_PREFIX=/agent
 MESFLOW_QA_HOME=$QA_HOME
 MESFLOW_QA_URL=$QA_URL
 MESFLOW_QA_PORT=8095
+MESFLOW_WORKSPACE_ROOT=$RESOLVED_WORKSPACE_ROOT
 PYTHONUTF8=1
 EOF
 chmod 600 /etc/mesflow-deploy-agent.env

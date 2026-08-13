@@ -5,4 +5,4 @@ services:
       MESFLOW_BUILD_ENABLED: "1"
       MESFLOW_SOURCE_DIR: /workspace/mesflow/mesflow
     volumes:
-      - ../../:/workspace/mesflow
+      - ${MESFLOW_WORKSPACE_ROOT:-/home/dell/workspace/mesflow}:/workspace/mesflow
