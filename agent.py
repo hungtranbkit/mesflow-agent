@@ -13,7 +13,7 @@ from werkzeug.security import check_password_hash, generate_password_hash
 from werkzeug.utils import secure_filename
 import ota_control as ota
 
-AGENT_VERSION="2.17.4-docker-runtime"
+AGENT_VERSION="2.18.0-docker-runtime"
 AGENT_HOME=Path(os.environ.get("WORKSHOP_AGENT_HOME","/opt/mesflow-agent"))
 TARGET_HOME=Path(os.environ.get("WORKSHOP_TARGET_HOME","/opt/mesflow"))
 QA_HOME=Path(os.environ.get("MESFLOW_QA_HOME","/opt/mesflow-qa-center"))
@@ -358,7 +358,19 @@ def _release_summary():
     local_pass=bool(promotion.get("local_pass")); test_pass=bool(promotion.get("test_pass"))
     zip_ok=bool(promotion.get("zip_sha_unchanged")); digest_ok=bool(promotion.get("image_digest_unchanged"))
     production_promote_enabled=os.environ.get("MESFLOW_PRODUCTION_PROMOTE_ENABLED","").strip().lower() in {"1","true","yes","on"}
-    gate_ok=local_pass and test_pass and zip_ok and digest_ok and schema_pass and not contamination.get("contaminated")
+    # Production target health must come from a *fresh* read-only preflight,
+    # not a stale cached one — infrastructure can go unhealthy between
+    # checks, so an old "healthy" result must not silently keep gating
+    # PASS. PREFLIGHT_MAX_AGE_SECONDS matches the window an operator would
+    # reasonably trust without re-checking immediately before promoting.
+    preflight=load_json(CONFIG_DIR/"production-preflight.json",{})
+    PREFLIGHT_MAX_AGE_SECONDS=900
+    preflight_age=None
+    try: preflight_age=(datetime.now()-datetime.strptime(preflight.get("checked_at",""),"%Y-%m-%d %H:%M:%S")).total_seconds()
+    except (ValueError,TypeError): pass
+    preflight_fresh=preflight_age is not None and 0<=preflight_age<=PREFLIGHT_MAX_AGE_SECONDS
+    target_healthy=preflight_fresh and bool(preflight.get("healthy"))
+    gate_ok=local_pass and test_pass and zip_ok and digest_ok and schema_pass and not contamination.get("contaminated") and target_healthy
     # Exact blocking reason, so the UI never just shows a disabled button.
     build_block=None if MESFLOW_BUILD_ENABLED else "Build is disabled on this Agent (MESFLOW_BUILD_ENABLED=0 — this host is not DEV)."
     local_block=None
@@ -377,6 +389,13 @@ def _release_summary():
         if not digest_ok: missing.append("image digest unchanged")
         if not schema_pass: missing.append("schema PASS")
         if contamination.get("contaminated"): missing.append("release not contaminated")
+        if not target_healthy:
+            if not (os.environ.get("MESFLOW_PRODUCTION_AGENT_URL") or "").strip():
+                missing.append("Production target not configured (set MESFLOW_PRODUCTION_AGENT_URL/_USER/_PASSWORD)")
+            elif not preflight_fresh:
+                missing.append(f"Production preflight missing or stale (>{PREFLIGHT_MAX_AGE_SECONDS//60}min old — run Production Preflight)")
+            else:
+                missing.append("Production preflight reports unhealthy")
         production_block="Blocked: "+", ".join(missing) if missing else "Blocked"
     elif not production_promote_enabled:
         production_block="Gate PASS, but production execution is disabled on this Agent until a human sets MESFLOW_PRODUCTION_PROMOTE_ENABLED=1 and clicks confirm."
@@ -397,6 +416,8 @@ def _release_summary():
             "states":{"build":build_state,"local":promotion.get("local_status","NOT_TESTED"),
                       "test":test_state,"production":production_status},
             "blocked":{"build":build_block,"local":local_block,"test":test_block,"production":production_block},
+            "production_preflight":preflight,"production_preflight_fresh":preflight_fresh,"production_target_healthy":target_healthy,
+            "production_target_configured":bool((os.environ.get("MESFLOW_PRODUCTION_AGENT_URL") or "").strip()),
             "promotion":{**promotion,"expected_schema_revision":expected,"actual_schema_revision":actual,"schema_pass":schema_pass,
                         "production_gate":gate_ok,"production_promote_enabled":production_promote_enabled,
                         "history":["Built" if build.get("version") else "Not built",
@@ -524,6 +545,62 @@ def _production_test_target():
     user=(os.environ.get("MESFLOW_PRODUCTION_TEST_AGENT_USER") or "admin").strip()
     password=(os.environ.get("MESFLOW_PRODUCTION_TEST_AGENT_PASSWORD") or "").strip()
     return url,user,password
+
+def _production_target():
+    url=(os.environ.get("MESFLOW_PRODUCTION_AGENT_URL") or "").strip().rstrip("/")
+    user=(os.environ.get("MESFLOW_PRODUCTION_AGENT_USER") or "admin").strip()
+    password=(os.environ.get("MESFLOW_PRODUCTION_AGENT_PASSWORD") or "").strip()
+    return url,user,password
+
+def _remote_agent_get_json(opener,base,path,timeout=20):
+    req=urllib.request.Request(base+path,headers={"User-Agent":"MESFlow-Deploy-Agent-Promote"})
+    with opener.open(req,timeout=timeout) as r:
+        return json.loads(r.read().decode("utf-8",errors="replace"))
+
+def _target_preflight(opener,base):
+    """Read-only production preflight: GET only, via the already-authenticated
+    session. Never uploads a release and never calls /deploy/<version>."""
+    status=_remote_agent_get_json(opener,base,"/api/status")
+    try: ops=_remote_agent_get_json(opener,base,"/api/ops/summary")
+    except Exception as ex: ops={"error":str(ex)}
+    try: backups=_remote_agent_get_json(opener,base,"/api/ops/backups")
+    except Exception as ex: backups={"error":str(ex)}
+    mes=status.get("mes") or {}; docker=mes.get("docker") or {}
+    job=status.get("job") or {}
+    job_running=job.get("status") in {"queued","uploading","validating","building","deploying","verifying"}
+    build_disabled=(status.get("build_enabled") is False)
+    postgres_health=(docker.get("service_health") or {}).get("postgres","unknown")
+    disk=ops.get("disk") if isinstance(ops,dict) else None
+    disk_ok=bool(disk) and disk.get("percent") is not None and disk.get("percent")<90
+    mes_healthy=bool(mes.get("healthy"))
+    ops_reachable=isinstance(ops,dict) and "error" not in ops
+    backups_reachable=isinstance(backups,dict) and "error" not in backups
+    healthy=(mes_healthy and build_disabled and status.get("deploy_enabled") is True
+             and postgres_health in ("healthy","none") and not job_running
+             and ops_reachable and (not disk or disk_ok))
+    return {
+        "checked_at":now_text(),
+        "agent":{"version":status.get("agent_version"),"server_role":status.get("server_role"),
+                 "build_enabled":status.get("build_enabled"),"deploy_enabled":status.get("deploy_enabled"),
+                 "job_running":job_running},
+        "mes":{"version":mes.get("version"),"healthy":mes_healthy,"schema_actual":mes.get("migration_head") or ""},
+        "postgres":{"health":postgres_health},
+        "disk":disk or {"note":"unavailable"},
+        "docker":{"running":ops.get("docker_running") if ops_reachable else None,
+                  "unhealthy":ops.get("docker_unhealthy") if ops_reachable else None} if ops_reachable else {"error":ops.get("error")},
+        "backups":backups if backups_reachable else {"error":backups.get("error")},
+        "release_compatible":bool(status.get("deploy_enabled")) and build_disabled,
+        "healthy":healthy,
+    }
+
+def _run_production_preflight():
+    url,user,password=_production_target()
+    if not url or not password:
+        raise _RemoteAgentError("PRODUCTION_AGENT_NOT_CONFIGURED: set MESFLOW_PRODUCTION_AGENT_URL/_USER/_PASSWORD")
+    opener,base,csrf=_remote_agent_client(url,user,password)
+    report=_target_preflight(opener,base)
+    save_json(CONFIG_DIR/"production-preflight.json",report)
+    return report
 
 def promote_test_update(status,message,**extra):
     def mutate(s):
@@ -828,13 +905,20 @@ def _classify_health(payload, http_status):
 def mes_status():
     docker_state=_docker_mes_state()
     v,vs=http_json("/api/system/version");h,hs=http_json("/api/system/health")
+    # /api/system/ready exposes the real applied Alembic head (migration_head).
+    # Deliberately not health_payload's schema_version, an app-defined label
+    # that looks like a version string -- see AGENTS.md: never infer schema
+    # from the app version. Read-only, best-effort: absence must never make
+    # mes_status() itself fail.
+    ready,readys=http_json("/api/system/ready")
+    migration_head=str(ready.get("migration_head") or "") if readys==200 else ""
     health_state=_classify_health(h,hs)
     api_online=(vs==200)
     online=api_online or bool(docker_state.get("running"))
     if online and health_state=="failed" and docker_state.get("running"):
         # Nginx/backend may intentionally not expose 8080 to the host. Do not call the server OFFLINE.
         health_state="running" if hs==0 else "warning"
-    return {"online":online,"healthy":health_state in ("healthy","warning","running"),"health_state":health_state,"version":v.get("version") or current_file_version(),"deployment_id":v.get("deployment_id",""),"version_payload":v,"health_payload":h,"docker":docker_state,"api_online":api_online}
+    return {"online":online,"healthy":health_state in ("healthy","warning","running"),"health_state":health_state,"version":v.get("version") or current_file_version(),"deployment_id":v.get("deployment_id",""),"version_payload":v,"health_payload":h,"migration_head":migration_head,"docker":docker_state,"api_online":api_online}
 def list_releases():
     out=[]
     for x in RELEASES_DIR.iterdir():
@@ -2346,6 +2430,24 @@ def release_manager_promote_test():
     try: start_promote_test(version); return jsonify(ok=True,version=version),202
     except RuntimeError as exc: return jsonify(ok=False,error=str(exc)),409
 
+@app.post("/api/release-manager/production-preflight")
+def release_manager_production_preflight():
+    """Read-only: logs in and issues GET requests only (/api/status,
+    /api/ops/summary, /api/ops/backups) against the configured Production
+    Agent. Never uploads a release, never calls /deploy/<version>."""
+    if not logged_in(): return jsonify(ok=False,error="AUTH_REQUIRED"),401
+    verify_csrf()
+    try:
+        report=_run_production_preflight()
+        return jsonify(ok=True,preflight=report)
+    except Exception as exc:
+        return jsonify(ok=False,error=str(exc)),409
+
+@app.get("/api/release-manager/production-preflight")
+def release_manager_production_preflight_get():
+    if not logged_in(): return jsonify(ok=False,error="AUTH_REQUIRED"),401
+    return jsonify(ok=True,preflight=load_json(CONFIG_DIR/"production-preflight.json",{}))
+
 @app.post("/api/release-manager/promote-production")
 def release_manager_promote_production():
     """Wired but never executes without explicit human approval:
@@ -2622,6 +2724,31 @@ def ops_summary():
             "failed_services":len(failed),"docker_running":len([x for x in docker.get("stdout","").splitlines() if x.strip()]),
             "docker_unhealthy":uh,"mes":mes,"qa":qa}
 
+def ops_backups():
+    """Read-only rollback/backup readiness: what _create_linux_backup() has
+    produced so far, and free space where the next one would land. Never
+    creates, deletes or restores anything."""
+    root=DATA_DIR/"mes_backups"
+    entries=[]
+    if root.is_dir():
+        for d in sorted(root.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True):
+            if not d.is_dir(): continue
+            first_install=(d/"FIRST_INSTALL_BACKUP_MARKER").is_file() or any(d.glob(".mesflow_first_install_baseline"))
+            version=""
+            vfile=d/"VERSION.txt"
+            if vfile.is_file():
+                try: version=vfile.read_text(encoding="utf-8-sig").strip()
+                except OSError: pass
+            entries.append({"name":d.name,"modified_at":datetime.fromtimestamp(d.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S"),
+                             "version":version,"first_install_baseline":first_install})
+    try:
+        free_bytes=shutil.disk_usage(root if root.is_dir() else DATA_DIR).free
+    except OSError:
+        free_bytes=None
+    return {"count":len(entries),"most_recent":entries[0] if entries else None,"entries":entries[:20],
+            "free_space":_bytes(free_bytes) if free_bytes is not None else "unknown",
+            "mechanism":"automatic: a fresh backup of the current release is created immediately before every deploy cutover; rollback restores it if verification fails"}
+
 def ops_services():
     if os.name=='nt': return []
     cmd=["systemctl","list-units","--type=service","--all","--no-legend","--plain","--no-pager"]
@@ -2683,6 +2810,9 @@ def ops_page():
 
 @app.get('/api/ops/summary')
 def api_ops_summary(): return jsonify(ops_summary())
+
+@app.get('/api/ops/backups')
+def api_ops_backups(): return jsonify(ops_backups())
 
 @app.get('/api/ops/services')
 def api_ops_services(): return jsonify({"items":ops_services()})

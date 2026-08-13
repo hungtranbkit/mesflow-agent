@@ -32,6 +32,27 @@ body{font-family:Arial;margin:0;background:#f3f6fa;color:#172033}.top{background
 {% if release_summary.blocked.test %}<div>Promote Test blocked: {{release_summary.blocked.test}}</div>{% endif %}
 {% if release_summary.blocked.production %}<div>Promote Production blocked: {{release_summary.blocked.production}}</div>{% endif %}
 </div>
+<h3>Production Preflight <span class="label">(read-only — never uploads or deploys)</span></h3>
+<p><button id="releaseProdPreflightButton" class="secondary" type="button" {% if not release_summary.production_target_configured %}disabled{% endif %}>Run Production Preflight</button>
+{% if not release_summary.production_target_configured %}<span class="label"> — no target configured (set MESFLOW_PRODUCTION_AGENT_URL/_USER/_PASSWORD)</span>{% endif %}</p>
+{% set pf=release_summary.production_preflight %}
+{% if pf and pf.checked_at %}
+<div class="grid">
+<div><div class="label">Target</div>
+<b>Checked at:</b> {{pf.checked_at}} ({{'fresh' if release_summary.production_preflight_fresh else 'STALE — re-run before promoting'}})<br>
+<b>Agent:</b> {{pf.agent.version or '—'}} · role={{pf.agent.server_role or '—'}} · build_enabled={{pf.agent.build_enabled}}<br>
+<b>Deploy job running:</b> {{pf.agent.job_running}}<br>
+<b>MESFlow version:</b> {{pf.mes.version or '—'}} · <b>healthy:</b> {{pf.mes.healthy}}<br>
+<b>Schema (actual):</b> {{pf.mes.schema_actual or '—'}}</div>
+<div><div class="label">Infrastructure</div>
+<b>Postgres:</b> {{pf.postgres.health if pf.postgres else '—'}}<br>
+<b>Disk:</b> {% if pf.disk and pf.disk.percent is defined %}{{pf.disk.percent}}% used ({{pf.disk.free}} free of {{pf.disk.total}}){% else %}unavailable{% endif %}<br>
+<b>Docker:</b> {% if pf.docker and pf.docker.running is defined %}{{pf.docker.running}} running, {{pf.docker.unhealthy}} unhealthy{% else %}unavailable{% endif %}<br>
+<b>Backup readiness:</b> {% if pf.backups and pf.backups.count is defined %}{{pf.backups.count}} backup(s) kept, {{pf.backups.free_space}} free{% if pf.backups.most_recent %}, most recent {{pf.backups.most_recent.modified_at}}{% endif %}{% else %}unavailable{% endif %}<br>
+<b>Release compatible:</b> {{pf.release_compatible}}<br>
+<b>Overall:</b> <span class="{{'ok' if pf.healthy else 'bad'}}">{{'HEALTHY' if pf.healthy else 'NOT READY'}}</span></div>
+</div>
+{% else %}<p class="label">No preflight has been run yet.</p>{% endif %}
 <h3>Release history</h3><p class="label">{{release_summary.promotion.history|join(' → ')}}</p></section>
 {% if job %}<div class="card"><h3>MES Deployment {{job.from_version}} → {{job.version}}</h3><div class="job-phases" aria-label="Trạng thái triển khai">{% for p,label in [('queued','Đã xếp hàng'),('uploading','Đã nhận ZIP'),('validating','Đang kiểm tra'),('building','Đang build'),('deploying','Đang deploy'),('verifying','Đang xác minh'),('success','Hoàn tất'),('failed','Thất bại')] %}<span class="job-phase {{'current' if job.status==p else 'done' if (job.transitions|selectattr('status','equalto',p)|list)|length else 'failed' if job.status=='failed' and p=='failed' else ''}}">{{label}}</span>{% endfor %}</div><div class="steps">{% for n in ['stage','backup','install','restart','health','version','rollback'] %}{% set x=job.steps.get(n,{}) %}<div class="step {{'success' if x.status=='success' else 'error' if x.status=='failed' else 'warning' if x.status=='warning' else 'skipped' if x.status=='skipped' else ''}}"><b>{{n}}</b><br><span class="{{'ok' if x.status=='success' else 'bad' if x.status=='failed' else 'run'}}">{{x.status or 'pending'}}</span><br>{{x.message or ''}}</div>{% endfor %}</div><p><b>{{job.status}}</b> — {{job.message}}</p><pre>{{job.log_tail}}</pre></div>{% endif %}
 <div class="card full" style="border-top:4px solid #0f766e">
@@ -97,6 +118,7 @@ body{font-family:Arial;margin:0;background:#f3f6fa;color:#172033}.top{background
   runReleaseAction('releaseBuildButton','{{url_for("release_manager_build")}}','QUEUED — Đang build image…','Build failed',700);
   runReleaseAction('releaseLocalButton','{{url_for("release_manager_deploy_local")}}','LOCAL_DEPLOYING — Đang deploy image release…','Local deploy failed',1200);
   runReleaseAction('releaseTestButton','{{url_for("release_manager_promote_test")}}','UPLOADING — Đang promote sang Production Test…','Promote Test failed',1500);
+  runReleaseAction('releaseProdPreflightButton','{{url_for("release_manager_production_preflight")}}','Đang kiểm tra Production (read-only)…','Production preflight failed',700);
   (function(){
     const button=document.getElementById('releaseProdButton'), status=document.getElementById('releaseBuildStatus');
     if(!button)return;

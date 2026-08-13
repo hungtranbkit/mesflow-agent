@@ -1,0 +1,50 @@
+MESFlow Deploy Agent 2.18.0
+
+Finalizes the Deploy Agent fixes found live during the first real
+Production Test promotion (65.8.44.69, 2026-08-13) and adds read-only
+Production preflight.
+
+Fixes since 2.17.0 (Promote Production Test first shipped):
+- 2.17.1: added git to the Agent's own Docker image, and scoped
+  `git -c safe.directory='*'` in build-release.sh -- source_commit was
+  always recorded as "unknown" otherwise.
+- 2.17.2: sync artifacts/releases/<version>/PROMOTION.json when the
+  Agent's own promotion-state.json changes, so external tooling
+  (scripts/promote-test.sh) never disagrees with what the Agent believes.
+- 2.17.3: Deploy Local no longer blocked by a stale FAILED build job --
+  it now gates on whether a valid artifact exists on disk
+  (release.json/image-info.json/the ZIP), not on the most recent build
+  attempt's transient status. A correctly-rejected duplicate build (the
+  immutable-release guard working as designed) was silently blocking
+  redeployment of the still-valid prior release.
+- 2.17.4: _remote_agent_status() now reuses the authenticated session
+  opener -- it previously built a bare, cookie-less request, which
+  /api/status (not login-exempt) answered with a login-page redirect
+  instead of JSON, turning a real remote deploy success into a false
+  REMOTE_DEPLOY_TIMEOUT. Also: the Production Test pipeline indicator now
+  shows the live UPLOADING/DEPLOYING job state instead of sitting at
+  NOT_DEPLOYED until the very end.
+
+New in 2.18.0:
+- Read-only Production preflight (`/api/release-manager/production-preflight`,
+  GET requests only -- never uploads a release, never calls
+  /deploy/<version>): Agent health/role/build_enabled, MESFlow version and
+  health, applied schema (migration_head, not the app-version-shaped
+  schema_version label), PostgreSQL health, disk usage, Docker container
+  health, and backup/rollback readiness (new `/api/ops/backups`
+  read-only endpoint).
+- Promote Production's gate now also requires a *fresh* (<=15 minutes
+  old) healthy preflight result, in addition to the existing LOCAL_PASS +
+  TEST_PASS + matching ZIP SHA + matching image digest + schema PASS +
+  not-contaminated checks. A stale cached "healthy" no longer keeps
+  gating PASS indefinitely.
+- MESFLOW_PRODUCTION_AGENT_URL/_USER/_PASSWORD environment passthrough
+  (docker/compose.linux.yml), mirroring the existing
+  MESFLOW_PRODUCTION_TEST_AGENT_* pattern -- no values are hardcoded or
+  committed.
+- New docker/compose.production.override.yml (SERVER_ROLE=PRODUCTION,
+  MESFLOW_BUILD_ENABLED=0), mirroring compose.production-test.override.yml.
+- Promote Production remains unexecuted: still requires
+  MESFLOW_PRODUCTION_PROMOTE_ENABLED=1 on this Agent AND an explicit
+  {"confirm": true} request, and still returns 501 even then -- this
+  Agent build does not perform a production deploy.

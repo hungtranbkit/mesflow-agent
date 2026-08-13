@@ -3,7 +3,7 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile
-    image: ${AGENT_IMAGE:-mesflow-deploy-agent:2.17.4}
+    image: ${AGENT_IMAGE:-mesflow-deploy-agent:2.18.0}
     container_name: mesflow-deploy-agent
     restart: unless-stopped
     environment:
@@ -27,6 +27,14 @@ services:
       MESFLOW_PRODUCTION_TEST_AGENT_URL: ${MESFLOW_PRODUCTION_TEST_AGENT_URL:-}
       MESFLOW_PRODUCTION_TEST_AGENT_USER: ${MESFLOW_PRODUCTION_TEST_AGENT_USER:-}
       MESFLOW_PRODUCTION_TEST_AGENT_PASSWORD: ${MESFLOW_PRODUCTION_TEST_AGENT_PASSWORD:-}
+      # Production target: read-only use only (health/version/schema/disk/
+      # backup preflight via GET requests). The Agent never uploads a
+      # release or calls /deploy/<version> against this target except
+      # through the explicitly human-gated Promote Production action, which
+      # this Agent build does not execute (see release_manager_promote_production).
+      MESFLOW_PRODUCTION_AGENT_URL: ${MESFLOW_PRODUCTION_AGENT_URL:-}
+      MESFLOW_PRODUCTION_AGENT_USER: ${MESFLOW_PRODUCTION_AGENT_USER:-}
+      MESFLOW_PRODUCTION_AGENT_PASSWORD: ${MESFLOW_PRODUCTION_AGENT_PASSWORD:-}
     volumes:
       - ${MESFLOW_AGENT_DATA_DIR:-/var/lib/mesflow-deploy-agent}:/data
       - /var/run/docker.sock:/var/run/docker.sock

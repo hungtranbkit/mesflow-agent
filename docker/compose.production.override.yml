@@ -1,0 +1,5 @@
+services:
+  mesflow-deploy-agent:
+    environment:
+      SERVER_ROLE: PRODUCTION
+      MESFLOW_BUILD_ENABLED: "0"
