@@ -100,8 +100,18 @@ class DeploySafetyTests(unittest.TestCase):
     def test_start_names_only_application_owned_services(self):
         self.install_old(); calls=[]
         def record(root,log,args,**kwargs): calls.append(args); return 0
-        with patch.object(agent, "_compose_at", side_effect=record): agent._start_stack(io.StringIO())
-        self.assertEqual(calls, [["up", "-d", "--no-build", "postgres", "mesflow"]])
+        # _start_stack refuses to run unless persistent PostgreSQL already
+        # reports healthy (it must never be recreated just because the
+        # application tier redeploys) — mock that pre-flight check so this
+        # test exercises the compose invocation itself, not real Docker.
+        with patch.object(agent, "_compose_at", side_effect=record), \
+             patch.object(agent, "_docker_mes_state", return_value={"service_health": {"postgres": "healthy"}}):
+            agent._start_stack(io.StringIO())
+        # --no-deps + only "mesflow" is intentional: the gateway and
+        # PostgreSQL are neither recreated nor reset by an application
+        # deploy (see _start_stack's docstring comment).
+        self.assertEqual(calls, [["up", "-d", "--no-build", "--no-deps", "mesflow"]])
+        self.assertFalse(any("postgres" in args for args in calls))
 
     def test_legacy_docker_helpers_do_not_target_gateway(self):
         self.install_old(); calls=[]
@@ -134,7 +144,12 @@ class DeploySafetyTests(unittest.TestCase):
                 stdout=("postgres\nmesflow\n" if "--services" in cmd else
                         "healthy\n" if cmd[:2] == ["docker", "inspect"] else "container-id\n")
             return Result()
-        with patch.object(agent, "os", SimpleNamespace(name="posix")), patch.object(agent.subprocess, "run", side_effect=run):
+        # Patch only os.name, not the whole `os` module: _docker_mes_state()
+        # also calls os.environ.copy(), which a wholesale
+        # SimpleNamespace(name="posix") replacement doesn't have — that
+        # AttributeError was being silently swallowed by _docker_mes_state's
+        # broad except clause, masking this test's real assertions.
+        with patch.object(agent.os, "name", "posix"), patch.object(agent.subprocess, "run", side_effect=run):
             state=agent._docker_mes_state()
         self.assertTrue(state["healthy"])
         self.assertNotIn("nginx", state["service_health"])
@@ -143,7 +158,9 @@ class DeploySafetyTests(unittest.TestCase):
     def test_failed_deploy_and_rollback_never_target_gateway(self):
         self.install_old(); backup=agent._create_linux_backup(io.StringIO()); calls=[]
         def record(root,log,args,**kwargs): calls.append(args); return 0
-        with patch.object(agent, "_compose_at", side_effect=record), patch.object(agent, "mes_status", return_value={"version":"1","healthy":True}), patch.object(agent, "MES_VERIFY_TIMEOUT", 1):
+        with patch.object(agent, "_compose_at", side_effect=record), patch.object(agent, "mes_status", return_value={"version":"1","healthy":True}), \
+             patch.object(agent, "_docker_mes_state", return_value={"service_health": {"postgres": "healthy"}}), \
+             patch.object(agent, "MES_VERIFY_TIMEOUT", 1):
             agent._rollback_linux_source(backup, "1", io.StringIO())
         self.assertTrue(calls)
         self.assertFalse(any("nginx" in args for args in calls))

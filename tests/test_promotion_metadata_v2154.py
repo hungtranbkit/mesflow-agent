@@ -1,4 +1,5 @@
 import json
+import re
 from pathlib import Path
 
 
@@ -6,10 +7,14 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def test_agent_version_and_promotion_fields_are_visible():
-    assert (ROOT / "VERSION.txt").read_text().strip() == "2.15.5-docker-runtime"
+    # Assert internal consistency (VERSION.txt matches agent.py's
+    # AGENT_VERSION), not one frozen historical version — this must keep
+    # passing across every release, not just the one it was written against.
+    version = (ROOT / "VERSION.txt").read_text().strip()
+    assert re.fullmatch(r"\d+\.\d+\.\d+-docker-runtime", version), version
     source = (ROOT / "agent.py").read_text()
     template = (ROOT / "templates/index.html").read_text()
-    assert 'AGENT_VERSION="2.15.5-docker-runtime"' in source
+    assert f'AGENT_VERSION="{version}"' in source
     assert 'promotion=load_json(x/"PROMOTION.json",{})' in source
     assert "SHA256:" in template
     assert "Local verification:" in template

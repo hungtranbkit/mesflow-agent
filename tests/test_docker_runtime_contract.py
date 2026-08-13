@@ -1,3 +1,4 @@
+import re
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -5,7 +6,11 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def test_runtime_guard_is_present():
     text = (ROOT / "agent.py").read_text(encoding="utf-8")
-    assert 'AGENT_VERSION="2.16.9-docker-runtime"' in text
+    # The exact version changes every release; what must hold is that
+    # AGENT_VERSION is tagged "-docker-runtime" (the marker this whole
+    # test module is about), not any specific historical value.
+    assert re.search(r'AGENT_VERSION="\d+\.\d+\.\d+-docker-runtime"', text), \
+        "AGENT_VERSION must be a X.Y.Z-docker-runtime version string"
     assert "MESFLOW_AGENT_DEPLOY_ENABLED" in text
     assert "if not dry_run and not DEPLOY_ENABLED" in text
     assert "HOST_OPS_ENABLED" in text
