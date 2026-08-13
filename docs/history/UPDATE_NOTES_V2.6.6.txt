@@ -1,0 +1,6 @@
+Workshop Update Agent v2.6.6
+
+- Fix same-version redeploy recovery.
+- Do not stop and launch MES a second time when port 8080 is already active.
+- Start MES during recovery only when port 8080 is genuinely closed.
+- Prevent duplicate launcher processes after a verification timeout.

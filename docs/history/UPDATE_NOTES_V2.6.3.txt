@@ -1,0 +1,7 @@
+Workshop Update Agent V2.6.3
+
+- Prefer launcher.py over direct start_server.py.
+- Allow 120 seconds for migrations and startup instead of 35 seconds.
+- Detect early MES process exit.
+- Include mes_process.log tail in Agent deployment failure message.
+- Configurable with WORKSHOP_MES_VERIFY_TIMEOUT.

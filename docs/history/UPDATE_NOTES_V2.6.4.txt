@@ -1,0 +1,6 @@
+Workshop Update Agent V2.6.4
+
+- Uses taskkill, PowerShell Stop-Process, and Win32_Process.Terminate to release port 8080.
+- Repeats cleanup for respawned launcher/start_server processes for up to 60 seconds.
+- Logs process name, executable, command line, parent PID, owner, and termination errors.
+- Does not start a duplicate MES process when the old process remains alive.

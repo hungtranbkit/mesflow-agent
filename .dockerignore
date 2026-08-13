@@ -1,0 +1,13 @@
+.git
+.pytest_cache
+.test-tmp
+.venv
+.venv-test
+__pycache__
+*.pyc
+*.pyo
+*.log
+data/
+config/
+*.zip
+*.rar

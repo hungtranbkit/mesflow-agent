@@ -1,0 +1,8 @@
+services:
+  mesflow-deploy-agent:
+    environment:
+      SERVER_ROLE: DEV
+      MESFLOW_BUILD_ENABLED: "1"
+      MESFLOW_SOURCE_DIR: /workspace/mesflow/mesflow
+    volumes:
+      - ../../:/workspace/mesflow

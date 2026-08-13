@@ -1,0 +1,7 @@
+MESFlow Deploy Agent v2.8.1 Linux
+
+- Fix false MESFlow OFFLINE on Docker deployments where backend port 8080 is not published to host.
+- Detect running MESFlow service through docker compose ps.
+- Probe MES API through configured URL plus local nginx HTTP/HTTPS endpoints.
+- Support self-signed/local TLS for loopback health probes.
+- UI reports ONLINE when Docker MES service is running even if direct backend API is intentionally private.

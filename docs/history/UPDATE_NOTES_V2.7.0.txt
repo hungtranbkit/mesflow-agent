@@ -1,0 +1,8 @@
+MESFlow Deploy Agent v2.7.0
+
+- Adds MESFlow QA Center package repository and deployment flow.
+- Upload QA ZIP, install/update, restart, stop, health/version check.
+- QA Center runs independently on port 8095.
+- Preserves QA config.json and reports across updates.
+- Automatic rollback to previous QA Center when health verification fails.
+- Keeps existing MESFlow deployment logic unchanged.

@@ -1,0 +1,14 @@
+MESFlow Deploy Agent v2.9.0-linux-ops
+
+New Server Operations Console (/agent/ops):
+- Server health score: CPU, RAM, disk, load, uptime, failed systemd services, Docker health, MESFlow/QA availability.
+- systemd service browser with filter and Start/Stop/Restart.
+- Docker container browser with Start/Stop/Restart.
+- Listening ports mapped to PID/process.
+- Unified log reader: deploy agent, MESFlow app, PostgreSQL, QA Center, nginx, kernel, system errors.
+- Local command terminal with quick commands.
+- SSH command execution (host/port/user/password or SSH key path). Password is not persisted.
+- CSRF protection for JSON command APIs and audit entries in agent log.
+- Dangerous commands require a second explicit confirmation in UI.
+
+Dependencies added: psutil, paramiko.

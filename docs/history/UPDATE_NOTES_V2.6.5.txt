@@ -1,0 +1,5 @@
+Workshop Update Agent V2.6.5
+
+- Uses a dedicated cookie name: mesflow_agent_session, preventing login collisions with the MES Flask application.
+- Supports direct access through http://SERVER-IP:8090/agent/ without requiring nginx to strip the prefix.
+- Keeps nginx X-Forwarded-Prefix support for https://domain/agent/.

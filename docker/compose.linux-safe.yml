@@ -1,0 +1,14 @@
+# Linux inspection/dry-run profile. Real deploy is disabled.
+services:
+  mesflow-deploy-agent:
+    extends:
+      file: compose.linux.yml
+      service: mesflow-deploy-agent
+    environment:
+      MESFLOW_AGENT_RUNTIME: docker-linux-safe
+      MESFLOW_AGENT_DEPLOY_ENABLED: "0"
+      MESFLOW_AGENT_HOST_OPS_ENABLED: "0"
+
+networks:
+  mesflow-edge:
+    external: true

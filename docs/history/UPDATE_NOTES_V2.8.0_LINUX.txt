@@ -1,0 +1,8 @@
+MESFlow Deploy Agent v2.8.0-linux
+- Linux-native systemd installer.
+- Default paths: /opt/mesflow-agent, /opt/mesflow, /opt/mesflow-qa-center.
+- Deploys current MESFlow Docker packages containing compose.yml + release.json + VERSION.txt.
+- Preserves /opt/mesflow/.env, certs, runtime during MESFlow updates.
+- Uses docker compose down/up -d --build and verifies version + health.
+- Source rollback on failed MESFlow deployment.
+- QA Center upload/install/restart/stop retained on port 8095.

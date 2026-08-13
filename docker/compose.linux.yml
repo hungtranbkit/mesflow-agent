@@ -1,0 +1,36 @@
+services:
+  mesflow-deploy-agent:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: ${AGENT_IMAGE:-mesflow-deploy-agent:2.16.1}
+    container_name: mesflow-deploy-agent
+    restart: unless-stopped
+    environment:
+      MESFLOW_AGENT_RUNTIME: docker-linux
+      SERVER_ROLE: ${SERVER_ROLE:-PRODUCTION_TEST}
+      MESFLOW_BUILD_ENABLED: ${MESFLOW_BUILD_ENABLED:-0}
+      MESFLOW_SOURCE_DIR: ${MESFLOW_SOURCE_DIR:-/workspace/mesflow/mesflow}
+      MESFLOW_AGENT_DEPLOY_ENABLED: "1"
+      MESFLOW_AGENT_HOST_OPS_ENABLED: "0"
+      WORKSHOP_AGENT_HOME: /data
+      MESFLOW_AGENT_ADMIN_PASSWORD: ${MESFLOW_AGENT_ADMIN_PASSWORD:-1234567890}
+      WORKSHOP_TARGET_HOME: /opt/mesflow
+      WORKSHOP_MES_URL: http://mesflow-app:8080
+      MESFLOW_INTERNAL_API_TOKEN: ${MESFLOW_INTERNAL_API_TOKEN:-}
+      MESFLOW_DEPLOY_AGENT_TOKEN: ${MESFLOW_DEPLOY_AGENT_TOKEN:-}
+      MESFLOW_QA_URL: http://mesflow-qa-center:8095
+    volumes:
+      - ./runtime/agent-data:/data
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Same absolute host/container path is intentional so Compose bind paths remain valid.
+      - /opt/mesflow:/opt/mesflow
+      - /opt/mesflow-qa-center:/opt/mesflow-qa-center
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - mesflow-edge
+
+networks:
+  mesflow-edge:
+    external: true

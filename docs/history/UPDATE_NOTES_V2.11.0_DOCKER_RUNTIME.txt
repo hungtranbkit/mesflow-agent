@@ -1,0 +1,9 @@
+MESFlow Deploy Agent 2.11.0-docker-runtime
+
+- Adds Docker image and Compose definitions for Windows Docker Desktop and Linux Docker Engine.
+- Windows container runtime defaults to diagnostics/dry-run only; real deployment is blocked.
+- Linux container runtime supports full app deployment when /opt/mesflow is mounted at the same absolute path.
+- Adds runtime/deploy/host-ops flags to health/status metadata.
+- Host-local command and systemd actions are disabled when MESFLOW_AGENT_HOST_OPS_ENABLED=0.
+- Preserves root agent.py entry point for existing systemd compatibility.
+- Moves historical update notes under docs/history and removes cached virtualenv/test artifacts from distribution.

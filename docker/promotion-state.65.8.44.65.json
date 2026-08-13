@@ -1,0 +1,14 @@
+{
+  "version": "65.8.44.65",
+  "local_pass": true,
+  "test_pass": true,
+  "production_status": "NOT_DEPLOYED",
+  "zip_sha256": "556617feffeda5bdda2484da4b774d6feb6568f638c068934f3cd5c8b20c97ac",
+  "zip_sha_unchanged": true,
+  "image_digest": "sha256:0c439f75840b149dcdc51d8164bcd20ee9695ed1636491543fb05a52b289a6e1",
+  "image_digest_unchanged": true,
+  "source_commit": "77890f31ac8c07cbcf353d959b886310143aa216",
+  "expected_schema_revision": "65.8.44.60",
+  "actual_schema_revision": "65.8.44.60",
+  "history": ["Built", "Local PASS", "Test PASS", "Production NOT DEPLOYED"]
+}

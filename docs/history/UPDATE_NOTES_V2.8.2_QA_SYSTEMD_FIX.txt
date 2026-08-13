@@ -1,0 +1,9 @@
+MESFlow Deploy Agent v2.8.2 Linux
+
+- Fix QA Center deploy not updating visible/runtime version.
+- Migrate legacy standalone /opt/mesflow-qa-center install into current/.
+- QA Center now runs only through mesflow-qa-center.service pointing to current/agent.py.
+- Preserve config.json and reports during migration/update.
+- Detect legacy QA VERSION at root.
+- Backup/rollback legacy QA source.
+- QA service survives reboot on the deployed version.

@@ -1,0 +1,96 @@
+MESFlow Deploy Agent Docker Runtime Build Report
+================================================
+Version: 2.11.0-docker-runtime
+
+Scope
+-----
+Reorganized the supplied Deploy Agent repository without moving the stable agent.py entry point.
+Added Docker deployment assets and explicit runtime safety modes.
+
+Docker modes
+------------
+1. Windows Docker Desktop
+   - Agent UI / health / Docker diagnostics / release upload / dry-run.
+   - Real deployment disabled by default (MESFLOW_AGENT_DEPLOY_ENABLED=0).
+   - Host systemd/local command operations disabled.
+
+2. Linux Docker Engine
+   - Full MESFlow application deployment enabled.
+   - /opt/mesflow is mounted at the same absolute path in the container.
+   - Docker socket mounted.
+   - Agent joins external mesflow-edge for direct app health checks.
+   - Gateway and PostgreSQL data directories are NOT mounted into the Agent.
+
+Compatibility
+-------------
+- Existing native Linux/systemd entry point remains agent.py.
+- Existing root install_agent.sh remains present.
+- Existing templates/tests/tools preserved.
+
+Validation performed
+--------------------
+PASS: python -m py_compile agent.py
+PASS: tests/test_docker_runtime_contract.py (4/4)
+PASS: Docker Compose YAML static parse contract
+PASS: required Docker/docs files present
+
+Not run in this build environment
+---------------------------------
+- Full test_deploy_safety.py runtime suite because the current execution environment does not have the Agent Python dependencies installed (paramiko was missing).
+- test_phase2b_architecture.py is a cross-repository test and expects a sibling mesflow/ project not included in the supplied Agent ZIP.
+- Live Docker image build/start was not run in this artifact environment.
+
+Important
+---------
+Mounting /var/run/docker.sock grants high privilege over the Docker host.
+Windows Docker mode intentionally blocks real source-replacing deployment because Windows host bind-path semantics are not reliably preserved when Compose is invoked from a Linux Agent container.
+
+
+2.11.1 Docker build hotfix:
+- Alpine build dependencies added for psutil 7.0.0 on Python 3.13.
+- Uses virtual .build-deps and removes compiler toolchain after pip install.
+- Docker image tags updated to 2.11.1.
+
+
+Hotfix 2.12.5-docker-runtime
+- Fixed auto-upload regression: file input was disabled before form submit, so browsers excluded it from multipart/form-data and backend returned "Chọn file ZIP".
+- Auto-submit now uses requestSubmit() while keeping the selected file enabled.
+- Added one-shot submitting guard to prevent duplicate upload.
+- Added visible "Đang upload và triển khai..." state.
+
+
+Hotfix 2.12.6-docker-runtime
+- Đồng bộ VERSION, AGENT_VERSION và Docker image tag.
+- install.sh không còn hard-code image 2.12.4; image lấy từ payload/VERSION.txt.
+- Linux port mapping chỉ có một nguồn: compose.bootstrap.override.yml do installer tạo.
+- Tự dừng systemd Agent cũ và xóa canonical container Agent cũ trước khi kiểm tra port.
+- Nếu port do tiến trình khác giữ, installer báo PID/process và dừng an toàn.
+- Force recreate container, rồi xác minh Docker PortBindings trước khi chờ HTTP health.
+
+
+Hotfix 2.12.8-docker-runtime
+- Fixed false-negative gateway verification caused by HTTPS request to 127.0.0.1 with only Host header.
+- Gateway validation now uses curl --resolve deploy.mesflow.net:443:127.0.0.1 so TLS SNI and Host both select the deploy vhost.
+- Verifies /agent/health JSON ok=true instead of testing UI route only.
+- Verifies deploy.mesflow.net root redirects to /agent/.
+- Installer performs the same SNI-correct gateway health check.
+- Added diagnose-gateway.sh for one-command diagnostics.
+
+
+Feature 2.12.9-docker-runtime
+- Added Deploy Agent button to rebuild all MESFlow tutorial videos after major changes.
+- Background job shows live status/log/history.
+- Temporary TUT data can be seeded and is cleaned after recording.
+- Uses isolated cached Playwright builder container on mesflow-edge.
+- MESFlow source is mounted read-only; final videos publish to runtime/tutorials.
+- MESFlow password is passed only via child-process environment and is not stored in Agent state/log.
+
+
+Hotfix 2.13.1-docker-runtime
+- Fixed local-browser silent upload path.
+- Removed dependency on inline onchange/requestSubmit-only behavior.
+- Auto-upload now uses a regular JS event listener and falls back to form.submit().
+- Visible Upload & Deploy button remains available if auto-upload is blocked.
+- UI displays selected filename/size and "Đang upload..." state.
+- Agent logs upload request, saved byte count, detected version/root, repository store, and pre-deploy exceptions.
+- Same resilient upload pattern applied to QA upload.

@@ -1,0 +1,10 @@
+MESFlow Deploy Agent v2.9.1 - Boot Recovery
+============================================
+- Opens UFW TCP port 8090 during Linux installation (or configured agent port).
+- Enables Docker daemon at boot.
+- Enables Server Agent at boot.
+- Installs mesflow-boot-recovery.service.
+- On every boot, waits for Docker then runs docker compose up -d against /opt/mesflow/compose.yml.
+- Restarts/enables mesflow-qa-center.service when present.
+- Preserves MESFlow runtime/database data; compose recovery is idempotent.
+- Adds CLI: mesflow-agent boot-status, boot-logs, recover.

@@ -1,0 +1,8 @@
+MESFlow Deploy Agent 2.10.0
+
+- Stage, validate Compose, build the app image, and validate Alembic heads before cutover.
+- Persistent .env, certs, runtime, PostgreSQL, uploads, and backups are never copied from a release or removed.
+- Cutover stops app/nginx only; PostgreSQL and its data directory remain running.
+- Durable deployment journal supports automatic rollback after failures or Agent restart.
+- Cross-process deploy lock prevents concurrent deployments.
+- Dry-run performs staging validation/build without changing production source or stopping services.

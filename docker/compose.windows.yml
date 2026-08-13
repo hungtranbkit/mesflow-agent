@@ -1,0 +1,31 @@
+services:
+  mesflow-deploy-agent:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: mesflow-deploy-agent:2.15.4
+    container_name: mesflow-deploy-agent
+    restart: unless-stopped
+    ports:
+      - "8090:8090"
+    environment:
+      MESFLOW_AGENT_RUNTIME: docker-windows
+      MESFLOW_AGENT_DEPLOY_ENABLED: "0"
+      MESFLOW_AGENT_HOST_OPS_ENABLED: "0"
+      WORKSHOP_AGENT_HOME: /data
+      MESFLOW_AGENT_ADMIN_PASSWORD: ${MESFLOW_AGENT_ADMIN_PASSWORD:-1234567890}
+      WORKSHOP_TARGET_HOME: /workspace/mesflow
+      WORKSHOP_MES_URL: http://host.docker.internal:8080
+      MESFLOW_QA_URL: http://host.docker.internal:8095
+    volumes:
+      - agent-data:/data
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Set MESFLOW_WORKSPACE to the Windows MESFlow directory before running.
+      - type: bind
+        source: ${MESFLOW_WORKSPACE:?Set MESFLOW_WORKSPACE to the MESFlow source directory}
+        target: /workspace/mesflow
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+volumes:
+  agent-data:

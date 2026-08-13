@@ -1,0 +1,7 @@
+Workshop Update Agent V2.6.2
+
+- Adds Forgot Password with a one-time Recovery Code.
+- Adds localhost-only password reset at /agent/local-reset.
+- Adds password reset and Recovery Code regeneration to install_agent.bat.
+- Recovery Codes are stored only as secure password hashes.
+- Retains the lightweight stale deployment recovery fixes from V2.6.1.

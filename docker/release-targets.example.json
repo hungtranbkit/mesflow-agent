@@ -1,0 +1,23 @@
+[
+  {
+    "name": "LOCAL",
+    "role": "DEV",
+    "url": "local",
+    "health_url": "http://127.0.0.1:8090/health",
+    "credential_env": "LOCAL_AGENT_TOKEN"
+  },
+  {
+    "name": "PRODUCTION_TEST",
+    "role": "PRODUCTION_TEST",
+    "url": "https://deploy-test.example/agent",
+    "health_url": "https://deploy-test.example/agent/health",
+    "credential_env": "PRODUCTION_TEST_AGENT_TOKEN"
+  },
+  {
+    "name": "PRODUCTION",
+    "role": "PRODUCTION",
+    "url": "https://deploy.example/agent",
+    "health_url": "https://deploy.example/agent/health",
+    "credential_env": "PRODUCTION_AGENT_TOKEN"
+  }
+]
