@@ -49,8 +49,6 @@ AGENT_IMAGE_TAG="${AGENT_VERSION%-docker-runtime}"
 AGENT_IMAGE="mesflow-deploy-agent:${AGENT_IMAGE_TAG}"
 MESFLOW_WORKSPACE_ROOT="$(resolve_workspace_root)"
 CONTAINER_NAME="mesflow-deploy-agent"
-TS="$(date +%Y%m%d_%H%M%S)"
-BACKUP_NAME="${CONTAINER_NAME}-preinstall-${TS}"
 
 command -v docker >/dev/null || { echo "Docker is required" >&2; exit 1; }
 docker compose version >/dev/null || { echo "Docker Compose plugin is required" >&2; exit 1; }
@@ -60,15 +58,21 @@ echo "Resolved MESFLOW_WORKSPACE_ROOT=$MESFLOW_WORKSPACE_ROOT (override with MES
 echo "Persistent Agent data dir: $AGENT_DATA_DIR (never recreated/wiped by this installer)"
 
 # --- detect an existing Agent container -------------------------------------
+# IMPORTANT: `docker compose up --force-recreate` identifies "the container
+# for this service" by Compose project/service *labels*, not by container
+# name — so renaming the old container beforehand does NOT protect it from
+# being removed by the recreate (verified empirically: a renamed container
+# was still torn down by the next `up --force-recreate`). The only thing
+# that reliably survives is the *image*, referenced by its immutable id, and
+# the external data bind mount. Roll back by redeploying that exact image
+# id, not by trying to resurrect the old container object.
 EXISTED=0
+PREV_IMAGE_ID=""
 if docker inspect "$CONTAINER_NAME" >/dev/null 2>&1; then
   EXISTED=1
-  echo "Existing Agent container '$CONTAINER_NAME' detected; it will be preserved as a rollback target."
-  # Free the port/name without discarding it: rename, then stop. Its data
-  # lives in the external bind mount ($AGENT_DATA_DIR), not in the
-  # container, so nothing persistent is touched by rename/stop.
-  docker rename "$CONTAINER_NAME" "$BACKUP_NAME"
-  docker stop "$BACKUP_NAME" >/dev/null
+  PREV_IMAGE_ID="$(docker inspect "$CONTAINER_NAME" --format '{{.Image}}')"
+  echo "Existing Agent container '$CONTAINER_NAME' detected, running image id $PREV_IMAGE_ID."
+  echo "That image id is not removed by this installer; rollback redeploys it by id if needed."
 else
   if ss -lntp "sport = :${AGENT_PORT}" | grep -q LISTEN; then
     echo "Port ${AGENT_PORT} is already listening by something other than '$CONTAINER_NAME'; stop it before retrying" >&2
@@ -77,13 +81,16 @@ else
 fi
 
 rollback() {
-  echo "ROLLBACK: new Agent failed to become healthy; restoring previous Agent." >&2
-  docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
-  if [[ "$EXISTED" -eq 1 ]]; then
-    docker rename "$BACKUP_NAME" "$CONTAINER_NAME"
-    docker start "$CONTAINER_NAME" >/dev/null
-    echo "ROLLBACK complete: previous Agent container restored and started." >&2
+  echo "ROLLBACK: new Agent failed to become healthy." >&2
+  if [[ "$EXISTED" -eq 1 && -n "$PREV_IMAGE_ID" ]]; then
+    echo "Redeploying the previous image ($PREV_IMAGE_ID) via compose (--no-build, same data dir)." >&2
+    AGENT_BIND_IP="$AGENT_BIND_IP" AGENT_PORT="$AGENT_PORT" AGENT_IMAGE="$PREV_IMAGE_ID" \
+      MESFLOW_AGENT_DATA_DIR="$AGENT_DATA_DIR" MESFLOW_WORKSPACE_ROOT="$MESFLOW_WORKSPACE_ROOT" \
+      docker compose -f compose.linux.yml -f compose.bootstrap.override.yml up -d --force-recreate mesflow-deploy-agent \
+      && echo "ROLLBACK complete: previous Agent image restored and started." >&2 \
+      || echo "ROLLBACK FAILED: could not restart the previous image ($PREV_IMAGE_ID). Manual intervention required." >&2
   else
+    docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
     echo "ROLLBACK complete: no previous Agent existed; nothing to restore." >&2
   fi
   exit 1
@@ -128,6 +135,6 @@ curl -fsS "http://${AGENT_BIND_IP}:${AGENT_PORT}/agent/health"
 echo
 echo "Installed local Deploy Agent ${AGENT_VERSION}; nginx/firewall/PostgreSQL were not modified."
 if [[ "$EXISTED" -eq 1 ]]; then
-  echo "Previous Agent preserved (stopped) as container '$BACKUP_NAME' for manual rollback:"
-  echo "  docker rm -f $CONTAINER_NAME && docker rename $BACKUP_NAME $CONTAINER_NAME && docker start $CONTAINER_NAME"
+  echo "Previous Agent image id kept for manual rollback if needed later:"
+  echo "  AGENT_IMAGE=$PREV_IMAGE_ID docker compose -f compose.linux.yml -f compose.bootstrap.override.yml up -d --force-recreate mesflow-deploy-agent"
 fi

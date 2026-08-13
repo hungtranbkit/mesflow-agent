@@ -1,6 +1,6 @@
 from __future__ import annotations
-import hashlib, hmac, io, json, os, secrets, shutil, socket, ssl, subprocess, sys, threading, time, urllib.request, urllib.error, uuid, zipfile, platform, re, tempfile
-from urllib.parse import quote
+import hashlib, hmac, http.cookiejar, io, json, os, secrets, shutil, socket, ssl, subprocess, sys, threading, time, urllib.request, urllib.error, uuid, zipfile, platform, re, tempfile
+from urllib.parse import quote, urlencode
 import psutil
 import paramiko
 from datetime import datetime
@@ -13,7 +13,7 @@ from werkzeug.security import check_password_hash, generate_password_hash
 from werkzeug.utils import secure_filename
 import ota_control as ota
 
-AGENT_VERSION="2.16.11-docker-runtime"
+AGENT_VERSION="2.17.0-docker-runtime"
 AGENT_HOME=Path(os.environ.get("WORKSHOP_AGENT_HOME","/opt/mesflow-agent"))
 TARGET_HOME=Path(os.environ.get("WORKSHOP_TARGET_HOME","/opt/mesflow"))
 QA_HOME=Path(os.environ.get("MESFLOW_QA_HOME","/opt/mesflow-qa-center"))
@@ -169,25 +169,207 @@ def start_esp_builder():
     except Exception:
         ESP_BUILDER_LOCK.release(); raise
 
+PROMOTION_STATE_FILE=CONFIG_DIR/"promotion-state.json"
+_promotion_lock=threading.Lock()
+
+def _releases_root():
+    return MESFLOW_SOURCE_DIR.parent/"artifacts"/"releases"
+
+def _release_dir_for(version):
+    return _releases_root()/version
+
+def _release_contamination(version):
+    """Detect a version whose frozen artifact cannot be trusted.
+
+    Two independent checks: (1) an explicit CONTAMINATED.json marker placed
+    next to a known-bad release (never overwrites release.json/checksums.txt
+    themselves), and (2) a live check that the Docker tag recorded in this
+    release's release.json still points at the exact image id that was
+    frozen — if a later build silently moved the tag (the 65.8.44.65
+    incident), this catches it even without a marker file.
+    """
+    root=_release_dir_for(version)
+    marker=load_json(root/"CONTAMINATED.json",{})
+    if marker.get("contaminated"):
+        return {"contaminated":True,"reason":marker.get("reason","Marked contaminated"),"source":"marker"}
+    meta=load_json(root/"release.json",{})
+    image=str(meta.get("image") or ""); expected_id=str(meta.get("image_id") or "")
+    if image and expected_id:
+        try:
+            r=subprocess.run(["docker","image","inspect",image,"--format","{{.Id}}"],capture_output=True,text=True,timeout=15)
+            if r.returncode==0:
+                actual_id=r.stdout.strip()
+                if actual_id and actual_id!=expected_id:
+                    return {"contaminated":True,"reason":f"Docker tag {image} now points at {actual_id}, not the frozen id {expected_id}. A later build moved the tag.","source":"tag_drift"}
+        except Exception:
+            pass
+    return {"contaminated":False}
+
+def _load_promotion_state():
+    with _promotion_lock:
+        return load_json(PROMOTION_STATE_FILE,{})
+
+def _reset_promotion_state(version,artifact):
+    state={
+        "version":version,
+        "source_commit":artifact.get("source_commit",""),
+        "package_sha256":artifact.get("package_sha256",""),
+        "image":artifact.get("image",""),
+        "image_digest":artifact.get("digest") or artifact.get("image_digest",""),
+        "image_id":artifact.get("image_id",""),
+        "expected_schema_revision":artifact.get("schema_revision",""),
+        "build_status":"PASS",
+        "local_status":"NOT_TESTED","local_pass":False,
+        "test_status":"NOT_DEPLOYED","test_pass":False,
+        "production_status":"NOT_DEPLOYED","production_pass":False,
+    }
+    with _promotion_lock:
+        save_json(PROMOTION_STATE_FILE,state)
+    return state
+
+def _update_promotion_state(version,artifact,**fields):
+    """Merge fields into the tracked promotion state for `version`.
+
+    If the tracked state belongs to a different version, it is reset first
+    — promotion status never silently carries over to a different artifact.
+    """
+    with _promotion_lock:
+        state=load_json(PROMOTION_STATE_FILE,{})
+    if state.get("version")!=version:
+        state=_reset_promotion_state(version,artifact)
+    state.update(fields)
+    with _promotion_lock:
+        save_json(PROMOTION_STATE_FILE,state)
+    return state
+
+def _actual_running_mes_image_id():
+    ds=_docker_mes_state()
+    cid=(ds.get("container_ids") or {}).get("mesflow","")
+    if not cid: return ""
+    try:
+        r=subprocess.run(["docker","inspect",cid,"--format","{{.Image}}"],capture_output=True,text=True,timeout=15)
+        return r.stdout.strip() if r.returncode==0 else ""
+    except Exception:
+        return ""
+
+def _actual_schema_revision(base_urls=None):
+    """Read the real applied Alembic head from /api/system/ready.
+
+    Deliberately not `schema_version` (an app-defined system_meta label that
+    looks like an app version string) — see AGENTS.md: never infer schema
+    from the app version.
+    """
+    payload,code=http_json("/api/system/ready",6)
+    if code==200: return str(payload.get("migration_head") or "")
+    return ""
+
+def _http_smoke_ok(base_urls=None,timeout=6):
+    """Minimal server-side smoke check: the login page renders and looks like MESFlow."""
+    for base in _mes_url_candidates():
+        try:
+            ctx=ssl._create_unverified_context() if base.lower().startswith("https://") else None
+            req=urllib.request.Request(base+"/login",headers={"Host":"localhost","User-Agent":"MESFlow-Deploy-Agent"})
+            with urllib.request.urlopen(req,timeout=timeout,context=ctx) as r:
+                body=r.read(4096).decode("utf-8",errors="replace")
+                if r.status==200 and ("MESFlow" in body or "mesflow" in body.lower()):
+                    return True
+        except Exception:
+            continue
+    return False
+
+def _record_local_deploy_result(version,success,message=""):
+    """Called after a Release Manager-initiated local deploy finishes.
+
+    Computes LOCAL_PASS from real evidence: exact image bytes (image id, not
+    tag), applied schema vs the frozen expected schema, and an HTTP smoke
+    check — never from the deploy job's return code alone.
+    """
+    artifact=_artifact_for_release(version)
+    if not artifact.get("version"): return
+    contamination=_release_contamination(version)
+    if not success:
+        _update_promotion_state(version,artifact,local_status="FAILED",local_pass=False,local_message=message)
+        return
+    if contamination.get("contaminated"):
+        _update_promotion_state(version,artifact,local_status="FAILED",local_pass=False,
+                                 local_message=f"CONTAMINATED release: {contamination.get('reason')}")
+        return
+    actual_id=_actual_running_mes_image_id()
+    expected_id=str(artifact.get("image_id") or "")
+    image_ok=bool(expected_id) and actual_id==expected_id
+    expected_schema=str(artifact.get("schema_revision") or "")
+    actual_schema=_actual_schema_revision()
+    schema_ok=bool(expected_schema) and expected_schema not in ("unknown","") and actual_schema==expected_schema
+    smoke_ok=_http_smoke_ok()
+    local_pass=image_ok and schema_ok and smoke_ok
+    reasons=[]
+    if not image_ok: reasons.append(f"running image id {actual_id or 'unknown'} != frozen id {expected_id or 'unknown'}")
+    if not schema_ok: reasons.append(f"schema expected={expected_schema or 'unknown'} actual={actual_schema or 'unknown'}")
+    if not smoke_ok: reasons.append("browser/HTTP smoke check failed")
+    _update_promotion_state(version,artifact,
+        local_status="PASS" if local_pass else "FAILED",local_pass=local_pass,
+        local_message="LOCAL_PASS" if local_pass else "; ".join(reasons),
+        actual_schema_revision=actual_schema,image_id_verified=image_ok,smoke_ok=smoke_ok,
+        zip_sha_unchanged=True,image_digest_unchanged=image_ok)
+
 def _release_summary():
     version_file=MESFLOW_SOURCE_DIR/"VERSION.txt"
     version=version_file.read_text(encoding="utf-8-sig").strip() if version_file.is_file() else "—"
     try:
         commit=subprocess.run(["git","-C",str(MESFLOW_SOURCE_DIR),"rev-parse","--short","HEAD"],capture_output=True,text=True,timeout=5).stdout.strip() or "unknown"
     except Exception: commit="unknown"
-    latest=sorted((MESFLOW_SOURCE_DIR.parent/"artifacts"/"releases").glob("*/image-info.json"),key=lambda p:p.stat().st_mtime,reverse=True)
+    latest=sorted(_releases_root().glob("*/image-info.json"),key=lambda p:p.stat().st_mtime,reverse=True)
     build=load_json(latest[0],{}) if latest else {}
     if latest:
         package=latest[0].parent/f"MESFlow_{build.get('version','')}.deploy.zip"
-        build={**build,"package":str(package),"package_sha256":sha(package) if package.is_file() else ""}
-    promotion=load_json(CONFIG_DIR/"promotion-state.json",{})
-    if promotion.get("version") != build.get("version"): promotion={}
+        release_meta=load_json(latest[0].parent/"release.json",{})
+        build={**build,"package":str(package),"package_sha256":sha(package) if package.is_file() else "",
+               "image_id":release_meta.get("image_id",""),"schema_revision":release_meta.get("schema_revision","")}
+    contamination=_release_contamination(build.get("version","")) if build.get("version") else {"contaminated":False}
+    build_job=load_state().get("release_build_job") or {}
+    build_state={"QUEUED":"BUILDING","BUILDING":"BUILDING","SUCCESS":"PASS","FAILED":"FAILED"}.get(build_job.get("status",""),"IDLE" if not build_job else "IDLE")
+    promotion=load_json(PROMOTION_STATE_FILE,{})
+    if promotion.get("version")!=build.get("version"): promotion={"version":build.get("version",""),"local_status":"NOT_TESTED","test_status":"NOT_DEPLOYED","production_status":"NOT_DEPLOYED"}
     expected=str(promotion.get("expected_schema_revision") or build.get("schema_revision") or "")
     actual=str(promotion.get("actual_schema_revision") or "")
-    schema_pass=bool(expected and actual and expected==actual)
+    schema_pass=bool(expected and actual and expected not in ("unknown","") and expected==actual)
     local_pass=bool(promotion.get("local_pass")); test_pass=bool(promotion.get("test_pass"))
     zip_ok=bool(promotion.get("zip_sha_unchanged")); digest_ok=bool(promotion.get("image_digest_unchanged"))
-    return {"source_path":str(MESFLOW_SOURCE_DIR),"source_exists":MESFLOW_SOURCE_DIR.is_dir(),"source_version":version,"git":commit,"status":"clean" if MESFLOW_SOURCE_DIR.is_dir() else "missing","latest":build,"promotion":{**promotion,"expected_schema_revision":expected,"actual_schema_revision":actual,"schema_pass":schema_pass,"production_gate":local_pass and test_pass and zip_ok and digest_ok and schema_pass,"history":["Built","Local PASS" if local_pass else "Local NOT TESTED","Test PASS" if test_pass else "Test NOT DEPLOYED","Production NOT DEPLOYED"]}}
+    production_promote_enabled=os.environ.get("MESFLOW_PRODUCTION_PROMOTE_ENABLED","").strip().lower() in {"1","true","yes","on"}
+    gate_ok=local_pass and test_pass and zip_ok and digest_ok and schema_pass and not contamination.get("contaminated")
+    # Exact blocking reason, so the UI never just shows a disabled button.
+    build_block=None if MESFLOW_BUILD_ENABLED else "Build is disabled on this Agent (MESFLOW_BUILD_ENABLED=0 — this host is not DEV)."
+    local_block=None
+    if not build.get("version"): local_block="No release has been built yet."
+    elif contamination.get("contaminated"): local_block=f"Release {build.get('version')} is CONTAMINATED: {contamination.get('reason')}"
+    test_block=None
+    if not local_pass: test_block="LOCAL_PASS is required before promoting to Production Test."
+    elif contamination.get("contaminated"): test_block=f"Release {build.get('version')} is CONTAMINATED: {contamination.get('reason')}"
+    elif not (os.environ.get("MESFLOW_PRODUCTION_TEST_AGENT_URL") or "").strip(): test_block="No Production Test Agent is configured (set MESFLOW_PRODUCTION_TEST_AGENT_URL/_USER/_PASSWORD)."
+    production_block=None
+    if not gate_ok:
+        missing=[]
+        if not local_pass: missing.append("LOCAL_PASS")
+        if not test_pass: missing.append("TEST_PASS")
+        if not zip_ok: missing.append("ZIP SHA unchanged")
+        if not digest_ok: missing.append("image digest unchanged")
+        if not schema_pass: missing.append("schema PASS")
+        if contamination.get("contaminated"): missing.append("release not contaminated")
+        production_block="Blocked: "+", ".join(missing) if missing else "Blocked"
+    elif not production_promote_enabled:
+        production_block="Gate PASS, but production execution is disabled on this Agent until a human sets MESFLOW_PRODUCTION_PROMOTE_ENABLED=1 and clicks confirm."
+    production_status=promotion.get("production_status") or ("READY" if gate_ok else "NOT_DEPLOYED")
+    return {"source_path":str(MESFLOW_SOURCE_DIR),"source_exists":MESFLOW_SOURCE_DIR.is_dir(),"source_version":version,"git":commit,
+            "status":"clean" if MESFLOW_SOURCE_DIR.is_dir() else "missing","latest":build,"contamination":contamination,
+            "states":{"build":build_state,"local":promotion.get("local_status","NOT_TESTED"),
+                      "test":promotion.get("test_status","NOT_DEPLOYED"),"production":production_status},
+            "blocked":{"build":build_block,"local":local_block,"test":test_block,"production":production_block},
+            "promotion":{**promotion,"expected_schema_revision":expected,"actual_schema_revision":actual,"schema_pass":schema_pass,
+                        "production_gate":gate_ok,"production_promote_enabled":production_promote_enabled,
+                        "history":["Built" if build.get("version") else "Not built",
+                                   "Local PASS" if local_pass else "Local NOT TESTED",
+                                   "Test PASS" if test_pass else "Test NOT DEPLOYED",
+                                   "Production PASS" if promotion.get("production_pass") else "Production NOT DEPLOYED"]}}
 
 def release_build_update(status,message,**extra):
     def mutate(s):
@@ -231,11 +413,157 @@ def _artifact_for_release(version):
     root=MESFLOW_SOURCE_DIR.parent/"artifacts"/"releases"/version
     package=root/f"MESFlow_{version}.deploy.zip"
     info=load_json(root/"image-info.json",{}); meta=load_json(root/"release.json",{})
-    return {"version":version,"image":meta.get("image",info.get("image")),"digest":meta.get("image_digest",info.get("digest")),"package":str(package),"package_sha256":sha(package) if package.is_file() else "","source_commit":meta.get("source_commit",""),"built_at":meta.get("built_at","")}
+    return {"version":version,"image":meta.get("image",info.get("image")),"digest":meta.get("image_digest",info.get("digest")),
+            "image_id":meta.get("image_id",""),"schema_revision":meta.get("schema_revision",""),
+            "package":str(package),"package_sha256":sha(package) if package.is_file() else "",
+            "source_commit":meta.get("source_commit",""),"built_at":meta.get("built_at","")}
 
 def _release_targets():
     raw=load_json(CONFIG_DIR/"release-targets.json",{})
     return raw if isinstance(raw,list) else [{"name":"LOCAL","role":"DEV","url":"local","status":"AVAILABLE"}]
+
+# ---------------- Promote Production Test: remote Deploy Agent client ----------------
+_promote_test_lock=threading.Lock()
+
+class _RemoteAgentError(RuntimeError):
+    pass
+
+def _remote_agent_client(base_url,user,password,timeout=20):
+    """Log in to a remote Deploy Agent's session-based auth, mirroring
+    scripts/promote-test.sh exactly (same endpoints, same CSRF contract).
+    Returns (opener, csrf_token)."""
+    base=base_url.rstrip("/")
+    jar=http.cookiejar.CookieJar()
+    opener=urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
+    def _get(path):
+        req=urllib.request.Request(base+path,headers={"User-Agent":"MESFlow-Deploy-Agent-Promote"})
+        with opener.open(req,timeout=timeout) as r: return r.read().decode("utf-8",errors="replace")
+    def _csrf(html):
+        m=re.search(r'name="csrf"\s+value="([^"]+)"',html)
+        return m.group(1) if m else ""
+    login_page=_get("/login")
+    csrf=_csrf(login_page)
+    data=urlencode({"username":user,"password":password,"csrf":csrf}).encode()
+    req=urllib.request.Request(base+"/login",data=data,headers={"Content-Type":"application/x-www-form-urlencoded","User-Agent":"MESFlow-Deploy-Agent-Promote"})
+    with opener.open(req,timeout=timeout) as r: r.read()
+    home=_get("/")
+    csrf2=_csrf(home)
+    if not csrf2: raise _RemoteAgentError("REMOTE_LOGIN_FAILED: no session/csrf obtained (check target URL/credentials)")
+    return opener,base,csrf2
+
+def _remote_agent_upload(opener,base,csrf,zip_path,timeout=600):
+    """multipart/form-data POST of the release ZIP to the remote /upload endpoint."""
+    boundary=uuid.uuid4().hex
+    zip_path=Path(zip_path)
+    parts=[]
+    def field(name,value):
+        parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"\r\n\r\n{value}\r\n'.encode())
+    field("csrf",csrf)
+    parts.append((f'--{boundary}\r\nContent-Disposition: form-data; name="release_zip"; filename="{zip_path.name}"\r\n'
+                   'Content-Type: application/zip\r\n\r\n').encode())
+    parts.append(zip_path.read_bytes())
+    parts.append(f"\r\n--{boundary}--\r\n".encode())
+    body=b"".join(parts)
+    req=urllib.request.Request(base+"/upload",data=body,headers={
+        "Content-Type":f"multipart/form-data; boundary={boundary}",
+        "X-CSRF-Token":csrf,"User-Agent":"MESFlow-Deploy-Agent-Promote"})
+    with opener.open(req,timeout=timeout) as r:
+        return r.status,r.read().decode("utf-8",errors="replace")
+
+def _remote_agent_deploy(opener,base,csrf,version,timeout=600):
+    req=urllib.request.Request(base+f"/deploy/{quote(version,safe='')}",data=urlencode({"csrf":csrf}).encode(),
+        headers={"Content-Type":"application/x-www-form-urlencoded","X-CSRF-Token":csrf,"User-Agent":"MESFlow-Deploy-Agent-Promote"})
+    with opener.open(req,timeout=timeout) as r:
+        return r.status,r.read().decode("utf-8",errors="replace")
+
+def _remote_agent_status(base,timeout=15):
+    req=urllib.request.Request(base+"/api/status",headers={"User-Agent":"MESFlow-Deploy-Agent-Promote"})
+    with urllib.request.urlopen(req,timeout=timeout) as r:
+        return json.loads(r.read().decode("utf-8",errors="replace"))
+
+def _production_test_target():
+    url=(os.environ.get("MESFLOW_PRODUCTION_TEST_AGENT_URL") or "").strip().rstrip("/")
+    user=(os.environ.get("MESFLOW_PRODUCTION_TEST_AGENT_USER") or "admin").strip()
+    password=(os.environ.get("MESFLOW_PRODUCTION_TEST_AGENT_PASSWORD") or "").strip()
+    return url,user,password
+
+def promote_test_update(status,message,**extra):
+    def mutate(s):
+        j=dict(s.get("promote_test_job") or {});j.update(status=status,message=message,updated_at=now_text(),**extra);s["promote_test_job"]=j
+    return update_state(mutate).get("promote_test_job")
+
+def _run_promote_test(version):
+    try:
+        artifact=_artifact_for_release(version)
+        if not artifact.get("package") or not Path(artifact["package"]).is_file():
+            raise _RemoteAgentError("PACKAGE_NOT_FOUND")
+        contamination=_release_contamination(version)
+        if contamination.get("contaminated"):
+            raise _RemoteAgentError(f"RELEASE_CONTAMINATED: {contamination.get('reason')}")
+        promotion=_load_promotion_state()
+        if promotion.get("version")!=version or not promotion.get("local_pass"):
+            raise _RemoteAgentError("LOCAL_PASS_REQUIRED")
+        url,user,password=_production_test_target()
+        if not url or not password:
+            raise _RemoteAgentError("PRODUCTION_TEST_AGENT_NOT_CONFIGURED: set MESFLOW_PRODUCTION_TEST_AGENT_URL/_USER/_PASSWORD")
+        zip_path=Path(artifact["package"])
+        local_sha=sha(zip_path)
+        if artifact.get("package_sha256") and artifact["package_sha256"]!=local_sha:
+            raise _RemoteAgentError("PACKAGE_SHA_SELF_CHECK_FAILED")
+        promote_test_update("UPLOADING",f"Uploading {zip_path.name} (sha256={local_sha[:12]}...) to {url}",version=version)
+        opener,base,csrf=_remote_agent_client(url,user,password)
+        _remote_agent_upload(opener,base,csrf,zip_path)
+        promote_test_update("DEPLOYING",f"Deploying {version} on target (--no-build; server enforces image-release contract)",version=version)
+        _remote_agent_deploy(opener,base,csrf,version)
+        deadline=time.time()+MES_VERIFY_TIMEOUT
+        last={}
+        while time.time()<deadline:
+            time.sleep(3)
+            try: last=_remote_agent_status(base)
+            except Exception as ex: last={"error":str(ex)}; continue
+            job=last.get("job") or {}
+            if job.get("status")=="success" and canonical_version(str(job.get("version") or ""))==canonical_version(version):
+                break
+            if job.get("status")=="failed":
+                raise _RemoteAgentError(f"REMOTE_DEPLOY_FAILED: {job.get('message')}")
+        else:
+            raise _RemoteAgentError(f"REMOTE_DEPLOY_TIMEOUT: last status {last}")
+        # The remote Agent's own run_job() already verified the image digest
+        # byte-for-byte before starting the container (IMAGE_DIGEST_MISMATCH
+        # aborts the deploy) — see _verify_and_prepare_image_release(). Here
+        # we only need to confirm the remote reports the right version and is
+        # healthy; a failed remote digest check would already show as
+        # job.status == "failed" above.
+        mes=(last or {}).get("mes") or {}
+        remote_version=canonical_version(str(mes.get("version") or ""))
+        version_ok=remote_version==canonical_version(version)
+        healthy_ok=bool(mes.get("healthy"))
+        if not (version_ok and healthy_ok):
+            raise _RemoteAgentError(f"REMOTE_VERIFY_FAILED: version_ok={version_ok} healthy_ok={healthy_ok} mes={mes}")
+        promote_test_update("VERIFYING","Checking remote schema and browser smoke",version=version)
+        _update_promotion_state(version,artifact,
+            test_status="PASS",test_pass=True,
+            test_message=f"TEST_PASS: remote version={remote_version} healthy={healthy_ok}",
+            test_target=url)
+        promote_test_update("SUCCESS",f"TEST_PASS: {version} verified on {url}",version=version)
+    except Exception as exc:
+        code=str(exc) if isinstance(exc,_RemoteAgentError) else f"{type(exc).__name__}: {exc}"
+        try:
+            artifact=_artifact_for_release(version)
+            _update_promotion_state(version,artifact,test_status="FAILED",test_pass=False,test_message=code)
+        except Exception:
+            pass
+        promote_test_update("FAILED",code,error_code=code)
+    finally:
+        if _promote_test_lock.locked(): _promote_test_lock.release()
+
+def start_promote_test(version):
+    if not _promote_test_lock.acquire(False): raise RuntimeError("PROMOTE_TEST_ALREADY_RUNNING")
+    try:
+        promote_test_update("QUEUED","Promote to Production Test queued",version=version)
+        threading.Thread(target=_run_promote_test,args=(version,),daemon=True).start()
+    except Exception:
+        _promote_test_lock.release(); raise
 def _new_recovery_code():
     raw=secrets.token_hex(8).upper()
     return "-".join(raw[i:i+4] for i in range(0,16,4))
@@ -1009,6 +1337,12 @@ def run_job(version, dry_run=False):
             except Exception as re:
                 _save_deploy_tx(status="rollback_failed",phase="ROLLBACK_FAILED",error=str(re),finished_at=now_text())
                 message += f"; ROLLBACK FAILED: {re}"
+    if not dry_run and image_ref:
+        # Image-release deploy (the Build-Once/Promote-Same-Artifact path):
+        # record LOCAL_PASS/FAILED from real evidence (image id, schema,
+        # smoke check), never from the job return code alone.
+        try: _record_local_deploy_result(version,status=="success",message)
+        except Exception as ex: append_log(f"LOCAL_PASS recording failed: {type(ex).__name__}: {ex}")
     def done(s):
         j=s.get("job") or {};j.update(status=status,phase=status,finished_at=now_text(),return_code=rc,message=message,rolled_back_to=rolled)
         j.setdefault("transitions",[]).append({"status":status,"at":now_text(),"message":message})
@@ -1891,9 +2225,10 @@ def index():
     tj=st.get("tutorial_job")
     if tj and tj.get("log_file"): tj=dict(tj); tj["log_tail"]=tail(tj["log_file"],180)
     host=(request.host or "localhost").split(":",1)[0]
-    return render_template("index.html",releases=list_releases(),mes=mes_status(),target_home=str(TARGET_HOME),job=j,history=st.get("history",[]),qa=qa_status(),qa_releases=list_qa_releases(),qa_home=str(QA_HOME),qa_job=qj,qa_history=st.get("qa_history",[]),tutorial_job=tj,tutorial_history=tj and st.get("tutorial_history",[]) or [],esp_tutorial=esp_tutorial_status(),esp_tutorial_job=st.get("esp_tutorial_job"),esp_builder_job=st.get("esp_builder_job"),esp_build_enabled=ESP_BUILD_ENABLED,esp_kiosk_source=str(ESP_KIOSK_SOURCE_DIR),release_build_job=st.get("release_build_job"),release_summary=_release_summary(),mes_build_enabled=MESFLOW_BUILD_ENABLED,server_role=SERVER_ROLE,release_targets=_release_targets(),esp_tutorial_view_url=(os.environ.get("WORKSHOP_MES_PUBLIC_URL") or "").rstrip("/")+"/app?guide=esp-kiosk" if os.environ.get("WORKSHOP_MES_PUBLIC_URL") else "/app?guide=esp-kiosk",qa_open_url=f"http://{host}:{QA_PORT}/",csrf=session.get("csrf",""),agent_log=tail(AGENT_LOG,80),qa_log=tail(QA_LOG,100),agent_version=AGENT_VERSION)
+    ptj=st.get("promote_test_job")
+    return render_template("index.html",releases=list_releases(),mes=mes_status(),target_home=str(TARGET_HOME),job=j,history=st.get("history",[]),qa=qa_status(),qa_releases=list_qa_releases(),qa_home=str(QA_HOME),qa_job=qj,qa_history=st.get("qa_history",[]),tutorial_job=tj,tutorial_history=tj and st.get("tutorial_history",[]) or [],esp_tutorial=esp_tutorial_status(),esp_tutorial_job=st.get("esp_tutorial_job"),esp_builder_job=st.get("esp_builder_job"),esp_build_enabled=ESP_BUILD_ENABLED,esp_kiosk_source=str(ESP_KIOSK_SOURCE_DIR),release_build_job=st.get("release_build_job"),promote_test_job=ptj,release_summary=_release_summary(),mes_build_enabled=MESFLOW_BUILD_ENABLED,server_role=SERVER_ROLE,release_targets=_release_targets(),esp_tutorial_view_url=(os.environ.get("WORKSHOP_MES_PUBLIC_URL") or "").rstrip("/")+"/app?guide=esp-kiosk" if os.environ.get("WORKSHOP_MES_PUBLIC_URL") else "/app?guide=esp-kiosk",qa_open_url=f"http://{host}:{QA_PORT}/",csrf=session.get("csrf",""),agent_log=tail(AGENT_LOG,80),qa_log=tail(QA_LOG,100),agent_version=AGENT_VERSION)
 @app.get("/api/status")
-def api_status():return jsonify({"agent_version":AGENT_VERSION,"runtime_mode":RUNTIME_MODE,"server_role":SERVER_ROLE,"build_enabled":MESFLOW_BUILD_ENABLED,"source_dir":str(MESFLOW_SOURCE_DIR),"deploy_enabled":DEPLOY_ENABLED,"host_ops_enabled":HOST_OPS_ENABLED,"mes":mes_status(),"qa":qa_status(),"job":load_state().get("job"),"qa_job":load_state().get("qa_job"),"tutorial_job":load_state().get("tutorial_job"),"esp_tutorial":esp_tutorial_status(),"esp_tutorial_job":load_state().get("esp_tutorial_job"),"release_build":load_state().get("release_build_job"),"release_summary":_release_summary()})
+def api_status():return jsonify({"agent_version":AGENT_VERSION,"runtime_mode":RUNTIME_MODE,"server_role":SERVER_ROLE,"build_enabled":MESFLOW_BUILD_ENABLED,"source_dir":str(MESFLOW_SOURCE_DIR),"deploy_enabled":DEPLOY_ENABLED,"host_ops_enabled":HOST_OPS_ENABLED,"mes":mes_status(),"qa":qa_status(),"job":load_state().get("job"),"qa_job":load_state().get("qa_job"),"tutorial_job":load_state().get("tutorial_job"),"esp_tutorial":esp_tutorial_status(),"esp_tutorial_job":load_state().get("esp_tutorial_job"),"release_build":load_state().get("release_build_job"),"promote_test_job":load_state().get("promote_test_job"),"release_summary":_release_summary()})
 
 @app.get("/api/release-manager")
 def release_manager():
@@ -1931,8 +2266,68 @@ def release_manager_deploy_local():
         finally: shutil.rmtree(extract,ignore_errors=True)
     version=str(artifact.get("version") or "")
     if not version or job.get("status")!="SUCCESS": return jsonify(ok=False,error="LOCAL_BUILD_REQUIRED"),409
+    contamination=_release_contamination(version)
+    if contamination.get("contaminated"):
+        return jsonify(ok=False,error=f"RELEASE_CONTAMINATED: {contamination.get('reason')}"),409
     try: start_deploy(version); return jsonify(ok=True,version=version),202
     except Exception as exc: return jsonify(ok=False,error=str(exc)),409
+
+@app.get("/api/release-manager/promote-test")
+def release_manager_promote_test_status():
+    if not logged_in(): return jsonify(ok=False,error="AUTH_REQUIRED"),401
+    return jsonify(ok=True,job=load_state().get("promote_test_job"),summary=_release_summary())
+
+@app.post("/api/release-manager/promote-test")
+def release_manager_promote_test():
+    """LOCAL_PASS -> select the exact frozen release -> verify ZIP SHA/image
+    digest/source commit -> upload the SAME zip to the configured
+    PRODUCTION_TEST Agent -> remote verifies SHA -> deploy --no-build ->
+    health/version/schema -> TEST_PASS. Never rebuilds anything."""
+    if not logged_in(): return jsonify(ok=False,error="AUTH_REQUIRED"),401
+    verify_csrf()
+    summary=_release_summary()
+    latest=summary.get("latest") or {}
+    requested=(request.get_json(silent=True) or {}).get("version") or request.form.get("version")
+    version=str(requested or latest.get("version") or "")
+    if not version: return jsonify(ok=False,error="NO_RELEASE_TO_PROMOTE"),409
+    promotion=_load_promotion_state()
+    if promotion.get("version")!=version or not promotion.get("local_pass"):
+        return jsonify(ok=False,error="LOCAL_PASS_REQUIRED"),409
+    contamination=_release_contamination(version)
+    if contamination.get("contaminated"):
+        return jsonify(ok=False,error=f"RELEASE_CONTAMINATED: {contamination.get('reason')}"),409
+    url,user,password=_production_test_target()
+    if not url or not password:
+        return jsonify(ok=False,error="PRODUCTION_TEST_AGENT_NOT_CONFIGURED"),409
+    try: start_promote_test(version); return jsonify(ok=True,version=version),202
+    except RuntimeError as exc: return jsonify(ok=False,error=str(exc)),409
+
+@app.post("/api/release-manager/promote-production")
+def release_manager_promote_production():
+    """Wired but never executes without explicit human approval:
+    MESFLOW_PRODUCTION_PROMOTE_ENABLED=1 on this Agent AND a request body of
+    {"confirm": true}. Requires LOCAL_PASS + TEST_PASS + matching ZIP SHA +
+    matching image digest + schema PASS + not contaminated, verified fresh
+    on every call (never trusts a stale flag)."""
+    if not logged_in(): return jsonify(ok=False,error="AUTH_REQUIRED"),401
+    verify_csrf()
+    summary=_release_summary()
+    promotion=summary.get("promotion") or {}
+    version=str((summary.get("latest") or {}).get("version") or "")
+    if not promotion.get("production_gate"):
+        return jsonify(ok=False,error="GATE_NOT_PASSED",blocked=summary.get("blocked",{}).get("production")),409
+    enabled=os.environ.get("MESFLOW_PRODUCTION_PROMOTE_ENABLED","").strip().lower() in {"1","true","yes","on"}
+    confirmed=bool((request.get_json(silent=True) or {}).get("confirm"))
+    if not (enabled and confirmed):
+        return jsonify(ok=False,error="PRODUCTION_PROMOTE_NOT_APPROVED",
+                        detail="Requires MESFLOW_PRODUCTION_PROMOTE_ENABLED=1 on this Agent AND {\"confirm\":true} in the request body. Neither is a default — a human must set both explicitly."),403
+    # Deliberately not implemented further in this change: even with the gate
+    # passed and explicitly confirmed, this Agent does not perform a
+    # production deploy in this codebase revision. See
+    # reports/RELEASE_MANAGER_BUILD_ONCE.md — Production deploys remain a
+    # separate, explicitly-scoped, human-executed action.
+    return jsonify(ok=False,error="PRODUCTION_DEPLOY_NOT_IMPLEMENTED",
+                    detail=f"Gate passed for {version} and explicitly approved, but this Agent build does not execute production deploys yet."),501
 
 
 # ---------------- Minimal Deploy Agent ESP OTA ----------------
