@@ -26,7 +26,7 @@ import agent_backend.db_backup as db_backup  # P4 Backup/DB/Storage Center -- re
 import agent_backend.fleet as fleet  # P5 Multi-server: Server Registry / Fleet Health -- see fleet.py module docstring.
 import agent_backend.incident_recovery as recovery  # Server Incident Recovery Console -- see incident_recovery.py module docstring.
 
-AGENT_VERSION="2.24.3-docker-runtime"
+AGENT_VERSION="2.24.4-docker-runtime"
 # Bumped when the wire contract changes in a way a caller might need to
 # branch on (new required fields, new endpoints a promotion depends on).
 # Independent of AGENT_VERSION: two different AGENT_VERSION builds can
@@ -36,7 +36,7 @@ API_PROTOCOL_VERSION=2
 # Capabilities this Agent build actually implements. A promotion (or the
 # DEV Target Agents table) checks REQUIRED_CAPABILITIES against this list
 # -- never AGENT_VERSION strings -- to decide COMPATIBLE/INCOMPATIBLE.
-AGENT_CAPABILITIES=["image_release_receive","digest_verify","remote_deploy","deploy_status","health_status","agent_self_update","qa_image_release_receive","qa_deploy","release_gate_evidence","operations_incidents","predictive_health","incident_ai_advisory","deployment_platform","build_once_local"]
+AGENT_CAPABILITIES=["image_release_receive","digest_verify","remote_deploy","deploy_status","health_status","agent_self_update","qa_image_release_receive","qa_deploy","release_gate_evidence","operations_incidents","predictive_health","incident_ai_advisory","deployment_platform","build_once_local","mes_release_test_gate"]
 AGENT_HOME=Path(os.environ.get("WORKSHOP_AGENT_HOME","/opt/mesflow-agent"))
 TARGET_HOME=Path(os.environ.get("WORKSHOP_TARGET_HOME","/opt/mesflow"))
 QA_HOME=Path(os.environ.get("MESFLOW_QA_HOME","/opt/mesflow-qa-center"))
@@ -439,7 +439,19 @@ def _record_gate_run(version,payload):
     _update_promotion_state(version,_artifact_for_release(version),**fields)
     return evidence
 
-def _invoke_qa_profile(version,environment,timeout=600):
+def _run_qa_profile(version,environment,timeout=600):
+    """Runs the given release-gate profile against THIS Agent's own local
+    QA Center (QA_URL is always this host's own internal-only QA Center --
+    never a remote one) and returns the raw run payload, WITHOUT recording
+    it anywhere. Split out of _invoke_qa_profile() so a "TEST" run can be
+    triggered remotely: only the Agent physically co-located with a given
+    MESFlow instance can reach that instance's own internal-only QA
+    Center, so a "release-test" run against the Production Test target is
+    always executed BY that target's own Agent (via the
+    /release-manager/run-test-gate/<version> endpoint below) and the raw
+    payload is shipped back over HTTP to the promoting (DEV) Agent, which
+    records it into its own evidence store -- see _remote_agent_run_test_gate()
+    and the v70 branch of _run_promote_test()."""
     ident=_gate_identity(version);profile="release-local" if environment=="LOCAL" else "release-test"
     body=json.dumps({"profile":profile,"release_version":version,"artifact_digest":ident.artifact_digest}).encode()
     request_start=urllib.request.Request(QA_URL+"/api/release-runs",data=body,method="POST",headers={"Content-Type":"application/json"})
@@ -454,8 +466,11 @@ def _invoke_qa_profile(version,environment,timeout=600):
         with urllib.request.urlopen(QA_URL+f"/api/runs/{quote(run_id)}",timeout=20) as response:last=json.loads(response.read().decode()).get("run") or {}
         if last.get("status") not in {"RUNNING","QUEUED"}:break
     else:raise RuntimeError("QA_RUN_TIMEOUT")
-    payload={**last,"run_id":run_id,"environment":environment,"profile":profile,"artifact_digest":ident.artifact_digest,
+    return {**last,"run_id":run_id,"environment":environment,"profile":profile,"artifact_digest":ident.artifact_digest,
              "finished_at":last.get("ended_at"),"total_tests":last.get("total",0),"passed_tests":last.get("passed",0),"failed_tests":last.get("failed",0)}
+
+def _invoke_qa_profile(version,environment,timeout=600):
+    payload=_run_qa_profile(version,environment,timeout=timeout)
     return _record_gate_run(version,payload)
 
 def _run_local_gate(version):
@@ -1039,6 +1054,20 @@ def _remote_agent_qa_upload(opener,base,csrf,zip_path,timeout=600):
 def _remote_agent_qa_deploy(opener,base,csrf,version,timeout=600):
     return _remote_agent_deploy(opener,base,csrf,version,timeout=timeout,path_fmt="/qa-release/deploy/{}")
 
+def _remote_agent_run_test_gate(opener,base,csrf,version,timeout=650):
+    """POST to a remote Agent's release-test QA gate endpoint and return
+    the parsed JSON payload. Long timeout on purpose: the remote side
+    blocks synchronously while ITS OWN local QA Center runs the full
+    "release-test" check suite against ITS OWN internal MESFlow (mirrors
+    _run_qa_profile()'s own up-to-600s wait, plus headroom for the extra
+    HTTP hop) -- this call happens inside _run_promote_test()'s own
+    background thread, so blocking here does not freeze the UI."""
+    req=urllib.request.Request(base+f"/release-manager/run-test-gate/{quote(version,safe='')}",
+        data=urlencode({"csrf":csrf}).encode(),
+        headers={"Content-Type":"application/x-www-form-urlencoded","X-CSRF-Token":csrf,"User-Agent":"MESFlow-Deploy-Agent-Promote"})
+    with opener.open(req,timeout=timeout) as r:
+        return json.loads(r.read().decode("utf-8",errors="replace"))
+
 def _remote_agent_status(opener,base,timeout=25):
     # Must reuse the authenticated opener (session cookie from
     # _remote_agent_client): /api/status is not in the Agent's login-exempt
@@ -1506,7 +1535,55 @@ def _run_promote_test(version):
             test_deployment_verified=True,test_deployed_digest=str(artifact.get("digest") or artifact.get("image_digest") or ""),
             test_message=("TEST deployment verified; release-test QA evidence required" if v70 else f"TEST_PASS: remote version={remote_version} healthy={healthy_ok}"),
             test_target=url)
-        promote_test_update("SUCCESS",f"TEST deployed and digest verified: {version}" if v70 else f"TEST_PASS: {version} verified on {url}",version=version)
+        if not v70:
+            promote_test_update("SUCCESS",f"TEST_PASS: {version} verified on {url}",version=version)
+        elif "mes_release_test_gate" not in (target_status.get("capabilities") or []):
+            # Older target Agent, pre-dating this gate: deployment is real
+            # and verified, but nothing can run the release-test QA check
+            # remotely yet. Degrade visibly rather than silently -- never
+            # invent a PASS.
+            promote_test_update("SUCCESS",
+                f"TEST deployed and digest verified: {version}; release-test QA gate skipped "
+                f"(target Agent {target_status.get('agent_version','')} does not support "
+                f"mes_release_test_gate yet -- update the Deploy Agent on that host)",version=version)
+        else:
+            # Only the Agent physically co-located with a MESFlow instance
+            # can reach that instance's own internal-only QA Center -- ask
+            # the TARGET Agent to run "release-test" against ITS OWN local
+            # QA Center (mirrors _run_local_gate(), just over HTTP), then
+            # record the returned evidence into THIS (promoting) Agent's
+            # own evidence store, since DEV owns the authoritative
+            # production-readiness gate for this release.
+            promote_test_update("RUNNING_TEST_QA_GATE",
+                "Deployed and verified; running release-test QA evidence on the Production Test Agent's own QA Center",
+                version=version)
+            try:
+                gate_response=_remote_agent_run_test_gate(opener,base,csrf,version)
+                if not gate_response.get("ok"):
+                    raise RuntimeError(str(gate_response.get("error") or "TEST_QA_GATE_FAILED"))
+                # _record_gate_run() already appends this TEST run to the
+                # evidence store and calls _update_promotion_state() itself
+                # (test_status = this TEST run's own PASS/FAIL, test_pass =
+                # the FULL holistic gate decision -- LOCAL run + TEST
+                # deployment + TEST run + no blocking known issues, a
+                # stricter bar than LOCAL_PASS on purpose since this is the
+                # last checkpoint before Production). Do not recompute or
+                # overwrite either field here.
+                evidence=_record_gate_run(version,gate_response["payload"])
+                test_status_final=evidence["test"]["status"]
+                promote_test_update("SUCCESS",
+                    f"TEST deployed and digest verified: {version}; release-test QA {test_status_final} "
+                    f"(production-readiness: {evidence['decision']['decision']})",version=version)
+            except Exception as gate_exc:
+                # The DEPLOYMENT itself succeeded (test_deployment_verified
+                # is already True above) -- only the QA evidence step
+                # failed. Keep that distinction visible instead of masking
+                # a real deploy success as a promote failure.
+                gate_code=f"{type(gate_exc).__name__}: {gate_exc}"
+                _update_promotion_state(version,artifact,test_status="FAILED",test_pass=False,
+                    test_message=f"Deployed OK, but release-test QA gate failed: {gate_code}")
+                promote_test_update("SUCCESS",
+                    f"TEST deployed and digest verified: {version}; release-test QA gate FAILED: {gate_code}",version=version)
         # Run cleanup only after a successful, verified promotion.
         try: _cleanup_old_releases("TEST_PASS")
         except Exception as ex: append_log(f"Release cleanup after TEST_PASS failed: {type(ex).__name__}: {ex}")
@@ -4251,6 +4328,28 @@ def release_manager_deploy_local():
         return jsonify(ok=False,error=f"RELEASE_CONTAMINATED: {contamination.get('reason')}"),409
     try: start_deploy(version); return jsonify(ok=True,version=version),202
     except Exception as exc: return jsonify(ok=False,error=str(exc)),409
+
+@app.post("/release-manager/run-test-gate/<version>")
+def release_manager_run_test_gate(version):
+    """Runs the "release-test" QA evidence profile against THIS Agent's
+    own local QA Center (this host's own internal-only MESFlow) and
+    returns the raw run payload -- observes only, never records anything
+    itself and never mutates a deployment. Called remotely by the
+    promoting (DEV) Agent right after it has already verified an
+    image-release deploy to this host; the caller records the returned
+    payload into ITS OWN evidence store via _record_gate_run(), since only
+    the promoting Agent owns the authoritative production-readiness gate
+    for a release. This is the MESFlow-release equivalent of what
+    _run_local_gate() already does locally for LOCAL -- see
+    _run_qa_profile() and _remote_agent_run_test_gate()."""
+    if not logged_in(): return jsonify(ok=False,error="AUTH_REQUIRED"),401
+    verify_csrf()
+    try:
+        version=norm(version)
+        payload=_run_qa_profile(version,"TEST")
+        return jsonify(ok=True,payload=payload)
+    except Exception as exc:
+        return jsonify(ok=False,error=str(exc)),409
 
 @app.get("/api/release-manager/promote-test")
 def release_manager_promote_test_status():
