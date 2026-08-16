@@ -26,7 +26,7 @@ import agent_backend.db_backup as db_backup  # P4 Backup/DB/Storage Center -- re
 import agent_backend.fleet as fleet  # P5 Multi-server: Server Registry / Fleet Health -- see fleet.py module docstring.
 import agent_backend.incident_recovery as recovery  # Server Incident Recovery Console -- see incident_recovery.py module docstring.
 
-AGENT_VERSION="2.24.4-docker-runtime"
+AGENT_VERSION="2.24.5-docker-runtime"
 # Bumped when the wire contract changes in a way a caller might need to
 # branch on (new required fields, new endpoints a promotion depends on).
 # Independent of AGENT_VERSION: two different AGENT_VERSION builds can
@@ -439,7 +439,22 @@ def _record_gate_run(version,payload):
     _update_promotion_state(version,_artifact_for_release(version),**fields)
     return evidence
 
-def _run_qa_profile(version,environment,timeout=600):
+def _received_release_digest(version):
+    """The image_digest THIS Agent itself received and deployed for
+    `version`, read from its own local RELEASES_DIR/<version>/release.json
+    -- the receive-side layout, populated by /upload + /deploy. Deliberately
+    NOT _gate_identity()'s artifacts/releases/ workspace layout: that only
+    ever exists on DEV. Real bug found live the first time the release-test
+    gate endpoint was exercised against an actual Production Test host:
+    _gate_identity(version) there raised INVALID_ARTIFACT_DIGEST because
+    DEV's workspace tree simply isn't present on a receiving target."""
+    meta=load_json(RELEASES_DIR/version/"release.json",{})
+    digest=str(meta.get("image_digest") or "").strip()
+    if not re.fullmatch(r"sha256:[0-9a-f]{64}",digest):
+        raise ValueError(f"NO_LOCAL_RELEASE_DIGEST: {RELEASES_DIR/version/'release.json'} missing/invalid image_digest")
+    return digest
+
+def _run_qa_profile(version,environment,timeout=600,artifact_digest=None):
     """Runs the given release-gate profile against THIS Agent's own local
     QA Center (QA_URL is always this host's own internal-only QA Center --
     never a remote one) and returns the raw run payload, WITHOUT recording
@@ -451,9 +466,16 @@ def _run_qa_profile(version,environment,timeout=600):
     /release-manager/run-test-gate/<version> endpoint below) and the raw
     payload is shipped back over HTTP to the promoting (DEV) Agent, which
     records it into its own evidence store -- see _remote_agent_run_test_gate()
-    and the v70 branch of _run_promote_test()."""
-    ident=_gate_identity(version);profile="release-local" if environment=="LOCAL" else "release-test"
-    body=json.dumps({"profile":profile,"release_version":version,"artifact_digest":ident.artifact_digest}).encode()
+    and the v70 branch of _run_promote_test().
+
+    artifact_digest defaults to _gate_identity(version) (DEV's own
+    workspace-tree view, correct for the LOCAL call site below) -- pass it
+    explicitly (see _received_release_digest()) when this runs on a
+    receiving target, which has no such workspace tree at all."""
+    if artifact_digest is None:
+        artifact_digest=_gate_identity(version).artifact_digest
+    profile="release-local" if environment=="LOCAL" else "release-test"
+    body=json.dumps({"profile":profile,"release_version":version,"artifact_digest":artifact_digest}).encode()
     request_start=urllib.request.Request(QA_URL+"/api/release-runs",data=body,method="POST",headers={"Content-Type":"application/json"})
     try:
         with urllib.request.urlopen(request_start,timeout=20) as response:started=json.loads(response.read().decode())
@@ -466,7 +488,7 @@ def _run_qa_profile(version,environment,timeout=600):
         with urllib.request.urlopen(QA_URL+f"/api/runs/{quote(run_id)}",timeout=20) as response:last=json.loads(response.read().decode()).get("run") or {}
         if last.get("status") not in {"RUNNING","QUEUED"}:break
     else:raise RuntimeError("QA_RUN_TIMEOUT")
-    return {**last,"run_id":run_id,"environment":environment,"profile":profile,"artifact_digest":ident.artifact_digest,
+    return {**last,"run_id":run_id,"environment":environment,"profile":profile,"artifact_digest":artifact_digest,
              "finished_at":last.get("ended_at"),"total_tests":last.get("total",0),"passed_tests":last.get("passed",0),"failed_tests":last.get("failed",0)}
 
 def _invoke_qa_profile(version,environment,timeout=600):
@@ -1065,8 +1087,20 @@ def _remote_agent_run_test_gate(opener,base,csrf,version,timeout=650):
     req=urllib.request.Request(base+f"/release-manager/run-test-gate/{quote(version,safe='')}",
         data=urlencode({"csrf":csrf}).encode(),
         headers={"Content-Type":"application/x-www-form-urlencoded","X-CSRF-Token":csrf,"User-Agent":"MESFlow-Deploy-Agent-Promote"})
-    with opener.open(req,timeout=timeout) as r:
-        return json.loads(r.read().decode("utf-8",errors="replace"))
+    try:
+        with opener.open(req,timeout=timeout) as r:
+            return json.loads(r.read().decode("utf-8",errors="replace"))
+    except urllib.error.HTTPError as e:
+        # urlopen()/opener.open() raise on any non-2xx status instead of
+        # returning it -- without this, the endpoint's real {"ok":false,
+        # "error":"..."} body (e.g. INVALID_ARTIFACT_DIGEST) is completely
+        # lost behind a bare "HTTP Error 409: Conflict". Real bug found
+        # live the first time this was exercised against an actual
+        # Production Test host.
+        try:
+            return json.loads(e.read().decode("utf-8",errors="replace"))
+        except Exception:
+            return {"ok":False,"error":f"HTTP {e.code}: {e.reason}"}
 
 def _remote_agent_status(opener,base,timeout=25):
     # Must reuse the authenticated opener (session cookie from
@@ -4346,7 +4380,8 @@ def release_manager_run_test_gate(version):
     verify_csrf()
     try:
         version=norm(version)
-        payload=_run_qa_profile(version,"TEST")
+        digest=_received_release_digest(version)
+        payload=_run_qa_profile(version,"TEST",artifact_digest=digest)
         return jsonify(ok=True,payload=payload)
     except Exception as exc:
         return jsonify(ok=False,error=str(exc)),409

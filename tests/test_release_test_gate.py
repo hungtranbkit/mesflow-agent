@@ -219,5 +219,93 @@ class ReleaseTestGateFlowTests(unittest.TestCase):
         self.assertIn("does not support mes_release_test_gate", job.get("message", ""))
 
 
+class _FakeLocalQaCenter(http.server.BaseHTTPRequestHandler):
+    """Stands in for QA_URL -- what release_manager_run_test_gate() itself
+    calls out to on the RECEIVING (target) side. Minimal /api/release-runs
+    (POST, starts a run) + /api/runs/<id> (GET, poll) contract."""
+
+    def log_message(self, *a):
+        pass
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", 0))
+        self.rfile.read(length)
+        body = json.dumps({"ok": True, "run": {"run_id": "RUN-1", "status": "PASSED",
+                                                 "passed": 3, "failed": 0, "total": 3,
+                                                 "ended_at": "2026-01-01T00:00:00"}}).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        self.do_POST()
+
+
+class RunTestGateEndpointServerSideTests(unittest.TestCase):
+    """Exercises the REAL /release-manager/run-test-gate/<version> route
+    (the RECEIVING side, not the promoting side covered above) via
+    app.test_client() -- this is the side that actually reads its own
+    RELEASES_DIR/<version>/release.json. The fake-target-over-a-socket
+    tests above never touch this code at all (they fake the whole
+    endpoint), which is exactly how the real INVALID_ARTIFACT_DIGEST bug
+    (_gate_identity()'s DEV-only artifacts/releases/ workspace path doesn't
+    exist on a receiving target) went unnoticed until exercised against a
+    real Production Test host."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        self.releases_dir = root / "releases"
+        self.version = "70.0.0.2"
+        release = self.releases_dir / self.version
+        release.mkdir(parents=True)
+        self.digest = "sha256:" + "b" * 64
+        (release / "release.json").write_text(json.dumps({
+            "type": "mesflow-image-release", "version": self.version,
+            "image": f"mesflow-app:{self.version}", "image_digest": self.digest,
+        }))
+
+        self.old = {"RELEASES_DIR": agent.RELEASES_DIR, "QA_URL": agent.QA_URL}
+        agent.RELEASES_DIR = self.releases_dir
+
+        self.qa_server = http.server.HTTPServer(("127.0.0.1", 0), _FakeLocalQaCenter)
+        self.qa_port = self.qa_server.server_address[1]
+        agent.QA_URL = f"http://127.0.0.1:{self.qa_port}"
+        self.qa_thread = threading.Thread(target=self.qa_server.serve_forever, daemon=True)
+        self.qa_thread.start()
+
+        self.client = agent.app.test_client()
+        with self.client.session_transaction() as s:
+            s["authenticated"] = True
+            s["csrf"] = "test-csrf"
+
+    def tearDown(self):
+        self.qa_server.shutdown()
+        self.qa_thread.join(timeout=5)
+        for k, v in self.old.items():
+            setattr(agent, k, v)
+        self.tmp.cleanup()
+
+    def test_endpoint_resolves_its_own_local_release_digest(self):
+        resp = self.client.post(f"/release-manager/run-test-gate/{self.version}",
+                                 data={"csrf": "test-csrf"})
+        body = resp.get_json()
+        self.assertTrue(body.get("ok"), body)
+        self.assertEqual(body["payload"]["artifact_digest"], self.digest)
+        self.assertEqual(body["payload"]["environment"], "TEST")
+        self.assertEqual(body["payload"]["profile"], "release-test")
+        self.assertEqual(body["payload"]["status"], "PASSED")
+
+    def test_endpoint_reports_a_real_error_for_an_unknown_version(self):
+        resp = self.client.post("/release-manager/run-test-gate/9.9.9.9",
+                                 data={"csrf": "test-csrf"})
+        self.assertEqual(resp.status_code, 409)
+        body = resp.get_json()
+        self.assertFalse(body.get("ok"))
+        self.assertIn("NO_LOCAL_RELEASE_DIGEST", body.get("error", ""))
+
+
 if __name__ == "__main__":
     unittest.main()
