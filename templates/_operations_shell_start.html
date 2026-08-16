@@ -15,6 +15,7 @@
       <a class="{{'active' if page_key=='releases' and request.args.get('tab','deploy')=='deploy' else ''}}" href="{{url_for('release_manager_page')}}?tab=deploy">Release &amp; Deploy</a>
       <a class="{{'active' if page_key=='releases' and request.args.get('tab')=='history' else ''}}" href="{{url_for('release_manager_page')}}?tab=history">Lịch sử triển khai</a>
       <a class="{{'active' if page_key=='releases' and request.args.get('tab')=='agent-update' else ''}}" href="{{url_for('release_manager_page')}}?tab=agent-update">Agent Update</a>
+      <a class="{{'active' if page_key=='releases' and request.args.get('tab')=='guide' else ''}}" href="{{url_for('release_manager_page')}}?tab=guide">Hướng dẫn</a>
     </nav></div>
     <div class="ops-nav-group"><div>ESP KIOSK</div><nav class="ops-nav">
       <a class="{{'active' if page_key=='kiosk' and active_tab=='overview' else ''}}" href="{{url_for('kiosk_overview_page')}}">Tổng quan</a>

@@ -1,0 +1,131 @@
+<ul class="guide-toc">
+  <li><a href="#g-pipeline">Luồng chung</a></li>
+  <li><a href="#g-envs">3 môi trường</a></li>
+  <li><a href="#g-test">Đẩy sang Production Test</a></li>
+  <li><a href="#g-prod">Đẩy sang Production</a></li>
+  <li><a href="#g-role">Vai trò Agent này</a></li>
+  <li><a href="#g-qa">QA Center</a></li>
+  <li><a href="#g-agent">Deploy Agent / Bootstrap mới</a></li>
+  <li><a href="#g-incidents">Sự cố đã gặp</a></li>
+</ul>
+
+<div class="rel-card guide-card ops-anchor-target" id="g-pipeline">
+  <h4>Luồng chung — build một lần, promote nguyên digest</h4>
+  <p class="sub">Không bao giờ build lại giữa các môi trường. DEV build → Local verify → Test verify → Production (cần người duyệt).</p>
+  <div class="ops-pipeline" aria-label="Luồng minh hoạ">
+    <div class="ops-pipeline-stage ready"><div class="label">BUILD</div><div class="state">Trên DEV</div><div class="why">scripts/build-release.sh</div></div>
+    <div class="ops-pipeline-stage ready"><div class="label">LOCAL</div><div class="state">Deploy Local</div><div class="why">--no-build + LOCAL_PASS tự động</div></div>
+    <div class="ops-pipeline-stage pending"><div class="label">TEST</div><div class="state">Promote Test</div><div class="why">bấm trên DEV, Agent kia tự deploy</div></div>
+    <div class="ops-pipeline-stage production pending"><div class="label">PRODUCTION</div><div class="state">Cần duyệt người</div><div class="why">không có luồng tự động</div></div>
+  </div>
+</div>
+
+<div class="rel-card guide-card ops-anchor-target" id="g-envs">
+  <h4>3 môi trường</h4>
+  <table class="guide-table">
+    <thead><tr><th>Máy</th><th>SERVER_ROLE</th><th>Build</th><th>Compose override cộng thêm</th></tr></thead>
+    <tbody>
+      <tr><td>DEV local</td><td class="k">DEV</td><td>Bật</td><td class="k">compose.dev.override.yml</td></tr>
+      <tr><td>Production Test</td><td class="k">PRODUCTION_TEST</td><td>Tắt</td><td class="k">compose.production-test.override.yml</td></tr>
+      <tr><td>Production</td><td class="k">PRODUCTION</td><td>Tắt</td><td class="k">compose.production.override.yml</td></tr>
+    </tbody>
+  </table>
+  <p class="sub" style="margin:6px 0 0">Máy mới cài qua Bootstrap luôn cộng thêm <code class="k" style="font-family:ui-monospace,SFMono-Regular,Consolas,monospace">compose.bootstrap.override.yml</code> (chỉ để bind port 8090) song song với override vai trò ở trên.</p>
+</div>
+
+<div class="rel-card guide-card ops-anchor-target" id="g-test">
+  <h4>Đẩy sang Production Test</h4>
+  <p class="sub">Thao tác 100% trên máy DEV này — không bao giờ vào máy Production Test tự bấm gì. Bấm <b>Promote to Test</b> ở tab Release &amp; Deploy, Agent DEV tự upload + gọi deploy trên Agent của máy Test.</p>
+
+  <div class="guide-env-row">
+    <span>Trạng thái cấu hình target Production Test:</span>
+    {% if guide_test_target_configured %}
+      <span class="ops-badge healthy">ĐÃ CẤU HÌNH</span>
+      <span class="k" style="font-family:ui-monospace,SFMono-Regular,Consolas,monospace;color:var(--ops-muted)">{{guide_test_target_url}}</span>
+    {% else %}
+      <span class="ops-badge critical">CHƯA CẤU HÌNH</span>
+    {% endif %}
+  </div>
+
+  {% if not guide_test_target_configured %}
+  <p style="font-size:12.8px;margin:0 0 4px">Chưa có thì nút "Promote to Test" sẽ luôn bị mờ với lý do "No Production Test Agent is configured". Cách cấu hình — chỉ set qua biến môi trường của chính container này, không có form nào trên giao diện lưu được 3 giá trị này (cố ý, tránh lộ mật khẩu qua log/API):</p>
+  <div class="guide-code"><span class="c"># trên máy DEV (máy đang chạy Agent này)</span>
+sudo tee -a /opt/mesflow-deploy-agent/docker/.env &lt;&lt;'EOF'
+MESFLOW_PRODUCTION_TEST_AGENT_URL=https://&lt;domain-hoặc-ip&gt;:8090
+MESFLOW_PRODUCTION_TEST_AGENT_USER=&lt;user đăng nhập Agent trên máy Test&gt;
+MESFLOW_PRODUCTION_TEST_AGENT_PASSWORD=&lt;mật khẩu&gt;
+EOF
+cd /opt/mesflow-deploy-agent/docker
+docker compose -f compose.linux.yml -f compose.dev.override.yml -f compose.bootstrap.override.yml up -d</div>
+  {% endif %}
+
+  <ol class="guide-steps">
+    <li><b>Build + Deploy Local</b><p>Ở tab Release &amp; Deploy, bấm Build Release rồi Deploy Local cho version cần đẩy.</p></li>
+    <li><b>Chờ LOCAL_PASS</b><p>Tự động chạy sau Deploy Local: kiểm image id + schema + smoke test, với version ≥70 còn tự gọi QA Center chạy thêm "release-local" evidence. Badge LOCAL chuyển PASS mới đủ điều kiện.</p></li>
+    <li><b>Bấm "Promote to Test"</b><p>Chỉ hiện đủ điều kiện khi LOCAL_PASS + đã cấu hình target ở trên. DEV Agent tự kiểm máy Test đúng SERVER_ROLE=PRODUCTION_TEST và build_enabled=false trước khi đẩy — sai vai trò sẽ bị từ chối, không đẩy nhầm.</p></li>
+    <li><b>Xác nhận TEST_PASS</b><p>Badge TEST chuyển PASS sau khi Agent verify health/version trên máy Test xong.</p></li>
+  </ol>
+  <p class="sub" style="margin-top:8px">QA Center dùng <b>chung đúng 3 biến này</b> để promote sang Production Test — không cần cấu hình riêng.</p>
+</div>
+
+<div class="rel-card guide-card ops-anchor-target" id="g-prod">
+  <h4>Đẩy sang Production</h4>
+  <p class="sub">Luôn cần người bấm xác nhận riêng, mỗi lần — không có luồng tự động nào bỏ qua bước này.</p>
+  <div class="guide-env-row">
+    <span>Target Production:</span>
+    {% if guide_prod_target_configured %}<span class="ops-badge healthy">ĐÃ CẤU HÌNH</span><span class="k" style="font-family:ui-monospace,SFMono-Regular,Consolas,monospace;color:var(--ops-muted)">{{guide_prod_target_url}}</span>{% else %}<span class="ops-badge critical">CHƯA CẤU HÌNH</span>{% endif %}
+  </div>
+  <div class="guide-env-row">
+    <span>Cho phép promote Production (MESFLOW_PRODUCTION_PROMOTE_ENABLED):</span>
+    {% if guide_prod_promote_enabled %}<span class="ops-badge healthy">BẬT</span>{% else %}<span class="ops-badge blocked">TẮT</span>{% endif %}
+  </div>
+  <p style="font-size:12.8px;margin:8px 0 0">Điều kiện đầy đủ: LOCAL_PASS + TEST_PASS + ZIP SHA/image digest/schema khớp + không bị đánh dấu CONTAMINATED + <span class="k" style="font-family:ui-monospace,SFMono-Regular,Consolas,monospace">MESFLOW_PRODUCTION_PROMOTE_ENABLED=1</span> trên Agent này + body request có <span class="k" style="font-family:ui-monospace,SFMono-Regular,Consolas,monospace">{"confirm": true}</span> tường minh mỗi lần bấm.</p>
+</div>
+
+<div class="rel-card guide-card ops-anchor-target" id="g-role">
+  <h4>Vai trò của chính Agent này</h4>
+  <div class="guide-env-row">
+    <span>SERVER_ROLE hiện tại:</span>
+    <span class="ops-badge {{'healthy' if server_role=='DEV' else 'warning' if server_role=='PRODUCTION_TEST' else 'critical'}}">{{server_role}}</span>
+    <span class="ops-badge {{'healthy' if mes_build_enabled else 'blocked'}}">{{'BUILD BẬT' if mes_build_enabled else 'BUILD TẮT'}}</span>
+  </div>
+  <p style="font-size:12.8px;margin:0">Máy này nên là <b>DEV</b> + build bật nếu đây là máy phát triển/build. Nếu vai trò sai (ví dụ vừa cài lại Agent qua Bootstrap mà tự dưng thành PRODUCTION_TEST), sửa bằng đúng combo compose ở bảng "3 môi trường" rồi recreate container — xem sự cố thật bên dưới.</p>
+</div>
+
+<div class="rel-card guide-card ops-anchor-target" id="g-qa">
+  <h4>QA Center — build/deploy</h4>
+  <p class="sub">QA Center chỉ build; Deploy Agent chịu deploy. Hai đường có thể bấm build:</p>
+  <ul style="font-size:12.8px;margin:0;padding-left:1.2em">
+    <li>Ngay trong chính QA Center — trang "Release Package" (chỉ hiện khi chạy trực tiếp từ workspace, không có trong image đã đóng gói).</li>
+    <li>Ngay ở đây — thẻ QA Center bên trong tab Release &amp; Deploy, nút "Build Release".</li>
+  </ul>
+  <p style="font-size:12.8px;margin:8px 0 0">Cả hai gọi <b>cùng một</b> <span class="k" style="font-family:ui-monospace,SFMono-Regular,Consolas,monospace">qa-center/scripts/build-release.sh</span> — không có bản build song song. Version đã đóng băng thì build lại sẽ báo lỗi <span class="k" style="font-family:ui-monospace,SFMono-Regular,Consolas,monospace">VERSION_ALREADY_RELEASED</span> — không phải bug, tăng version (<span class="k" style="font-family:ui-monospace,SFMono-Regular,Consolas,monospace">qa-center/current/VERSION</span> + <span class="k" style="font-family:ui-monospace,SFMono-Regular,Consolas,monospace">APP_VERSION</span> trong agent.py, hai chỗ phải khớp nhau) rồi build lại.</p>
+</div>
+
+<div class="rel-card guide-card ops-anchor-target" id="g-agent">
+  <h4>Deploy Agent / Bootstrap có phiên bản mới</h4>
+  <table class="guide-table">
+    <thead><tr><th>Muốn làm gì</th><th>Chạy gì</th></tr></thead>
+    <tbody>
+      <tr><td>Cài Deploy Agent mới / sửa lỗi nặng</td><td class="k">deploy-agent/package_installer.sh → sudo bash install.sh (hoặc Bootstrap → Install Deploy Agent)</td></tr>
+      <tr><td>Cập nhật Deploy Agent tại chỗ, có rollback</td><td class="k">deploy-agent/scripts/build-agent-release.sh → Bootstrap → Agent Update</td></tr>
+      <tr><td>Rollback Deploy Agent</td><td class="k">Bootstrap → Overview → Advanced → Rollback</td></tr>
+      <tr><td>Cập nhật Bootstrap</td><td class="k">cd bootstrap &amp;&amp; sudo ./install.sh (idempotent)</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="rel-card guide-card ops-anchor-target" id="g-incidents">
+  <h4>Sự cố đã gặp</h4>
+  <div class="guide-incident">
+    <h5>Deploy Agent local bị lặng lẽ đổi DEV → PRODUCTION_TEST</h5>
+    <p><b>Triệu chứng:</b> mọi nút Build/Deploy Local mờ, "No release has been built yet" dù artifact có thật.</p>
+    <p><b>Gốc rễ:</b> installer hardcode override cho máy mới, quên cộng thêm <span class="k" style="font-family:ui-monospace,SFMono-Regular,Consolas,monospace">compose.dev.override.yml</span> khi cài lại trên chính máy DEV — đã fix, installer giờ tự nhận diện.</p>
+    <p><b>Kiểm tra nhanh sau mỗi lần Bootstrap cài/update Agent:</b> xem badge vai trò ở thẻ "Vai trò Agent này" phía trên.</p>
+  </div>
+  <div class="guide-incident" style="border-left-color:var(--status-warning);background:#fff8ef">
+    <h5>LOCAL bị BLOCKED: QA_RUNNER_UNAVAILABLE</h5>
+    <p><b>Nguyên nhân:</b> QA Center tạm không resolve được trên mạng Docker lúc Agent gọi gate tự động.</p>
+    <p><b>Fix:</b> không phải bug — đợi QA Center khoẻ lại rồi bấm lại Deploy Local (idempotent, chạy lại nhanh).</p>
+  </div>
+</div>

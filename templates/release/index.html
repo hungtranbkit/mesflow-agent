@@ -44,6 +44,28 @@
 .drawer-shell .drawer h2{margin:0 0 12px;font-size:18px}
 .drawer-shell .drawer-close{position:absolute;top:14px;right:16px;border:0;background:transparent;font-size:20px;cursor:pointer;color:var(--ops-muted)}
 .empty-state{padding:28px 10px;text-align:center;color:var(--ops-muted);font-size:13px}
+.guide-toc{display:flex;flex-wrap:wrap;gap:6px 10px;margin:0 0 18px;padding:0;list-style:none}
+.guide-toc a{font-size:12.5px;color:var(--ops-blue);text-decoration:none;padding:3px 0}
+.guide-toc a:hover{text-decoration:underline}
+.guide-card h4{margin:0 0 6px;font-size:14.5px}
+.guide-card .sub{color:var(--ops-muted);font-size:12.5px;margin:0 0 12px}
+.guide-code{background:#0f1626;color:#d9e1f7;border-radius:var(--radius-sm,6px);padding:12px 14px;overflow-x:auto;font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:12.5px;line-height:1.6;margin:10px 0}
+.guide-code .c{color:#7d8bb0}
+.guide-env-row{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:0 0 10px}
+.guide-env-row .k{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:12.5px}
+.guide-steps{counter-reset:gstep;margin:8px 0 4px;padding:0}
+.guide-steps li{list-style:none;position:relative;padding:0 0 14px 30px;border-left:2px solid var(--ops-line);margin-left:11px}
+.guide-steps li:last-child{border-color:transparent;padding-bottom:0}
+.guide-steps li::before{counter-increment:gstep;content:counter(gstep);position:absolute;left:-13px;top:0;width:24px;height:24px;border-radius:50%;background:#fff;border:2px solid var(--ops-blue);color:var(--ops-blue);font-weight:700;font-size:11.5px;display:grid;place-items:center}
+.guide-steps b{display:block;font-size:13.3px;margin-bottom:2px}
+.guide-steps p{margin:0;font-size:12.8px;color:var(--ops-muted)}
+.guide-table{width:100%;border-collapse:collapse;font-size:12.8px;margin:10px 0}
+.guide-table th{text-align:left;font-size:10.8px;letter-spacing:.04em;text-transform:uppercase;color:var(--ops-muted);padding:7px 10px;background:#f7f9fc;border-bottom:1px solid var(--ops-line)}
+.guide-table td{padding:8px 10px;border-bottom:1px solid #edf1f5;vertical-align:top}
+.guide-table td.k{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;white-space:nowrap}
+.guide-incident{border-left:3px solid var(--status-danger);background:#fdf3f2;border-radius:0 var(--radius-sm,6px) var(--radius-sm,6px) 0;padding:12px 14px;margin:10px 0}
+.guide-incident h5{margin:0 0 4px;font-size:12.5px;text-transform:uppercase;letter-spacing:.04em;color:var(--status-danger)}
+.guide-incident p{margin:3px 0;font-size:12.8px}
 </style></head><body>
 {% set page_title='Release & Deploy' %}{% include '_operations_shell_start.html' %}
 <div class="wrap">
@@ -53,7 +75,7 @@
    that exact set a second time, on screen at once. Same fix as the Ops
    page: sidebar is now the single navigation source; the page heading
    names the active view instead, like ops.html already does. #}
-{% set tab_title={'deploy':'Release Deploy','history':'Deployment History','agent-update':'Agent Update'}.get(active_tab,'Release Deploy') %}
+{% set tab_title={'deploy':'Release Deploy','history':'Deployment History','agent-update':'Agent Update','guide':'Hướng dẫn'}.get(active_tab,'Release Deploy') %}
 <header class="ops-page-head"><div><h2>Release &amp; Deploy · {{tab_title}}</h2><p>Build once, kiểm thử và promote cùng artifact digest. Production luôn cần phê duyệt riêng.</p></div></header>
 {% with messages=get_flashed_messages(with_categories=true) %}{% for c,m in messages %}<div class="{{c}} rel-card">{{m}}</div>{% endfor %}{% endwith %}
 

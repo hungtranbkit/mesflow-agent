@@ -4054,9 +4054,29 @@ def kiosk_firmware_page():
 def kiosk_tutorial_page():
     return _kiosk_render("tutorial")
 
+def _release_guide_tab_context():
+    """Hướng dẫn (Guide) tab: static runbook content plus a handful of
+    cheap, already-in-process facts (env var presence only -- no Docker/
+    network calls, unlike the Deploy tab's summaries) so the guide can show
+    real "configured / not configured" status next to each instruction
+    instead of generic prose that goes stale the moment the operator reads
+    it. Mirrors docs/operations/DEPLOY_RUNBOOK.html in the workspace, kept
+    intentionally shorter -- this tab covers only what this Agent instance
+    itself needs answered, the full runbook covers every project."""
+    def configured(*names):
+        return all((os.environ.get(n) or "").strip() for n in names)
+    return dict(
+        guide_test_target_configured=configured("MESFLOW_PRODUCTION_TEST_AGENT_URL","MESFLOW_PRODUCTION_TEST_AGENT_USER","MESFLOW_PRODUCTION_TEST_AGENT_PASSWORD"),
+        guide_test_target_url=(os.environ.get("MESFLOW_PRODUCTION_TEST_AGENT_URL") or "").strip(),
+        guide_prod_target_configured=configured("MESFLOW_PRODUCTION_AGENT_URL","MESFLOW_PRODUCTION_AGENT_USER","MESFLOW_PRODUCTION_AGENT_PASSWORD"),
+        guide_prod_target_url=(os.environ.get("MESFLOW_PRODUCTION_AGENT_URL") or "").strip(),
+        guide_prod_promote_enabled=os.environ.get("MESFLOW_PRODUCTION_PROMOTE_ENABLED","").strip().lower() in {"1","true","yes","on"},
+    )
+
 RELEASE_TABS={"deploy":("release/_deploy_tab.html",_release_deploy_tab_context),
               "history":("release/_history_tab.html",_deployment_history_tab_context),
-              "agent-update":("release/_agent_update_tab.html",_agent_update_tab_context)}
+              "agent-update":("release/_agent_update_tab.html",_agent_update_tab_context),
+              "guide":("release/_guide_tab.html",_release_guide_tab_context)}
 
 @app.get("/releases")
 def release_manager_page():
