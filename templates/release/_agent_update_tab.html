@@ -3,6 +3,9 @@
   <div class="rel-current"><h3 style="margin:0">Deploy Agent Package</h3>
   <button id="buildAgentPackageButton" class="btn btn-primary" type="button" {% if not mes_build_enabled %}disabled{% endif %}>Build Agent Package</button></div>
   <p class="sub">Source preflight → version validation → tests → package build → SHA256 → manifest → immutable artifact. Định dạng ZIP giống hệt định dạng Bootstrap <code>/updater/update</code> đã kiểm tra/cài đặt (không đổi).</p>
+  <p><input id="agentBumpVersionTarget" type="text" placeholder="Để trống = tự +1 (vd 2.24.7)" style="width:240px" {% if not mes_build_enabled %}disabled{% endif %}>
+  <button id="agentBumpVersionButton" class="secondary btn" type="button" {% if not mes_build_enabled %}disabled{% endif %} title="Chỉ sửa VERSION.txt/agent.py/Dockerfile/compose/README/docs -- không build">Nâng version (chưa build)</button>
+  {% if agent_version_bump %}<span class="label"> · Lần nâng gần nhất: {{agent_version_bump.before}} → <b>{{agent_version_bump.after}}</b> ({{agent_version_bump.at}})</span>{% endif %}</p>
   {% if latest_agent_release and latest_agent_release.package_exists %}
   <div class="row">
     <span><b>Phiên bản mới nhất:</b> {{latest_agent_release.version}}</span>
@@ -138,6 +141,31 @@
   }
   runReleaseAction('targetAgentsButton','{{url_for("release_manager_target_agents")}}','Đang kiểm tra Target Agents…','Refresh failed',700);
   runReleaseAction('buildAgentPackageButton','{{url_for("release_manager_build_agent_package")}}','Đang build Agent package (source preflight → version validation → tests → build → SHA256 → manifest)…','Build failed',1500);
+  (function(){
+    // Same shape as Release Deploy's MESFlow/QA Center "Nâng version" --
+    // only edits VERSION.txt/agent.py/Dockerfile/compose/README/docs via
+    // scripts/bump-version.sh, never builds.
+    const button=document.getElementById('agentBumpVersionButton'), input=document.getElementById('agentBumpVersionTarget'), status=document.getElementById('releaseBuildStatus');
+    if(!button)return;
+    button.onclick=async()=>{
+      const target=(input&&input.value||'').trim();
+      if(target && !/^\d+\.\d+\.\d+(-docker-runtime)?$/.test(target)){alert('Version phải dạng X.Y.Z, ví dụ 2.24.7');return}
+      if(!confirm('Nâng version Deploy Agent'+(target?(' lên '+target):' (tự +1)')+'? Chỉ sửa file khai báo version, KHÔNG build.'))return;
+      button.disabled=true; if(status) status.textContent='Đang nâng version…';
+      try{
+        const response=await fetch('{{url_for("release_manager_agent_bump_version")}}',{method:'POST',credentials:'same-origin',
+          headers:{'Content-Type':'application/json','X-CSRF-Token':CSRF,'X-Requested-With':'XMLHttpRequest'},
+          body:JSON.stringify({target_version:target})});
+        const payload=await response.json().catch(()=>({}));
+        if(!response.ok||!payload.ok) throw new Error(payload.error||('HTTP '+response.status));
+        if(status) status.textContent='Đã nâng version: '+payload.before+' → '+payload.after+'. Chưa build.';
+        setTimeout(()=>location.reload(),700);
+      }catch(err){
+        if(status) status.textContent='Nâng version failed: '+(err&&err.message?err.message:String(err));
+        button.disabled=false;
+      }
+    };
+  })();
   document.querySelectorAll('.update-agent-btn').forEach(function(button){
     button.onclick=async()=>{
       const role=button.dataset.role;

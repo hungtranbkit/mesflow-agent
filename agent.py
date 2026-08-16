@@ -1252,6 +1252,37 @@ def agent_package_build_job_update(status,message,**extra):
         state["agent_package_build_job"]=job
     return update_state(mutate).get("agent_package_build_job")
 
+def _run_agent_version_bump(target_version=""):
+    """Run deploy-agent/scripts/bump-version.sh: a fast, source-only edit
+    (VERSION.txt, agent.py's AGENT_VERSION, docker/Dockerfile,
+    docker/compose.linux.yml, docker/compose.windows.yml, README.md,
+    docs/DEPLOY_DOCKER.md) -- never builds/tags/pushes a Docker image.
+    DEV-only (build-enabled), same as Build Agent Package."""
+    if not MESFLOW_BUILD_ENABLED: raise ValueError("BUILD_DISABLED")
+    if not DEPLOY_AGENT_SOURCE_DIR.is_dir(): raise ValueError("SOURCE_NOT_FOUND")
+    script=DEPLOY_AGENT_SOURCE_DIR/"scripts"/"bump-version.sh"
+    if not script.is_file(): raise ValueError("BUMP_SCRIPT_NOT_FOUND")
+    version_file=DEPLOY_AGENT_SOURCE_DIR/"VERSION.txt"
+    before=version_file.read_text(encoding="utf-8-sig").strip() if version_file.is_file() else ""
+    args=[str(script)]
+    target_version=str(target_version or "").strip()
+    if target_version:
+        if not re.fullmatch(r"\d+\.\d+\.\d+(-docker-runtime)?",target_version): raise ValueError("VERSION_INVALID")
+        args.append(target_version)
+    log_path=LOG_DIR/"agent-version-bump.log"
+    with log_path.open("w",encoding="utf-8") as log:
+        result=subprocess.run(args,cwd=str(DEPLOY_AGENT_SOURCE_DIR),stdout=log,stderr=subprocess.STDOUT,text=True,timeout=30)
+    log_tail=tail(log_path,60)
+    if result.returncode:
+        lines=[ln for ln in log_tail.strip().splitlines() if ln.strip()]
+        raise RuntimeError(lines[-1] if lines else "VERSION_BUMP_FAILED")
+    after=version_file.read_text(encoding="utf-8-sig").strip() if version_file.is_file() else ""
+    entry={"at":now_text(),"before":before,"after":after,"log_tail":log_tail}
+    def f(s): s["agent_version_bump"]=entry
+    update_state(f)
+    append_log(f"Deploy Agent version bump: {before} -> {after}")
+    return entry
+
 def _run_agent_package_build():
     try:
         script=DEPLOY_AGENT_SOURCE_DIR/"scripts"/"build-agent-release.sh"
@@ -1783,6 +1814,37 @@ def _qa_release_summary():
             "promotion":{**promotion,"production_gate":gate_ok,"production_promote_enabled":production_promote_enabled},
             "blocked":{"build":build_block,"local":local_block,"test":test_block,"production":production_block},
             "production_target_configured":bool((os.environ.get("MESFLOW_PRODUCTION_AGENT_URL") or "").strip())}
+
+def _run_qa_version_bump(target_version=""):
+    """Run qa-center/scripts/bump-version.sh: a fast, source-only edit
+    (current/VERSION, current/agent.py's APP_VERSION) -- never builds/tags/
+    pushes a Docker image. DEV-only (build-enabled), same as QA Build
+    Release, since Production Test/Production never carry or need QA
+    Center source."""
+    if not MESFLOW_BUILD_ENABLED: raise ValueError("BUILD_DISABLED")
+    if not QA_CENTER_SOURCE_DIR.is_dir(): raise ValueError("SOURCE_NOT_FOUND")
+    script=QA_CENTER_SOURCE_DIR/"scripts"/"bump-version.sh"
+    if not script.is_file(): raise ValueError("BUMP_SCRIPT_NOT_FOUND")
+    version_file=QA_CENTER_SOURCE_DIR/"current"/"VERSION"
+    before=version_file.read_text(encoding="utf-8-sig").strip() if version_file.is_file() else ""
+    args=[str(script)]
+    target_version=str(target_version or "").strip()
+    if target_version:
+        if not re.fullmatch(r"\d+\.\d+\.\d+(\.\d+)?",target_version): raise ValueError("VERSION_INVALID")
+        args.append(target_version)
+    log_path=LOG_DIR/"qa-version-bump.log"
+    with log_path.open("w",encoding="utf-8") as log:
+        result=subprocess.run(args,cwd=str(QA_CENTER_SOURCE_DIR),stdout=log,stderr=subprocess.STDOUT,text=True,timeout=30)
+    log_tail=tail(log_path,60)
+    if result.returncode:
+        lines=[ln for ln in log_tail.strip().splitlines() if ln.strip()]
+        raise RuntimeError(lines[-1] if lines else "VERSION_BUMP_FAILED")
+    after=version_file.read_text(encoding="utf-8-sig").strip() if version_file.is_file() else ""
+    entry={"at":now_text(),"before":before,"after":after,"log_tail":log_tail}
+    def f(s): s["qa_version_bump"]=entry
+    update_state(f)
+    append_log(f"QA Center version bump: {before} -> {after}")
+    return entry
 
 def _run_qa_release_build():
     try:
@@ -4076,7 +4138,7 @@ def _release_deploy_tab_context():
     # reads + a backups directory scan) just to render the Release page.
     return dict(job=j,qa_local_deploy_job=qldj,promote_test_job=ptj,qa_promote_test_job=qptj,
         release_build_job=st.get("release_build_job"),version_bump=st.get("version_bump"),
-        qa_release_build_job=st.get("qa_release_build_job"),
+        qa_release_build_job=st.get("qa_release_build_job"),qa_version_bump=st.get("qa_version_bump"),
         release_summary=release_summary,qa_release_summary=qa_release_summary,
         deployment_platform=_deployment_platform_summary(mes=mes,qa=qa,mes_release=release_summary,qa_release=qa_release_summary),
         mes=mes,qa=qa,
@@ -4095,7 +4157,8 @@ def _agent_update_tab_context():
     return dict(target_agents=load_json(CONFIG_DIR/"target-agents.json",{}),
         agent_update_job=load_state().get("agent_update_job"),mes_build_enabled=MESFLOW_BUILD_ENABLED,
         latest_agent_release=_latest_agent_release(),
-        agent_package_build_job=load_state().get("agent_package_build_job"))
+        agent_package_build_job=load_state().get("agent_package_build_job"),
+        agent_version_bump=load_state().get("agent_version_bump"))
 
 # ---------------- ESP Kiosk (task: ESP_KIOSK_UI_SEPARATION) ----------------
 # Firmware Builder and Tutorial used to live inside the Release & Deploy
@@ -4471,6 +4534,28 @@ def release_manager_target_agents_get():
     if not logged_in(): return jsonify(ok=False,error="AUTH_REQUIRED"),401
     return jsonify(ok=True,**load_json(CONFIG_DIR/"target-agents.json",{"checked_at":None,"rows":[]}))
 
+@app.get("/api/release-manager/agent-bump-version")
+def release_manager_agent_bump_version_status():
+    if not logged_in(): return jsonify(ok=False,error="AUTH_REQUIRED"),401
+    vf=DEPLOY_AGENT_SOURCE_DIR/"VERSION.txt"
+    current=vf.read_text(encoding="utf-8-sig").strip() if vf.is_file() else ""
+    return jsonify(ok=True,enabled=MESFLOW_BUILD_ENABLED,current_version=current,last=load_state().get("agent_version_bump"))
+
+@app.post("/api/release-manager/agent-bump-version")
+def release_manager_agent_bump_version():
+    """Runs deploy-agent/scripts/bump-version.sh -- updates VERSION.txt,
+    agent.py's AGENT_VERSION, the Dockerfile ARG, both compose files'
+    default image tags, README.md and docs/DEPLOY_DOCKER.md consistently.
+    Fast, synchronous, source-only; never builds. Optional
+    {"target_version":"X.Y.Z"}; omitted/blank increments the last segment
+    by 1."""
+    if not logged_in(): return jsonify(ok=False,error="AUTH_REQUIRED"),401
+    verify_csrf()
+    body=request.get_json(silent=True) or {}
+    try: return jsonify(ok=True,**_run_agent_version_bump(body.get("target_version") or ""))
+    except (ValueError,RuntimeError) as exc: return jsonify(ok=False,error=str(exc)),409
+    except Exception as exc: return jsonify(ok=False,error=str(exc)),500
+
 @app.post("/api/release-manager/build-agent-package")
 def release_manager_build_agent_package():
     """Builds the Deploy Agent's own immutable update artifact from the
@@ -4573,6 +4658,24 @@ def qa_release_manager_cleanup_run():
     if not logged_in(): return jsonify(ok=False,error="AUTH_REQUIRED"),401
     verify_csrf()
     try: return jsonify(ok=True,report=_qa_cleanup_old_releases("MANUAL"))
+    except Exception as exc: return jsonify(ok=False,error=str(exc)),500
+
+@app.get("/api/qa-release-manager/bump-version")
+def qa_release_manager_bump_version_status():
+    if not logged_in(): return jsonify(ok=False,error="AUTH_REQUIRED"),401
+    return jsonify(ok=True,enabled=MESFLOW_BUILD_ENABLED,current_version=_qa_release_summary().get("source_version",""),last=load_state().get("qa_version_bump"))
+
+@app.post("/api/qa-release-manager/bump-version")
+def qa_release_manager_bump_version():
+    """Runs qa-center/scripts/bump-version.sh -- updates current/VERSION +
+    current/agent.py's APP_VERSION consistently. Fast, synchronous,
+    source-only; never builds. Optional {"target_version":"X.Y.Z"};
+    omitted/blank increments the last segment by 1."""
+    if not logged_in(): return jsonify(ok=False,error="AUTH_REQUIRED"),401
+    verify_csrf()
+    body=request.get_json(silent=True) or {}
+    try: return jsonify(ok=True,**_run_qa_version_bump(body.get("target_version") or ""))
+    except (ValueError,RuntimeError) as exc: return jsonify(ok=False,error=str(exc)),409
     except Exception as exc: return jsonify(ok=False,error=str(exc)),500
 
 @app.post("/api/qa-release-manager/build")
