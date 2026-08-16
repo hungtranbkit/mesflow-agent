@@ -1,6 +1,6 @@
 # MESFlow Deploy Agent — Docker deployment
 
-Version: **2.24.3-docker-runtime**
+Version: **2.24.6-docker-runtime**
 
 ## Runtime model
 
