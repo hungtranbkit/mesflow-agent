@@ -13,12 +13,15 @@ def test_agent_version_and_promotion_fields_are_visible():
     version = (ROOT / "VERSION.txt").read_text().strip()
     assert re.fullmatch(r"\d+\.\d+\.\d+-docker-runtime", version), version
     source = (ROOT / "agent.py").read_text()
-    template = (ROOT / "templates/index.html").read_text()
+    # templates/index.html was removed and replaced by the tabbed
+    # templates/release/*.html views -- see reports/RELEASE_DEPLOY_UX_CLEANUP.md.
+    # The Release Deploy tab is where artifact/evidence metadata now lives.
+    template = (ROOT / "templates/release/_deploy_tab.html").read_text()
     assert f'AGENT_VERSION="{version}"' in source
     assert 'promotion=load_json(x/"PROMOTION.json",{})' in source
-    assert "SHA256:" in template
-    assert "Local verification:" in template
-    assert "Source commit:" in template
+    assert "ZIP SHA" in template
+    assert "Local QA" in template
+    assert "Source commit" in template
 
 
 def test_docker_liveness_does_not_call_dependency_health():

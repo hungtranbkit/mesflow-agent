@@ -3,7 +3,7 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile
-    image: mesflow-deploy-agent:2.15.4
+    image: mesflow-deploy-agent:2.24.3
     container_name: mesflow-deploy-agent
     restart: unless-stopped
     ports:
@@ -13,7 +13,8 @@ services:
       MESFLOW_AGENT_DEPLOY_ENABLED: "0"
       MESFLOW_AGENT_HOST_OPS_ENABLED: "0"
       WORKSHOP_AGENT_HOME: /data
-      MESFLOW_AGENT_ADMIN_PASSWORD: ${MESFLOW_AGENT_ADMIN_PASSWORD:-1234567890}
+      # Empty means the Agent generates a one-time first-login credential.
+      MESFLOW_AGENT_ADMIN_PASSWORD: ${MESFLOW_AGENT_ADMIN_PASSWORD:-}
       WORKSHOP_TARGET_HOME: /workspace/mesflow
       WORKSHOP_MES_URL: http://host.docker.internal:8080
       MESFLOW_QA_URL: http://host.docker.internal:8095

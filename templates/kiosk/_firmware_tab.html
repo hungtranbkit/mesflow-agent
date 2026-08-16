@@ -1,0 +1,64 @@
+<section class="kiosk-card">
+  <h3>Build firmware</h3>
+  <p class="sub">Build local bằng Arduino CLI, không cần cắm USB và không tạo OTA job.</p>
+  <p><b>Source:</b> {{esp_kiosk_source}}</p>
+  <p><b>Firmware hiện tại:</b> {{(esp_builder_job.artifact.version if esp_builder_job and esp_builder_job.artifact else '—')}}</p>
+  <button id="espBuildButton" class="btn btn-primary" type="button" {% if not esp_build_enabled %}disabled{% endif %}>Build firmware</button>
+  <div id="espBuilderStatus" class="label" style="margin-top:10px">{{esp_builder_job.status if esp_builder_job else 'IDLE'}} — {{esp_builder_job.message if esp_builder_job else 'Chưa build'}}</div>
+  {% if esp_builder_job and esp_builder_job.log_tail %}<details><summary>Xem build log</summary><pre>{{esp_builder_job.log_tail}}</pre></details>{% endif %}
+</section>
+
+<section class="kiosk-card">
+  <h3>Build gần đây</h3>
+  {% if firmware_items %}
+  <div style="overflow-x:auto">
+  <table class="hist-table" style="width:100%">
+    <thead><tr><th>Version</th><th>Hardware</th><th>File</th><th>Kích thước</th><th>SHA256</th><th>Thời gian</th></tr></thead>
+    <tbody>
+    {% for f in firmware_items %}
+      <tr>
+        <td>{{f.version}}</td>
+        <td>{{f.hardware_model or '—'}}</td>
+        <td>{{f.filename}}</td>
+        <td>{{'%.1f'|format((f.size or 0)/1024)}} KB</td>
+        <td class="ops-id" title="{{f.sha256}}">{{(f.sha256 or '')[:12]}}…</td>
+        <td>{{f.created_at_display or '—'}}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  </div>
+  {% else %}
+  <p class="sub">Chưa có firmware nào được build/đăng ký.</p>
+  {% endif %}
+</section>
+
+<script>
+{# Same endpoint/behavior as before (esp_builder_start/esp_builder_status),
+   only relocated from the Release page's collapsed <details> card (task:
+   ESP_KIOSK_UI_SEPARATION). Polling only while a build is active -- no
+   unconditional interval. #}
+(function(){
+  const b=document.getElementById('espBuildButton'), s=document.getElementById('espBuilderStatus');
+  if(!b)return;
+  b.onclick=async()=>{
+    b.disabled=true; s.textContent='QUEUED — Đang khởi động build…';
+    const r=await fetch(SCRIPT_ROOT+'/api/esp-builder/start',{method:'POST',headers:{'X-CSRF-Token':CSRF}});
+    const d=await r.json();
+    if(!r.ok){s.textContent=friendlyError(d.error);b.disabled=false;return}
+    let tries=0;
+    const poll=async()=>{
+      tries++;
+      try{
+        const rr=await fetch(SCRIPT_ROOT+'/api/esp-builder/status');
+        const dd=await rr.json();
+        const job=dd.job||{};
+        if(job.status)s.textContent=job.status+' — '+(job.message||'');
+        if(job.status==='SUCCESS'||job.status==='FAILED'){location.reload();return}
+      }catch(_e){}
+      if(tries<200)setTimeout(poll,2000);
+    };
+    setTimeout(poll,1000);
+  };
+})();
+</script>

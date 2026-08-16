@@ -1,0 +1,93 @@
+<div class="rel-card">
+  <div class="hist-toolbar">
+    <select id="histComponent"><option value="">Tất cả component</option><option value="MESFLOW">MESFlow</option><option value="QA_CENTER">QA Center</option><option value="DEPLOY_AGENT">Deploy Agent</option></select>
+    <select id="histEnvironment"><option value="">Tất cả môi trường</option><option value="LOCAL">LOCAL</option><option value="TEST">TEST</option><option value="PRODUCTION">PRODUCTION</option></select>
+    <select id="histResult"><option value="">Tất cả kết quả</option><option value="SUCCESS">SUCCESS</option><option value="FAILED">FAILED</option><option value="ROLLED_BACK">ROLLED BACK</option></select>
+    <input id="histSearch" type="search" placeholder="Tìm version...">
+    <button id="histRefresh" class="secondary btn" type="button">Làm mới</button>
+  </div>
+  <div id="histError" class="label bad" style="display:none;margin-bottom:8px"></div>
+  <div class="tablewrap" style="overflow:auto">
+  <table class="hist-table">
+    <thead><tr><th>Thời gian</th><th>Component</th><th>Môi trường</th><th>Phiên bản</th><th>Kết quả</th><th>Thời lượng</th></tr></thead>
+    <tbody id="histRows"></tbody>
+  </table>
+  </div>
+  <div id="histEmpty" class="empty-state" style="display:none">Chưa có lịch sử triển khai.</div>
+  <div class="hist-pager">
+    <span id="histSummary"></span>
+    <button id="histPrev" class="secondary btn" type="button">← Trước</button>
+    <button id="histNext" class="secondary btn" type="button">Sau →</button>
+  </div>
+</div>
+
+<script>
+(function(){
+  const COMPONENT_LABEL={MESFLOW:'MESFlow',QA_CENTER:'QA Center',DEPLOY_AGENT:'Deploy Agent'};
+  let page=1, pageSize=20;
+  function fmtDuration(sec){ if(sec==null)return '—'; const m=Math.floor(sec/60), s=sec%60; return m?`${m}m ${s}s`:`${s}s` }
+  function fmtTime(t){ return t ? t.replace('T',' ').slice(0,19) : '—' }
+  async function load(){
+    const params=new URLSearchParams({page,page_size:pageSize});
+    const c=histComponent.value, e=histEnvironment.value, r=histResult.value, q=histSearch.value.trim();
+    if(c)params.set('component',c); if(e)params.set('environment',e); if(r)params.set('result',r); if(q)params.set('q',q);
+    histError.style.display='none';
+    let d;
+    try{ d=await apiFetch('/api/release-manager/history?'+params.toString()) }
+    catch(e){ histError.textContent='Không tải được lịch sử triển khai.'; histError.style.display='block'; return }
+    if(!d.ok){ histError.textContent='Không tải được lịch sử triển khai.'; histError.style.display='block'; return }
+    const items=d.items||[];
+    histEmpty.style.display=items.length?'none':'block';
+    histRows.innerHTML=items.map(x=>`<tr data-id="${esc(x.id)}">
+      <td>${esc(fmtTime(x.recorded_at))}</td>
+      <td>${esc(COMPONENT_LABEL[x.component]||x.component)}</td>
+      <td>${esc(x.environment)}</td>
+      <td>${esc(x.from_version?`${x.from_version} → ${x.version}`:x.version)}</td>
+      <td><span class="result-badge ${esc(x.result)}">${esc(x.result)}</span></td>
+      <td>${fmtDuration(x.duration_seconds)}</td>
+    </tr>`).join('');
+    [...histRows.querySelectorAll('tr')].forEach(tr=>tr.onclick=()=>openDetail(tr.dataset.id));
+    const total=d.total||0;
+    histSummary.textContent=total? `${(page-1)*pageSize+1}–${Math.min(page*pageSize,total)} / ${total}` : '';
+    histPrev.disabled=page<=1; histNext.disabled=page*pageSize>=total;
+  }
+  histComponent.onchange=()=>{page=1;load()};
+  histEnvironment.onchange=()=>{page=1;load()};
+  histResult.onchange=()=>{page=1;load()};
+  histSearch.addEventListener('input',()=>{page=1;load()});
+  histRefresh.onclick=()=>load();
+  histPrev.onclick=()=>{if(page>1){page--;load()}};
+  histNext.onclick=()=>{page++;load()};
+
+  async function openDetail(id){
+    const shell=document.createElement('div'); shell.className='drawer-shell'; document.body.appendChild(shell);
+    shell.innerHTML=`<button class="drawer-back" aria-label="Đóng"></button><aside class="drawer"><button class="drawer-close" aria-label="Đóng">✕</button><div id="histDetailBody">Đang tải…</div></aside>`;
+    const close=()=>shell.remove();
+    shell.querySelector('.drawer-back').onclick=close;
+    shell.querySelector('.drawer-close').onclick=close;
+    let d;
+    try{ d=await apiFetch('/api/release-manager/history/'+encodeURIComponent(id)) }
+    catch(e){ shell.querySelector('#histDetailBody').innerHTML='<p class="bad">Không tải được chi tiết.</p>'; return }
+    if(!d.ok){ shell.querySelector('#histDetailBody').innerHTML='<p class="bad">Không tải được chi tiết.</p>'; return }
+    const x=d.item;
+    const steps=Object.entries(x.steps||{}).map(([name,st])=>`<div class="step-row"><b>${esc(name)}</b> <span class="${st.status==='success'?'ok':st.status==='failed'?'bad':'run'}">${esc(st.status||'pending')}</span>${st.message?` — ${esc(st.message)}`:''}</div>`).join('')||'<p class="label">Không có step chi tiết.</p>';
+    shell.querySelector('#histDetailBody').innerHTML=`
+      <h2>${esc(COMPONENT_LABEL[x.component]||x.component)} · ${esc(x.environment)}</h2>
+      <p class="label">Deployment ID: <code>${esc((x.deployment_id||x.id||'').slice(0,16))}</code></p>
+      <div class="grid" style="grid-template-columns:1fr 1fr;gap:10px;margin:14px 0">
+        <div><div class="label">Từ</div><b>${esc(x.from_version||'—')}</b></div>
+        <div><div class="label">Đến</div><b>${esc(x.version||'—')}</b></div>
+        <div><div class="label">Bắt đầu</div><b>${esc(fmtTime(x.started_at))}</b></div>
+        <div><div class="label">Kết thúc</div><b>${esc(fmtTime(x.finished_at))}</b></div>
+        <div><div class="label">Thời lượng</div><b>${fmtDuration(x.duration_seconds)}</b></div>
+        <div><div class="label">Kết quả</div><span class="result-badge ${esc(x.result)}">${esc(x.result)}</span></div>
+      </div>
+      <p>${esc(x.message||'')}</p>
+      <h3 style="font-size:13px;margin-top:16px">Steps</h3>
+      ${steps}
+      ${x.log_tail?`<h3 style="font-size:13px;margin-top:16px">Log</h3><pre>${esc(x.log_tail)}</pre>`:''}
+    `;
+  }
+  load();
+})();
+</script>

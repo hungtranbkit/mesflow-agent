@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="vi"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Tổng quan · MESFlow Operations</title><link rel="stylesheet" href="{{static_url('css/agent.css')}}"></head><body>
+{% set page_title='Tổng quan vận hành' %}{% include '_operations_shell_start.html' %}
+<header class="ops-page-head"><div><h2>Trạng thái hệ thống</h2><p>Thông tin quan trọng để xác định hệ sinh thái MESFlow có cần can thiệp hay không.</p></div><a href="{{url_for('ops_page')}}?view=overview">Xem sức khỏe chi tiết →</a></header>
+<section class="ops-kpis" aria-label="Tình trạng thành phần">
+  <article class="ops-kpi"><div class="ops-kpi-label">MESFlow</div><div class="ops-kpi-value {{'ops-good' if mes.online else 'ops-critical'}}">{{'HEALTHY' if mes.online and mes.health_state=='healthy' else 'WARNING' if mes.online else 'OFFLINE'}}</div><div class="ops-kpi-detail">Version {{mes.version or 'không xác định'}}</div></article>
+  <article class="ops-kpi"><div class="ops-kpi-label">PostgreSQL</div><div id="overviewPostgres" class="ops-kpi-value">UNKNOWN</div><div class="ops-kpi-detail">Suy ra từ container health hiện có</div></article>
+  <article class="ops-kpi"><div class="ops-kpi-label">Deploy Agent</div><div class="ops-kpi-value ops-good">HEALTHY</div><div class="ops-kpi-detail">Agent {{agent_version}} · {{server_role}}</div></article>
+  <article class="ops-kpi"><div class="ops-kpi-label">QA Center</div><div class="ops-kpi-value {{'ops-good' if qa.online else 'ops-warning'}}">{{'HEALTHY' if qa.online else 'OFFLINE'}}</div><div class="ops-kpi-detail">Version {{qa.version or 'không xác định'}}</div></article>
+</section>
+<div class="ops-columns"><section class="ops-panel"><h3>Server</h3><div class="ops-kpis">
+  <div class="ops-kpi"><div class="ops-kpi-label">CPU</div><div id="overviewCpu" class="ops-kpi-value">--</div><span class="ops-bar" id="overviewCpuBar"><span style="width:0%"></span></span></div>
+  <div class="ops-kpi"><div class="ops-kpi-label">RAM</div><div id="overviewRam" class="ops-kpi-value">--</div><span class="ops-bar" id="overviewRamBar"><span style="width:0%"></span></span></div>
+  <div class="ops-kpi"><div class="ops-kpi-label">Disk</div><div id="overviewDisk" class="ops-kpi-value">--</div><span class="ops-bar" id="overviewDiskBar"><span style="width:0%"></span></span></div>
+  <div class="ops-kpi"><div class="ops-kpi-label">Uptime</div><div id="overviewUptime" class="ops-kpi-value">--</div></div></div></section>
+<section class="ops-panel"><h3>Cảnh báo đang hoạt động</h3><div id="overviewAlerts">Đang tải…</div></section></div>
+<div class="ops-columns"><section class="ops-panel"><h3>Dịch vụ chính</h3><div id="overviewServices">Đang tải…</div></section><section class="ops-panel"><h3>Hoạt động gần đây</h3>{% for item in history[:5] %}<div class="ops-status-row"><span>{{item.from_version}} → {{item.version}}</span><span class="ops-badge {{'pass' if item.status=='success' else 'failed'}}">{{item.status}}</span></div>{% else %}<p>Chưa có lịch sử triển khai.</p>{% endfor %}</section></div>
+<div class="ops-columns"><section class="ops-panel"><h3>Fleet · Servers đã đăng ký</h3><div id="overviewFleet">Đang tải…</div><p style="margin:10px 0 0"><a href="{{url_for('ops_page')}}?view=fleet">Xem Servers / Fleet →</a></p></section><section class="ops-panel"><h3>Backup / Database</h3><div id="overviewBackup">Đang tải…</div><p style="margin:10px 0 0"><a href="{{url_for('ops_page')}}?view=backup">Xem Backup / DB / Storage →</a></p></section></div>
+{% include '_operations_shell_end.html' %}
+<script>
+const compactDuration=seconds=>{seconds=Number(seconds||0);const days=Math.floor(seconds/86400),hours=Math.floor((seconds%86400)/3600);return days?`${days}d ${hours}h`:`${hours}h`};
+function setBar(el,pct){pct=Math.max(0,Math.min(100,Number(pct||0)));el.querySelector('span').style.width=pct+'%';el.className='ops-bar'+(pct>=90?' crit':pct>=75?' warn':'')}
+fetch('{{url_for("api_ops_summary")}}').then(r=>r.json()).then(d=>{
+  overviewCpu.textContent=Math.round(d.cpu_percent||0)+'%';overviewRam.textContent=Math.round(d.ram?.percent||0)+'%';overviewDisk.textContent=Math.round(d.disk?.percent||0)+'%';overviewUptime.textContent=compactDuration(d.uptime_seconds);
+  setBar(overviewCpuBar,d.cpu_percent);setBar(overviewRamBar,d.ram?.percent);setBar(overviewDiskBar,d.disk?.percent);
+  overviewServices.innerHTML=`<div class="ops-status-row"><span>MESFlow</span><span class="ops-badge ${d.mes?.online?'healthy':'offline'}">${d.mes?.online?'HEALTHY':'OFFLINE'}</span></div><div class="ops-status-row"><span>QA Center</span><span class="ops-badge ${d.qa?.online?'healthy':'offline'}">${d.qa?.online?'HEALTHY':'OFFLINE'}</span></div><div class="ops-status-row"><span>Docker containers</span><span>${d.docker_running||0} running · ${d.docker_unhealthy||0} unhealthy</span></div>`;
+  overviewAlerts.innerHTML=(d.alerts||[]).map(x=>`<div class="ops-status-row"><span>${x}</span><span class="ops-badge warning">WARNING</span></div>`).join('')||'<p>Không có cảnh báo cần xử lý.</p>';
+  overviewPostgres.textContent=d.docker_unhealthy?'WARNING':(d.docker_running?'HEALTHY':'UNKNOWN');overviewPostgres.classList.add(d.docker_unhealthy?'ops-warning':d.docker_running?'ops-good':'');
+}).catch(()=>{overviewAlerts.innerHTML='<p>Không thể tải health summary. <a href="{{url_for("ops_page")}}?view=overview">Mở chẩn đoán</a></p>'});
+fetch('{{url_for("api_fleet_summary")}}').then(r=>r.json()).then(d=>{
+  if(!d.ok){overviewFleet.innerHTML='<p class="muted">Không tải được Fleet.</p>';return}
+  const c=d.counts||{};
+  overviewFleet.innerHTML=`<div class="ops-status-row"><span>Servers đã đăng ký</span><span>${c.total??0}</span></div><div class="ops-status-row"><span>Online</span><span class="ops-badge healthy">${c.online??0}</span></div><div class="ops-status-row"><span>Production</span><span>${c.production??0}</span></div><div class="ops-status-row"><span>Sự cố đang mở (toàn Fleet)</span><span class="ops-badge ${c.active_incidents?'warning':'healthy'}">${c.active_incidents??0}</span></div>`;
+}).catch(()=>{overviewFleet.innerHTML='<p class="muted">Không tải được Fleet.</p>'});
+fetch('{{url_for("api_ops_storage")}}').then(r=>r.json()).then(d=>{
+  if(!d.filesystem){overviewBackup.innerHTML='<p class="muted">Không tải được Storage.</p>';return}
+  const fs=d.filesystem;
+  overviewBackup.innerHTML=`<div class="ops-status-row"><span>Dung lượng đã dùng</span><span>${fs.used||'—'} / ${fs.total||'—'} (${Math.round(fs.percent||0)}%)</span></div><div class="ops-status-row"><span>Trạng thái</span><span class="ops-badge ${fs.pressure_level==='CRITICAL'?'critical':fs.pressure_level==='WARNING'?'warning':'healthy'}">${fs.pressure_level==='CRITICAL'?'NGHIÊM TRỌNG':fs.pressure_level==='WARNING'?'CẢNH BÁO':'BÌNH THƯỜNG'}</span></div>`;
+}).catch(()=>{overviewBackup.innerHTML='<p class="muted">Không tải được Storage.</p>'});
+</script></body></html>

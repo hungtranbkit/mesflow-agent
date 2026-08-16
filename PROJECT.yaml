@@ -1,0 +1,86 @@
+schema_version: 1
+
+project:
+  code: deploy-agent
+  name: Deploy Agent
+  type: SERVICE
+  role: DEPLOYMENT_CONTROL_PLANE
+
+source:
+  root: .
+
+version:
+  file: VERSION.txt
+
+runtime:
+  type: docker-compose
+
+service:
+  healthcheck:
+    type: http
+    url: http://127.0.0.1:${DEPLOY_AGENT_LOCAL_PORT:-8090}/health
+    timeout_seconds: 15
+
+commands:
+
+  preflight:
+    command: ./scripts/preflight.sh
+    working_directory: .
+    timeout_seconds: 120
+
+  build:
+    command: ./scripts/build-agent-release.sh
+    working_directory: .
+    timeout_seconds: 1800
+
+  test:
+    command: ./scripts/test-baseline.sh
+    working_directory: .
+    timeout_seconds: 1800
+
+  local_status:
+    command: ./scripts/status.sh
+    working_directory: .
+
+artifacts:
+  strategy: immutable
+  directory: ../artifacts/deploy-agent/releases
+  metadata: ../artifacts/latest/deploy-agent.json
+
+deployment:
+  build_once: true
+  promote_same_artifact: true
+
+  local:
+    enabled: false
+    approval_required: true
+    notes: >
+      NOT WIRED to a ProjectFlow local_deploy action in this pass. The
+      Deploy Agent is the control plane that already manages this host's
+      real deployment(s) -- an already-running mesflow-deploy-agent
+      container was observed live at 127.0.0.1:8090 during the
+      standardization scan (see
+      reports/PROJECTFLOW_STANDARDIZATION_ASSESSMENT.md §5), driven by
+      deploy-agent/docker/compose.linux.yml, whose container_name
+      (mesflow-deploy-agent) and bind mounts (/opt/mesflow,
+      /opt/mesflow-qa-center, /var/run/docker.sock) are identical to what a
+      ProjectFlow-triggered "local deploy" of this same project would touch.
+      Redeploying the Agent locally without a human confirming this host's
+      real role is out of scope here. preflight/build/test are safe
+      (read-only / build-only / isolated-sandbox pytest, see
+      scripts/test-baseline.sh's own mktemp -d isolation) and are wired.
+      Wiring a genuinely isolated deploy-agent sandbox (separate port, data
+      dir, and Docker socket access, or none) is a known follow-up -- see
+      docs/PROJECTFLOW_INTEGRATION.md "Known limitations".
+
+  test:
+    enabled: true
+
+  staging:
+    enabled: true
+    notes: "Existing update path: scripts/update-target-agent.sh style host-side updater (see docs/operations/BUILD_AND_PROMOTE.md 'Release Manager UI/API'). Not wired as a direct ProjectFlow action."
+
+  production:
+    enabled: true
+    approval_required: true
+    projectflow_direct_execution: false

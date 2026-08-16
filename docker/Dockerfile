@@ -1,11 +1,11 @@
 FROM python:3.13-alpine3.22
 
-ARG AGENT_VERSION=2.15.4-docker-runtime
+ARG AGENT_VERSION=2.24.3-docker-runtime
 LABEL org.opencontainers.image.title="MESFlow Deploy Agent" \
       org.opencontainers.image.version="$AGENT_VERSION"
 
 RUN apk add --no-cache \
-      bash ca-certificates curl docker-cli docker-cli-compose git openssh-client tzdata \
+      bash ca-certificates curl docker-cli docker-cli-compose docker-cli-buildx git openssh-client tzdata zip \
     && apk add --no-cache --virtual .build-deps \
       build-base linux-headers python3-dev \
     && addgroup -S mesflow-agent \
@@ -17,8 +17,10 @@ RUN pip install --no-cache-dir --upgrade pip setuptools wheel \
     && pip install --no-cache-dir -r requirements.txt \
     && apk del .build-deps
 
-COPY agent.py ota_control.py VERSION.txt ./
+COPY agent.py ota_control.py predictive.py release_gate.py deployment_platform.py VERSION.txt ./
+COPY agent_backend ./agent_backend
 COPY templates ./templates
+COPY static ./static
 
 RUN mkdir -p /data/config /data/data \
     && chown -R mesflow-agent:mesflow-agent /app /data

@@ -1,0 +1,54 @@
+<section class="kiosk-card">
+  <h3>Fleet</h3>
+  <p class="sub">Trạng thái thiết bị tải bất đồng bộ từ MESFlow -- trang này không chặn tải để chờ kết quả.</p>
+  <div class="ops-kpis">
+    <div class="ops-kpi"><div class="ops-kpi-label">Tổng kiosk</div><div id="ovTotal" class="ops-kpi-value">--</div></div>
+    <div class="ops-kpi"><div class="ops-kpi-label">Online</div><div id="ovOnline" class="ops-kpi-value ops-good">--</div></div>
+    <div class="ops-kpi"><div class="ops-kpi-label">Offline</div><div id="ovOffline" class="ops-kpi-value ops-critical">--</div></div>
+    <div class="ops-kpi"><div class="ops-kpi-label">OTA đang chờ</div><div id="ovPending" class="ops-kpi-value">--</div></div>
+  </div>
+  <p style="margin-top:14px"><a class="btn" href="{{url_for('kiosk_ota_page')}}">Mở OTA &amp; Fleet</a></p>
+</section>
+
+<section class="kiosk-card">
+  <h3>Firmware</h3>
+  <p class="sub">Bản build gần nhất từ ESP Firmware Builder.</p>
+  <p><b>Phiên bản hiện tại:</b> {{(esp_builder_job.artifact.version if esp_builder_job and esp_builder_job.artifact else '—')}}
+  {% if not esp_build_enabled %}<span class="ops-badge warning">Đã tắt</span>{% endif %}</p>
+  <p><a class="btn" href="{{url_for('kiosk_firmware_page')}}">Mở Firmware</a></p>
+</section>
+
+<section class="kiosk-card">
+  <h3>Hướng dẫn ESP Kiosk</h3>
+  <p class="sub">Video tutorial đi kèm firmware, publish dưới dạng package độc lập.</p>
+  <p><b>Phiên bản:</b> {{esp_tutorial.tutorial_version}}
+  <span class="ops-badge {{'healthy' if esp_tutorial.package_status=='ready' else 'critical' if esp_tutorial.package_status=='invalid' else 'warning'}}">{{'Ready' if esp_tutorial.package_status=='ready' else 'Invalid' if esp_tutorial.package_status=='invalid' else 'Missing'}}</span></p>
+  <p><a class="btn" href="{{url_for('kiosk_tutorial_page')}}">Mở Hướng dẫn</a></p>
+</section>
+
+<script>
+(function(){
+  // Overview stays lightweight: a single one-shot load, no periodic
+  // polling -- device counts are the only thing this page fetches, and
+  // only once per page view (task: ESP_KIOSK_UI_SEPARATION section 8).
+  async function loadCounts(){
+    try{
+      const r=await fetch(SCRIPT_ROOT+'/api/esp-ota/devices');
+      const d=await r.json();
+      if(!r.ok)throw new Error(friendlyError(d.error));
+      const items=d.items||[];
+      ovTotal.textContent=items.length;
+      ovOnline.textContent=items.filter(x=>x.online).length;
+      ovOffline.textContent=items.filter(x=>!x.online).length;
+    }catch(_e){ovTotal.textContent='—';ovOnline.textContent='—';ovOffline.textContent='—'}
+    try{
+      const r2=await fetch(SCRIPT_ROOT+'/api/esp-ota/jobs');
+      if(!r2.ok)return;
+      const d2=await r2.json();
+      const items2=d2.items||[];
+      ovPending.textContent=items2.filter(x=>!['SUCCESS','FAILED','CANCELLED'].includes(x.status)).length;
+    }catch(_e){ovPending.textContent='—'}
+  }
+  loadCounts();
+})();
+</script>

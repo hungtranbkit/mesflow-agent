@@ -119,7 +119,9 @@ class DeploySafetyTests(unittest.TestCase):
         with patch.object(agent, "os", SimpleNamespace(name="posix")), patch.object(agent, "_docker_compose", side_effect=record), patch.object(agent, "port_open", return_value=False):
             agent.stop_mes(io.StringIO())
             agent.start_mes(io.StringIO())
-        self.assertEqual(calls, [["stop", "mesflow"], ["up", "-d", "--build", "postgres", "mesflow"]])
+        self.assertEqual(calls, [["stop", "mesflow"], ["up", "-d", "--no-build", "--no-deps", "mesflow"]])
+        self.assertFalse(any("--build" in args for args in calls))
+        self.assertFalse(any("postgres" in args for args in calls))
         self.assertFalse(any("nginx" in args for args in calls))
 
     def test_exception_after_stop_can_restore_exact_old_version(self):

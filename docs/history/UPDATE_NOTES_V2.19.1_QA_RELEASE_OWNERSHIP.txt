@@ -1,0 +1,10 @@
+MESFlow Deploy Agent 2.19.1
+
+- QA image-release Compose project now has an explicit stable ownership name.
+- Legacy `mesflow-qa-center` takeover is conditional: the exact named QA
+  container is removed only when another/legacy Compose project owns it.
+- Normal subsequent QA releases use scoped `docker compose up --no-build
+  --force-recreate mesflow-qa-center` without manual container removal.
+- Persistent QA runtime remains a host bind mount and is never deleted.
+- Adds generic duplicate top-level function detection and QA promotion
+  capability/artifact regression tests.

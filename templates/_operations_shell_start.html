@@ -1,0 +1,36 @@
+<div class="ops-shell">
+  <aside class="ops-sidebar" aria-label="Điều hướng IT Operations">
+    <a class="ops-brand" href="{{url_for('index')}}"><strong>MESFlow Operations</strong><span>Deploy Agent {{agent_version}}</span></a>
+    <div class="ops-nav-group"><div>TỔNG QUAN</div><nav class="ops-nav"><a class="{{'active' if page_key=='overview' else ''}}" href="{{url_for('index')}}">Tổng quan</a></nav></div>
+    <div class="ops-nav-group"><div>VẬN HÀNH</div><nav class="ops-nav">
+      <a class="{{'active' if page_key=='health' else ''}}" href="{{url_for('ops_page')}}?view=overview">Sức khỏe hệ thống</a>
+      <a class="{{'active' if page_key=='recovery' else ''}}" href="{{url_for('ops_page')}}?view=recovery">Dịch vụ</a>
+      <a class="{{'active' if page_key=='fleet' else ''}}" href="{{url_for('ops_page')}}?view=fleet">Servers / Fleet</a>
+      <a class="{{'active' if page_key=='alerts' else ''}}" href="{{url_for('ops_page')}}?view=alerts">Cảnh báo</a>
+      <a class="{{'active' if page_key=='incidents' else ''}}" href="{{url_for('ops_page')}}?view=incidents">Sự cố</a>
+      <a class="{{'active' if page_key=='logs' else ''}}" href="{{url_for('ops_page')}}?view=logs">Nhật ký hệ thống</a>
+      <a class="{{'active' if page_key=='diagnostics' else ''}}" href="{{url_for('ops_page')}}?view=diagnostics">Chẩn đoán</a>
+    </nav></div>
+    <div class="ops-nav-group"><div>TRIỂN KHAI</div><nav class="ops-nav">
+      <a class="{{'active' if page_key=='releases' and request.args.get('tab','deploy')=='deploy' else ''}}" href="{{url_for('release_manager_page')}}?tab=deploy">Release &amp; Deploy</a>
+      <a class="{{'active' if page_key=='releases' and request.args.get('tab')=='history' else ''}}" href="{{url_for('release_manager_page')}}?tab=history">Lịch sử triển khai</a>
+      <a class="{{'active' if page_key=='releases' and request.args.get('tab')=='agent-update' else ''}}" href="{{url_for('release_manager_page')}}?tab=agent-update">Agent Update</a>
+    </nav></div>
+    <div class="ops-nav-group"><div>ESP KIOSK</div><nav class="ops-nav">
+      <a class="{{'active' if page_key=='kiosk' and active_tab=='overview' else ''}}" href="{{url_for('kiosk_overview_page')}}">Tổng quan</a>
+      <a class="{{'active' if page_key=='kiosk' and active_tab=='ota' else ''}}" href="{{url_for('kiosk_ota_page')}}">OTA</a>
+      <a class="{{'active' if page_key=='kiosk' and active_tab=='firmware' else ''}}" href="{{url_for('kiosk_firmware_page')}}">Firmware</a>
+      <a class="{{'active' if page_key=='kiosk' and active_tab=='tutorial' else ''}}" href="{{url_for('kiosk_tutorial_page')}}">Hướng dẫn</a>
+    </nav></div>
+    <div class="ops-nav-group"><div>HỆ THỐNG</div><nav class="ops-nav">
+      <a class="{{'active' if page_key=='docker' else ''}}" href="{{url_for('ops_page')}}?view=docker">Docker</a>
+      <a class="{{'active' if page_key=='services' else ''}}" href="{{url_for('ops_page')}}?view=services">Dịch vụ hệ thống (systemd)</a><a class="{{'active' if page_key=='ports' else ''}}" href="{{url_for('ops_page')}}?view=ports">Network &amp; Ports</a>
+      <a class="{{'active' if page_key=='backup' else ''}}" href="{{url_for('ops_page')}}?view=backup">Backup / DB / Storage</a>
+      <a class="advanced {{'active' if page_key=='terminal' else ''}}" href="{{url_for('ops_page')}}?view=terminal">Terminal / SSH</a>
+    </nav></div>
+    <div class="ops-nav-group"><div>CẤU HÌNH</div><nav class="ops-nav"><a href="{{url_for('release_manager_page')}}?tab=agent-update#securitySettings">Users &amp; Security</a></nav></div>
+  </aside>
+  <button class="ops-scrim" aria-label="Đóng điều hướng"></button>
+  <div class="ops-main">
+    <header class="ops-context"><div style="display:flex;align-items:center;gap:10px"><button class="ops-sidebar-toggle" aria-label="Mở điều hướng">☰</button><h1>{{page_title or 'MESFlow IT Operations Center'}}</h1></div><div class="ops-context-meta"><span>{{server_role or 'Agent'}}</span><span>Agent {{agent_version}}</span><span class="ops-connection">Connected</span><form method="post" action="{{url_for('logout')}}"><input type="hidden" name="csrf" value="{{csrf}}"><button type="submit">Đăng xuất</button></form></div></header>
+    <main class="ops-content">

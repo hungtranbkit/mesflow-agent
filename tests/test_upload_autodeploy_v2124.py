@@ -10,29 +10,53 @@ def test_version_sync():
     assert f'AGENT_VERSION="{version}"' in s
 
 def test_mes_upload_auto_deploys():
+    # /upload is the current Build-Once artifact transfer route (used by
+    # _remote_agent_upload machine-to-machine calls and Deploy Local), not
+    # the removed legacy manual-ZIP-upload UI -- see
+    # reports/RELEASE_DEPLOY_UX_CLEANUP.md.
     s=(ROOT/'agent.py').read_text()
     block=s[s.index('@app.post("/upload")'):s.index('@app.post("/deploy/<version>")')]
     assert 'start_deploy(v)' in block
     assert 'Đã upload và bắt đầu deploy MESFlow' in block
 
-def test_qa_upload_auto_deploys():
+def test_legacy_source_zip_deploy_routes_removed():
+    # Legacy full-source-ZIP manual upload/deploy/delete routes (both the
+    # MESFlow "dry-run/delete" manual-UI actions and the entire QA Center
+    # legacy deploy path) were removed as dead UI-only code -- the current
+    # Build-Once architecture never used them for machine-to-machine
+    # transfer. See reports/RELEASE_DEPLOY_UX_CLEANUP.md for the audit.
     s=(ROOT/'agent.py').read_text()
-    block=s[s.index('@app.post("/qa/upload")'):s.index('@app.post("/qa/deploy/<version>")')]
-    assert 'start_qa_deploy(v)' in block
-    assert 'Đã upload và bắt đầu deploy QA Center' in block
+    for removed_route in (
+        '@app.post("/qa/upload")',
+        '@app.post("/qa/deploy/<version>")',
+        '@app.post("/qa/delete/<version>")',
+        '@app.post("/dry-run/<version>")',
+        '@app.post("/delete/<version>")',
+    ):
+        assert removed_route not in s, f"legacy route should have been removed: {removed_route}"
+    for removed_func in (
+        'def locate_qa_root',
+        'def list_qa_releases',
+        'def run_qa_job',
+        'def start_qa_deploy',
+        'def set_qa_step',
+        'def validate_mes_release_contract',
+    ):
+        assert removed_func not in s, f"dead legacy function should have been removed: {removed_func}"
+    # /deploy/<version> and /qa-release/* are NOT legacy -- they are the
+    # real machine-to-machine triggers _run_promote_test()/QA promote-test
+    # depend on, and must still be present.
+    assert '@app.post("/deploy/<version>")' in s
+    assert '@app.post("/qa-release/upload")' in s
 
-def test_file_picker_has_auto_submit_and_a_visible_fallback_button():
-    # AGENTS.md: "Upload UI must have a visible fallback action; never rely
-    # on only one fragile JavaScript auto-submit path." The upload flow may
-    # still auto-submit on file selection as a convenience, but a real,
-    # always-visible <button type="submit"> must exist so a user can send
-    # the upload manually if auto-submit doesn't fire.
-    h=(ROOT/'templates/index.html').read_text()
-    assert 'requestSubmit' in h or 'form.submit()' in h  # auto-submit convenience path exists
-    assert re.search(r'id="mesUploadButton"[^>]*type="submit"', h), "MESFlow upload needs a visible submit button"
-    assert re.search(r'id="qaUploadButton"[^>]*type="submit"', h), "QA upload needs a visible submit button"
-    assert 'Upload & Deploy' in h
-    assert 'Upload & Deploy QA' in h
+def test_legacy_upload_ui_removed_from_templates():
+    # The old giant single-page templates/index.html (with its manual
+    # source-ZIP <form> pickers) was deleted; the Release Deploy tab has no
+    # arbitrary-file-upload form for MESFlow/QA source ZIPs.
+    assert not (ROOT/'templates/index.html').exists()
+    deploy_tab=(ROOT/'templates/release/_deploy_tab.html').read_text()
+    assert 'mesUploadButton' not in deploy_tab
+    assert 'qaUploadButton' not in deploy_tab
 
 def test_agent_parses():
     ast.parse((ROOT/'agent.py').read_text())

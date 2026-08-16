@@ -1,0 +1,75 @@
+<section class="kiosk-card">
+  <h3>Thiết bị</h3>
+  <p class="sub">Chọn kiosk online để tạo OTA job. Version, build và hardware được xác minh từ manifest trong ZIP.</p>
+  <div id="devices" class="device-list">Đang tải thiết bị…</div>
+</section>
+
+<section class="kiosk-card">
+  <h3>Phát hành OTA</h3>
+  <form id="flashForm">
+    <label for="firmware">OTA package (.zip)</label>
+    <input id="firmware" name="firmware" type="file" accept=".zip" required>
+    <p style="color:var(--ops-muted)">Version, build và hardware được xác minh từ manifest trong ZIP.</p>
+    <button type="submit" class="btn btn-primary">Tạo OTA job cho kiosk đã chọn</button>
+  </form>
+  <div id="message" class="kiosk-card" hidden></div>
+</section>
+
+<section class="kiosk-card">
+  <h3>OTA jobs gần đây</h3>
+  <div id="jobs">Chưa có job.</div>
+</section>
+
+<script>
+{# Device list / flash form / job list logic carried over unchanged from
+   the old combined kiosk.html page (task: ESP_KIOSK_UI_SEPARATION) --
+   same endpoints (/api/esp-ota/devices, /api/esp-ota/jobs,
+   /api/esp-ota/upload, /api/esp-ota/jobs/<id>/cancel), same polling
+   cadence. Backend OTA logic is untouched; only the page this lives on
+   moved. #}
+async function loadDevices(){
+  const r=await fetch(SCRIPT_ROOT+'/api/esp-ota/devices');
+  const d=await r.json();
+  if(!r.ok)throw Error(friendlyError(d.error));
+  const items=d.items||[];
+  devices.innerHTML=items.map(x=>`<label class="device ${x.online?'':'offline'}"><input type="checkbox" value="${esc(x.kiosk_id)}" ${x.online?'':'disabled'}><span><b>${esc(x.kiosk_name||x.kiosk_id)}</b><small>${esc(x.kiosk_id)} · ${x.online?'ONLINE':'OFFLINE'} · firmware ${esc(x.firmware_version||'không rõ')}</small></span></label>`).join('')||'<p>Chưa có kiosk được cấu hình.</p>';
+}
+async function cancelJob(id){
+  if(!confirm('Hủy OTA job này?'))return;
+  await fetch(SCRIPT_ROOT+'/api/esp-ota/jobs/'+encodeURIComponent(id)+'/cancel',{method:'POST',headers:{'X-CSRF-Token':CSRF}});
+  await loadJobs();
+}
+function drawJob(j){
+  const active=!['SUCCESS','FAILED','CANCELLED'].includes(j.status);
+  return `<div class="ota-job"><b>${esc(j.version)} · ${esc(j.id.slice(0,8))}</b> <span class="ops-badge ${j.status==='SUCCESS'?'pass':j.status==='FAILED'?'failed':'warning'}">${esc(j.status)}</span>${active?` <button onclick="cancelJob('${esc(j.id)}')">Hủy job</button>`:''}${(j.devices||[]).map(x=>`<div class="ota-device"><b>${esc(x.kiosk_id)}</b> — ${esc(x.status)}${x.error?` · ${esc(x.error)}`:''}</div>`).join('')}</div>`;
+}
+async function loadJobs(){
+  const r=await fetch(SCRIPT_ROOT+'/api/esp-ota/jobs');
+  if(!r.ok)return;
+  const d=await r.json();
+  const items=d.items||[];
+  jobs.innerHTML=items.map(drawJob).join('')||'<p>Chưa có OTA job.</p>';
+}
+flashForm.addEventListener('submit',async e=>{
+  e.preventDefault();
+  const ids=[...document.querySelectorAll('#devices input:checked')].map(x=>x.value);
+  if(!ids.length){message.hidden=false;message.textContent='Chọn ít nhất một kiosk online.';return}
+  const submit=e.submitter;
+  submit.disabled=true;submit.textContent='Đang upload và tạo job…';
+  const fd=new FormData(e.target);
+  fd.set('kiosk_ids',JSON.stringify(ids));
+  message.hidden=false;message.textContent='Đang kiểm tra manifest…';
+  try{
+    const r=await fetch(SCRIPT_ROOT+'/api/esp-ota/upload',{method:'POST',body:fd,headers:{'X-CSRF-Token':CSRF}});
+    const d=await r.json();
+    message.textContent=r.ok?`Đã tạo job ${d.job.id.slice(0,8)} cho firmware ${d.job.version}.`:friendlyError(d.error);
+    if(r.ok){e.target.reset();await loadJobs()}
+  }finally{
+    submit.disabled=false;submit.textContent='Tạo OTA job cho kiosk đã chọn';
+  }
+});
+loadDevices().catch(e=>{message.hidden=false;message.textContent=e.message});
+loadJobs();
+setInterval(loadJobs,3000);
+setInterval(()=>loadDevices().catch(()=>{}),15000);
+</script>

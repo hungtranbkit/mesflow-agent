@@ -1,6 +1,6 @@
 # MESFlow Deploy Agent
 
-Current version: **2.15.5-docker-runtime**
+Current version: **2.24.3-docker-runtime**
 
 The Agent manages MESFlow release upload, validation, dry-run, application deployment/rollback, health diagnostics, QA integration and server operations. Phase 2B keeps the production nginx gateway independent from application deployment.
 
@@ -13,6 +13,31 @@ The Agent manages MESFlow release upload, validation, dry-run, application deplo
 Docker instructions: [`docs/DEPLOY_DOCKER.md`](docs/DEPLOY_DOCKER.md)
 
 Repository layout: [`docs/STRUCTURE.md`](docs/STRUCTURE.md)
+
+## Developer baseline
+
+From this directory, with the dependencies in `requirements.txt` plus
+`pytest` installed:
+
+```bash
+./scripts/test-baseline.sh
+```
+
+This runs Python compilation, the isolated fast test baseline, and source
+ZIP verification. Long-running QA/soak tests remain separate. Build a clean
+source archive explicitly with:
+
+```bash
+./scripts/build-source-package.sh
+```
+
+Build the immutable deployable Agent image/release on DEV only with:
+
+```bash
+./scripts/build-agent-release.sh
+```
+
+The application entry point remains `python agent.py` for compatibility.
 
 ## Native Linux install
 

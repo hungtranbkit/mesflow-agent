@@ -64,7 +64,9 @@ def test_agent_card_current_info_progress_and_view_link(tmp_path,monkeypatch):
     with agent.app.test_client() as client:
         with client.session_transaction() as session:
             session['authenticated']=True;session['csrf']='test-csrf'
-        response=client.get('/')
+        # ESP Tutorial card moved from the Release page to its own page
+        # (task: ESP_KIOSK_UI_SEPARATION).
+        response=client.get('/kiosk/tutorial')
     html=response.get_data(as_text=True)
     assert response.status_code==200
     for text in ('Video hướng dẫn ESP Kiosk','5.1.9.2','5.1.9.1','Upload &amp; Publish','Đang kiểm tra ZIP','Đang kiểm tra manifest','Đang backup bản cũ','Mở hướng dẫn ESP Kiosk'):

@@ -14,7 +14,7 @@ def test_docker_start_does_not_return_host_pid():
 
 def test_wait_qa_uses_container_state_for_docker():
     t=AGENT.read_text(encoding="utf-8")
-    block=t[t.index("def _wait_qa"):t.index("def _preserve_qa_data")]
+    block=t[t.index("def _wait_qa"):t.index("def _password_valid")]
     assert 'RUNTIME_MODE=="docker-linux"' in block
     assert "_qa_service_state()" in block
     assert "QA Center container exited" in block

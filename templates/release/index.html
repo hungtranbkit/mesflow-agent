@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="vi"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Release &amp; Deploy · MESFlow Operations</title>
+<link rel="stylesheet" href="{{static_url('css/agent.css')}}">
+<style>
+.rel-card{background:var(--ops-surface,#fff);border:1px solid var(--ops-line);border-radius:var(--radius-md,10px);padding:18px;margin-bottom:16px}
+.rel-card h3{margin:0 0 4px;font-size:16px}
+.rel-card .sub{color:var(--ops-muted);font-size:12px;margin:0 0 14px}
+.rel-current{display:flex;align-items:baseline;justify-content:space-between;flex-wrap:wrap;gap:10px;margin-bottom:6px}
+.rel-current .v{font-size:22px;font-weight:750}
+.rel-next{display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin-top:14px}
+.rel-next .why{font-size:12px;color:var(--ops-muted)}
+.rel-components{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:14px}
+.rel-component-status{font-size:13px;font-weight:700;margin-top:2px}
+.rel-component-status.ready{color:var(--status-success)}
+.rel-component-status.blocked{color:var(--status-warning)}
+.rel-component-status.na{color:var(--text-muted)}
+.rel-inprogress{border-left:4px solid var(--ops-blue);background:#f2f7fd}
+.rel-inprogress .elapsed{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-weight:700}
+.rel-more summary{cursor:pointer;font-size:13px;font-weight:600;color:var(--ops-muted);padding:6px 0}
+.rel-more-heading{font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:.03em;color:var(--ops-muted);margin:18px 0 8px;padding-top:14px;border-top:1px solid var(--ops-line)}
+.rel-more-heading:first-child{margin-top:0;padding-top:0;border-top:0}
+.hist-toolbar{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:12px}
+.hist-toolbar select,.hist-toolbar input{padding:7px 9px;border:1px solid var(--ops-line);border-radius:var(--radius-sm,6px);font-size:13px}
+.hist-toolbar input[type=search]{min-width:200px}
+.hist-table{width:100%;border-collapse:separate;border-spacing:0;font-size:13px}
+.hist-table th{position:sticky;top:0;background:#f7f9fc;text-align:left;padding:9px 8px;color:var(--ops-muted);font-weight:600;font-size:11px;text-transform:uppercase;border-bottom:1px solid var(--ops-line)}
+.hist-table td{padding:9px 8px;border-bottom:1px solid #edf1f5}
+.hist-table tbody tr{cursor:pointer}
+.hist-table tbody tr:hover{background:#f5f8fc}
+.result-badge{display:inline-flex;align-items:center;gap:5px;padding:3px 8px;border-radius:999px;font-size:11px;font-weight:800}
+.result-badge.SUCCESS{background:#e6f5ec;color:var(--status-success)}
+.result-badge.FAILED{background:#fde9e7;color:var(--status-danger)}
+.result-badge.ROLLED_BACK{background:#fff2dd;color:var(--status-warning)}
+.result-badge.ROLLBACK_FAILED{background:#fde9e7;color:var(--status-danger)}
+.hist-pager{display:flex;gap:10px;align-items:center;justify-content:flex-end;margin-top:10px;font-size:13px;color:var(--ops-muted)}
+.au-target{border:1px solid var(--ops-line);border-radius:var(--radius-md,10px);padding:16px;margin-bottom:14px}
+.au-target .name{font-weight:700;font-size:15px}
+.au-target .row{display:flex;gap:16px;flex-wrap:wrap;margin-top:8px;font-size:13px}
+.au-target .row b{font-weight:600}
+.drawer-shell{position:fixed;inset:0;z-index:2000}
+.drawer-shell .drawer-back{position:absolute;inset:0;background:#0d1b2b66;border:0}
+.drawer-shell .drawer{position:absolute;right:0;top:0;bottom:0;width:min(560px,92vw);background:#fff;box-shadow:-8px 0 30px #0003;padding:22px;overflow-y:auto}
+.drawer-shell .drawer h2{margin:0 0 12px;font-size:18px}
+.drawer-shell .drawer-close{position:absolute;top:14px;right:16px;border:0;background:transparent;font-size:20px;cursor:pointer;color:var(--ops-muted)}
+.empty-state{padding:28px 10px;text-align:center;color:var(--ops-muted);font-size:13px}
+</style></head><body>
+{% set page_title='Release & Deploy' %}{% include '_operations_shell_start.html' %}
+<div class="wrap">
+{# Real user report (reports/RELEASE_DEPLOY_UX_CLEANUP.md): the sidebar's
+   TRIỂN KHAI group already links directly to these same 3 destinations
+   (?tab=deploy/history/agent-update) -- an in-page tab bar here duplicated
+   that exact set a second time, on screen at once. Same fix as the Ops
+   page: sidebar is now the single navigation source; the page heading
+   names the active view instead, like ops.html already does. #}
+{% set tab_title={'deploy':'Release Deploy','history':'Deployment History','agent-update':'Agent Update'}.get(active_tab,'Release Deploy') %}
+<header class="ops-page-head"><div><h2>Release &amp; Deploy · {{tab_title}}</h2><p>Build once, kiểm thử và promote cùng artifact digest. Production luôn cần phê duyệt riêng.</p></div></header>
+{% with messages=get_flashed_messages(with_categories=true) %}{% for c,m in messages %}<div class="{{c}} rel-card">{{m}}</div>{% endfor %}{% endwith %}
+
+<script>
+{# Shared helpers must be defined BEFORE {% include tab_partial %} below --
+   real bug found+fixed while wiring up the History tab (reports/
+   RELEASE_DEPLOY_UX_CLEANUP.md): a tab partial's own <script> can run
+   code immediately (e.g. the History tab's unconditional `load();` call),
+   and inline <script> tags execute in document order, so a partial's
+   immediate call into apiFetch()/CSRF defined in a LATER <script> tag hit
+   a silent "apiFetch is not defined" ReferenceError caught by its own
+   try/catch -- the History tab always showed "failed to load", never a
+   real network request. #}
+function copyHashText(btn){const full=btn.getAttribute('data-full');navigator.clipboard?.writeText(full).then(()=>{const old=btn.textContent;btn.textContent='✓';btn.classList.add('copied');setTimeout(()=>{btn.textContent=old;btn.classList.remove('copied')},1200)}).catch(()=>{})}
+function esc(s){return String(s??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]))}
+const CSRF={{csrf|tojson}};
+async function apiFetch(url,opt={}){
+  // Real bug found+fixed live (reports/DEPLOY_AGENT_REFRESH_PERFORMANCE_FIX.md):
+  // this Agent's session cookie is scoped to Path={{request.script_root or '/'}}
+  // (SESSION_COOKIE_PATH=URL_PREFIX -- see agent.py). A root-absolute '/api/...'
+  // fetch issued from a page served under a URL prefix (the default,
+  // WORKSHOP_AGENT_URL_PREFIX=/agent) does not fall under that cookie's path,
+  // so the browser silently omits the session cookie -- the request looks
+  // unauthenticated, the API 302s to /login, and apiFetch's JSON parse of the
+  // login HTML fails, always showing "Không tải được..." even while logged
+  // in. ops.html's own api() helper already has this exact same fix; mirror
+  // it here instead of inventing a second convention.
+  if(url.startsWith('/api/'))url='{{request.script_root}}'+url;
+  opt.headers={...(opt.headers||{}),'X-CSRF-Token':CSRF,'X-Requested-With':'XMLHttpRequest'};if(opt.body&&!(opt.body instanceof FormData)&&!opt.headers['Content-Type'])opt.headers['Content-Type']='application/json';const r=await fetch(url,{credentials:'same-origin',...opt});let d={};try{d=await r.json()}catch(e){d={ok:false,error:'HTTP '+r.status}}d._status=r.status;return d}
+</script>
+
+{% include tab_partial %}
+
+</div>
+{% include '_operations_shell_end.html' %}
+</body></html>

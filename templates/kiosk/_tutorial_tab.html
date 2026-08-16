@@ -1,0 +1,62 @@
+<section class="kiosk-card">
+  <h3>Video hướng dẫn ESP Kiosk</h3>
+  <p class="sub">Video được tạo local và publish dưới dạng package độc lập. <span class="ops-badge {{'healthy' if esp_tutorial.package_status=='ready' else 'critical' if esp_tutorial.package_status=='invalid' else 'warning'}}">{{'Ready' if esp_tutorial.package_status=='ready' else 'Invalid' if esp_tutorial.package_status=='invalid' else 'Missing'}}</span></p>
+  <div class="kiosk-tutorial-summary">
+    <span><small>Phiên bản</small><b>{{esp_tutorial.tutorial_version}}</b></span>
+    {% if esp_tutorial.previous_version %}<span><small>Phiên bản trước</small><b>{{esp_tutorial.previous_version}}</b></span>{% endif %}
+    <span><small>Firmware</small><b>{{esp_tutorial.firmware_version or '—'}}</b></span>
+    <span><small>Video</small><b>{{esp_tutorial.video_count}}</b></span>
+    <span><small>Âm thanh</small><b>{{'Không' if esp_tutorial.audio is sameas false else '—'}}</b></span>
+    <span><small>Cập nhật</small><b>{{esp_tutorial.published_at or '—'}}</b></span>
+  </div>
+  <form id="espTutorialUploadForm" class="kiosk-tutorial-upload" method="post" enctype="multipart/form-data" action="{{url_for('esp_tutorial_upload')}}" style="margin-top:10px">
+    <input type="hidden" name="csrf" value="{{csrf}}">
+    <label class="file-button" for="espTutorialFile">Chọn ZIP</label><input id="espTutorialFile" type="file" name="tutorial_zip" accept=".zip,application/zip" required aria-describedby="espTutorialState">
+    <button id="espTutorialButton" class="btn btn-primary" type="submit">Upload &amp; Publish</button>
+    <a class="btn secondary" href="{{esp_tutorial_view_url}}">Mở hướng dẫn ESP Kiosk</a>
+    <div id="espTutorialState" class="label upload-state" aria-live="polite">Chưa chọn ZIP tutorial.</div>
+  </form>
+  {# Phase labels are always present in the DOM (not gated on a
+     currently-running job) so the upload JS below can light them up
+     progressively as it POSTs -- same convention as the Release page's
+     other upload flows. #}
+  <div class="job-phases" style="margin-top:8px">{% for p,label in [('uploading','Đang upload'),('validating','Đang kiểm tra ZIP'),('validating_manifest','Đang kiểm tra manifest'),('staging','Đang staging'),('backing_up','Đang backup bản cũ'),('publishing','Đang publish'),('verifying','Đang xác minh'),('success','Hoàn tất'),('failed','Thất bại')] %}<span class="job-phase {{'current' if esp_tutorial_job and esp_tutorial_job.status==p else 'done' if esp_tutorial_job and (esp_tutorial_job.transitions|selectattr('status','equalto',p)|list)|length else 'failed' if esp_tutorial_job and esp_tutorial_job.status=='failed' and p=='failed' else ''}}">{{label}}</span>{% endfor %}</div>
+  {% if esp_tutorial_job %}<p><b>{{esp_tutorial_job.status}}</b> — {{esp_tutorial_job.message}}</p>{% endif %}
+</section>
+
+{% if tutorial_job or tutorial_history %}
+<section class="kiosk-card">
+  <h3>Video hướng dẫn (MESFlow)</h3>
+  <p class="sub">Tính năng generate video trên server đã tắt. Video được tạo và kiểm tra trên máy local, sau đó upload package qua Agent.</p>
+  {% if tutorial_job %}<div><b>{{tutorial_job.status}}</b> — {{tutorial_job.message}}</div>{% if tutorial_job.log_tail %}<pre>{{tutorial_job.log_tail}}</pre>{% endif %}{% endif %}
+  {% if tutorial_history %}
+  <h4 style="font-size:13px">Lịch sử xuất video</h4>
+  {% for h in tutorial_history %}<div class="release"><div><b>{{h.started_at}}</b><div class="label">{{h.message}}</div></div><span class="{{'ok' if h.status=='success' else 'run' if h.status=='warning' else 'bad'}}">{{h.status}}</span></div>{% endfor %}
+  {% endif %}
+</section>
+{% endif %}
+
+<script>
+{# Upload/publish wiring carried over unchanged from the Release page's old
+   #espTutorialCard (task: ESP_KIOSK_UI_SEPARATION) -- same endpoint
+   (esp_tutorial_upload), same behavior. No periodic polling: this tab has
+   no in-flight background job to watch after a page load. #}
+(function(){
+  const form=document.getElementById('espTutorialUploadForm'), file=document.getElementById('espTutorialFile'), state=document.getElementById('espTutorialState'), button=document.getElementById('espTutorialButton');
+  if(!form||!file)return;
+  form.addEventListener('submit',async function(ev){
+    if(!file.files||!file.files.length)return;
+    ev.preventDefault();
+    state.textContent='Đang upload...'; button.disabled=true;
+    try{
+      const response=await fetch(form.action,{method:'POST',body:new FormData(form),credentials:'same-origin',headers:{'X-Requested-With':'XMLHttpRequest'}});
+      const isJson=(response.headers.get('content-type')||'').includes('application/json');
+      const payload=isJson?await response.json():{};
+      if(!response.ok||(isJson&&!payload.ok)) throw new Error(payload.error||('HTTP '+response.status));
+      window.location.assign(payload.redirect_url||response.url||window.location.href);
+    }catch(err){
+      button.disabled=false; state.textContent='Upload thất bại: '+(err&&err.message?err.message:String(err));
+    }
+  });
+})();
+</script>

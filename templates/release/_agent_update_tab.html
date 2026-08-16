@@ -1,0 +1,205 @@
+{% set tat=target_agents %}
+<div class="rel-card" id="agentPackageCard">
+  <div class="rel-current"><h3 style="margin:0">Deploy Agent Package</h3>
+  <button id="buildAgentPackageButton" class="btn btn-primary" type="button" {% if not mes_build_enabled %}disabled{% endif %}>Build Agent Package</button></div>
+  <p class="sub">Source preflight → version validation → tests → package build → SHA256 → manifest → immutable artifact. Định dạng ZIP giống hệt định dạng Bootstrap <code>/updater/update</code> đã kiểm tra/cài đặt (không đổi).</p>
+  {% if latest_agent_release and latest_agent_release.package_exists %}
+  <div class="row">
+    <span><b>Phiên bản mới nhất:</b> {{latest_agent_release.version}}</span>
+    <span><b>Build lúc:</b> {{latest_agent_release.built_at or '—'}}</span>
+    <span><b>Kích thước:</b> {{'%.1f'|format((latest_agent_release.package_size or 0)/1048576)}} MB</span>
+  </div>
+  <div class="row">
+    <span><b>Image digest:</b> <span class="ops-id">{{(latest_agent_release.image_digest or '')[:19]}}…</span></span>
+    <span><b>Source commit:</b> <span class="ops-id">{{(latest_agent_release.source_commit or '')[:12]}}</span></span>
+  </div>
+  <p class="label" style="margin-top:6px"><b>SHA256:</b> <span class="ops-id">{{latest_agent_release.package_sha256 or '—'}}</span></p>
+  <p style="margin-top:8px"><a class="btn secondary" href="{{url_for('release_manager_agent_package_download')}}">Download package</a></p>
+  {% else %}
+  <div class="empty-state">Chưa build package nào. Bấm "Build Agent Package" để tạo artifact đầu tiên.</div>
+  {% endif %}
+  {% if agent_package_build_job %}
+  {% set apb_done = agent_package_build_job.status in ['SUCCESS','FAILED'] %}
+  <div class="{{'' if apb_done else 'rel-inprogress'}}" style="margin-top:10px;padding-top:10px;border-top:1px solid var(--ops-line)">
+    <p><b>{{agent_package_build_job.status}}</b> — {{agent_package_build_job.message}}</p>
+    {# Honest pipeline explainer, not a fake live progress bar: BUILDING covers
+       source preflight/version validation/tests/docker build/SHA256/manifest
+       all inside this one job; a push afterwards (below) goes through
+       Bootstrap's single synchronous /updater/update call, which itself does
+       verify → install → restart → health check → version check and returns
+       one final PASS/FAILED/ROLLED_BACK -- Bootstrap does not expose
+       intermediate progress for that call, so this Agent cannot show it live
+       without inventing numbers it doesn't have. #}
+    {% if agent_package_build_job.log_tail %}<details><summary>Xem build log</summary><pre>{{agent_package_build_job.log_tail}}</pre></details>{% endif %}
+  </div>
+  {% endif %}
+</div>
+
+<div class="rel-card">
+  <div class="rel-current"><h3 style="margin:0">Target Agents</h3>
+  <button id="targetAgentsButton" class="secondary btn" type="button">Làm mới</button></div>
+  <p class="sub">Dùng chung cho MESFlow và QA Center. Đăng ký/khoẻ mạnh của từng Agent đích.</p>
+  <div id="releaseBuildStatus" class="label upload-state" aria-live="polite"></div>
+
+  {% if tat and tat.rows %}
+  {% for row in tat.rows %}
+  {# Real bug found+fixed (reports/RELEASE_DEPLOY_UX_CLEANUP.md): role used
+     to default to 'PRODUCTION' for anything that wasn't literally
+     "PRODUCTION TEST" -- including the LOCAL/DEV row -- so LOCAL rendered
+     a red "Update Production Agent" button. /api/release-manager/
+     update-agent only ever accepts role=PRODUCTION_TEST/PRODUCTION (see
+     its INVALID_ROLE check), so LOCAL must never get an update button at
+     all: this Agent cannot remote-update itself through that endpoint. #}
+  {% set display_name = 'TEST' if row.name=='PRODUCTION TEST' else row.name %}
+  {% set role = 'PRODUCTION_TEST' if row.name=='PRODUCTION TEST' else 'PRODUCTION' if row.name=='PRODUCTION' else '' %}
+  <div class="au-target">
+    <div class="name">{{display_name}}{% if display_name=='PRODUCTION' %} <span class="ops-badge critical" style="background:#fde9e7;color:#b3261e">PRODUCTION</span>{% endif %}</div>
+    {% if not role %}
+    <p class="label" style="margin-top:6px">Agent hiện tại: <b>{{row.agent_version or '—'}}</b> · MESFlow: <b>{{row.mesflow_version or '—'}}</b> ({{'khoẻ mạnh' if row.mesflow_healthy else 'không khoẻ mạnh'}}) — đây là chính Agent này, không thể tự cập nhật qua màn hình này.</p>
+    {% elif row.configured %}
+    <div class="row">
+      <span><b>Trạng thái:</b> {{'ONLINE' if row.compatibility.status not in ['OFFLINE','NOT_CONFIGURED'] else 'OFFLINE'}}</span>
+      <span><b>Agent hiện tại:</b> {{row.agent_version or '—'}}</span>
+      {% if row.latest_agent_version and row.agent_version and row.agent_version != row.latest_agent_version %}<span><b>Có bản mới:</b> {{row.latest_agent_version}}</span>{% endif %}
+      <span><b>MESFlow:</b> {{row.mesflow_version or '—'}} ({{'khoẻ mạnh' if row.mesflow_healthy else 'không khoẻ mạnh'}})</span>
+    </div>
+    <div class="row">
+      <span><b>Tương thích:</b> <span class="dotstatus {{'ok' if row.compatibility.status=='COMPATIBLE' else 'crit' if row.compatibility.status in ['INCOMPATIBLE','OFFLINE'] else 'warn'}}"><i></i>{{row.compatibility.status}}</span></span>
+      <span><b>Updater:</b> <span class="dotstatus {{'ok' if row.updater_configured else 'muted'}}"><i></i>{{'ĐÃ CẤU HÌNH' if row.updater_configured else 'CHƯA CẤU HÌNH'}}</span></span>
+    </div>
+    {% if row.compatibility.reason %}<p class="label" style="margin-top:6px">{{row.compatibility.reason}}</p>{% endif %}
+    {% if not row.updater_configured %}<details style="margin-top:6px"><summary class="label">Xem chi tiết cấu hình</summary><p class="label">Set MESFLOW_{{role}}_AGENT_UPDATER_URL/_TOKEN</p></details>{% endif %}
+    {% set update_disabled = row.compatibility.status in ['OFFLINE','NOT_CONFIGURED','INCOMPATIBLE'] or not row.updater_configured %}
+    <p style="margin-top:10px">
+      <button class="{{'btn btn-danger' if role=='PRODUCTION' else 'secondary btn'}} update-agent-btn" data-role="{{role}}" type="button" {% if update_disabled %}disabled{% endif %}>
+        {{'Update Production Agent' if role=='PRODUCTION' else 'Update Agent'}}
+      </button>
+      {% if role=='PRODUCTION' %}<span class="label">Cần phê duyệt của con người + MESFLOW_PRODUCTION_PROMOTE_ENABLED=1</span>{% endif %}
+    </p>
+    {% else %}
+    <p class="label">{{row.compatibility.reason}}</p>
+    {% endif %}
+  </div>
+  {% endfor %}
+  {% if tat.checked_at %}<p class="label">Kiểm tra lần cuối: {{tat.checked_at}}</p>{% endif %}
+  {% else %}
+  <div class="empty-state">Chưa cấu hình Remote Agent. Bấm "Làm mới" để kiểm tra.</div>
+  {% endif %}
+
+  {% if agent_update_job %}
+  {# Real bug found+fixed (reports/RELEASE_DEPLOY_UX_CLEANUP.md): heading
+     used to unconditionally say "Đang cập nhật" (updating...) even after
+     the job had already finished SUCCESS/FAILED/ROLLED_BACK. #}
+  {% set au_done = agent_update_job.status in ['SUCCESS','FAILED','ROLLED_BACK'] %}
+  {# Display-only label mapping (task: AGENT_PACKAGE_BUILD_PUSH) -- the
+     underlying job status stays exactly what Bootstrap's /updater/update
+     wire contract returns (SUCCESS/ROLLED_BACK/ROLLBACK_FAILED/FAILED,
+     unchanged, never duplicated here); UPLOADING/PASS are just clearer
+     words for the same states in this specific UI. #}
+  {% set au_label = {'QUEUED':'UPLOADING','UPDATING':'UPLOADING','PUSHING':'UPLOADING','SUCCESS':'PASS'}.get(agent_update_job.status, agent_update_job.status) %}
+  <div class="rel-card {{'' if au_done else 'rel-inprogress'}}" style="margin-top:14px">
+    <h3>{{'Cập nhật Agent' if au_done else 'Đang cập nhật Agent'}} {{agent_update_job.role}} {{agent_update_job.version or ''}}</h3>
+    <p><b>{{au_label}}</b> — {{agent_update_job.message}}</p>
+    {% if not au_done %}<p class="label">Bootstrap đang xử lý: verify → install → restart → health check → xác nhận version (một lệnh gọi, không có tiến trình chi tiết theo thời gian thực).</p>{% endif %}
+  </div>
+  {% endif %}
+</div>
+
+<div class="rel-card" id="securitySettings">
+  <h3>Đổi mật khẩu Agent</h3>
+  <p class="sub">Mật khẩu đăng nhập của chính Deploy Agent này.</p>
+  <form method="post" action="{{url_for('change_password')}}">
+    <input type="hidden" name="csrf" value="{{csrf}}">
+    <input type="password" name="old_password" placeholder="Mật khẩu hiện tại">
+    <input type="password" name="new_password" placeholder="Mật khẩu mới">
+    <button class="btn btn-primary">Đổi</button>
+  </form>
+</div>
+
+<script>
+(function(){
+  async function runReleaseAction(buttonId,url,busyText,fallbackError,reloadDelay){
+    const button=document.getElementById(buttonId), status=document.getElementById('releaseBuildStatus');
+    if(!button)return;
+    button.onclick=async()=>{
+      button.disabled=true; if(status) status.textContent=busyText;
+      try{
+        const response=await fetch(url,{method:'POST',credentials:'same-origin',headers:{'X-CSRF-Token':CSRF,'X-Requested-With':'XMLHttpRequest'}});
+        const ct=response.headers.get('content-type')||'';
+        const payload=ct.includes('application/json') ? await response.json() : {};
+        if(!response.ok) throw new Error(payload.error||payload.message||(fallbackError+' (HTTP '+response.status+')'));
+        if(status) status.textContent=payload.message||'Đã nhận yêu cầu.';
+        setTimeout(()=>location.reload(),reloadDelay);
+      }catch(err){
+        if(status) status.textContent=fallbackError+': '+(err&&err.message?err.message:String(err));
+        button.disabled=false;
+      }
+    };
+  }
+  runReleaseAction('targetAgentsButton','{{url_for("release_manager_target_agents")}}','Đang kiểm tra Target Agents…','Refresh failed',700);
+  runReleaseAction('buildAgentPackageButton','{{url_for("release_manager_build_agent_package")}}','Đang build Agent package (source preflight → version validation → tests → build → SHA256 → manifest)…','Build failed',1500);
+  document.querySelectorAll('.update-agent-btn').forEach(function(button){
+    button.onclick=async()=>{
+      const role=button.dataset.role;
+      const status=document.getElementById('releaseBuildStatus');
+      let body={role:role};
+      if(role==='PRODUCTION'){
+        if(!confirm('Xác nhận cập nhật Deploy Agent trên PRODUCTION? Cần phê duyệt của con người và MESFLOW_PRODUCTION_PROMOTE_ENABLED=1 trên Agent này.'))return;
+        body.confirm=true;
+      }
+      button.disabled=true; if(status) status.textContent='Đang gửi Agent update artifact tới '+role+' (không qua SSH)…';
+      try{
+        const response=await fetch('{{url_for("release_manager_update_agent")}}',{method:'POST',credentials:'same-origin',
+          headers:{'Content-Type':'application/json','X-CSRF-Token':CSRF,'X-Requested-With':'XMLHttpRequest'},
+          body:JSON.stringify(body)});
+        const payload=await response.json().catch(()=>({}));
+        if(!response.ok) throw new Error(payload.error||payload.detail||('HTTP '+response.status));
+        if(status) status.textContent='Agent update queued for '+role+'.';
+        setTimeout(()=>location.reload(),1500);
+      }catch(err){
+        if(status) status.textContent='Agent update failed: '+(err&&err.message?err.message:String(err));
+        button.disabled=false;
+      }
+    };
+  });
+  // Real bug found+fixed here (reports/DEPLOY_AGENT_REFRESH_PERFORMANCE_FIX.md):
+  // this used to be a single conditional setTimeout doing a bare page
+  // reload on a fixed short delay whenever the job looked active -- a
+  // ONE-SHOT reload that, once it fires, re-renders this exact same script on
+  // a freshly loaded page, which schedules ANOTHER one-shot reload if the job
+  // is still active -- in effect a "reload the whole page every 3 seconds"
+  // loop for as long as an Agent Update job runs. Same fix as the Release
+  // Deploy tab (which already had this): poll the existing lightweight
+  // persisted-state-only endpoint, update the visible status text in place,
+  // and reload exactly once when the job actually finishes.
+  const agentUpdateHadActiveJob={{ 'true' if (agent_update_job and agent_update_job.status in ['QUEUED','UPDATING','PUSHING']) or (agent_package_build_job and agent_package_build_job.status in ['QUEUED','BUILDING']) else 'false' }};
+  if(agentUpdateHadActiveJob){
+    let wasActive=true, pollInFlight=false;
+    const pollAgentUpdateState=async()=>{
+      if(document.hidden)return;
+      if(pollInFlight)return;  // never stack a second request behind a slow/stuck one
+      pollInFlight=true;
+      try{
+        const response=await fetch('{{url_for("release_manager_live_status")}}',{credentials:'same-origin',cache:'no-store'});
+        if(!response.ok)return;
+        const data=await response.json();
+        const job=(data.jobs&&data.jobs.agent_update_job)||{};
+        const buildJob=(data.jobs&&data.jobs.agent_package_build_job)||{};
+        const status=document.getElementById('releaseBuildStatus');
+        if(job.status&&status) status.textContent=job.status+(job.message?' — '+job.message:'');
+        else if(buildJob.status&&status) status.textContent=buildJob.status+(buildJob.message?' — '+buildJob.message:'');
+        const stillActive=['QUEUED','UPDATING','PUSHING'].includes(job.status)||['QUEUED','BUILDING'].includes(buildJob.status);
+        if(wasActive&&!stillActive){
+          wasActive=false;
+          window.setTimeout(()=>location.reload(),500);
+        }
+      }catch(_err){ /* status polling is best-effort; never freeze the page */ }
+      finally{ pollInFlight=false; }
+    };
+    window.setInterval(pollAgentUpdateState,5000);
+    window.setTimeout(pollAgentUpdateState,1200);
+    document.addEventListener('visibilitychange',()=>{ if(!document.hidden) pollAgentUpdateState(); });
+  }
+  if(location.hash==='#securitySettings'){document.getElementById('securitySettings')?.scrollIntoView({block:'start'})}
+})();
+</script>

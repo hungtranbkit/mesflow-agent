@@ -1,0 +1,352 @@
+{% macro hashline(label, value, head=10, tail=8) -%}
+<b>{{label}}:</b>
+{%- if not value %} —<br>
+{%- elif value|length > head+tail+3 %} <span class="ops-hash"><code>{{value[:head]}}…{{value[-tail:]}}</code><button type="button" class="copybtn" data-full="{{value}}" onclick="copyHashText(this)">Copy</button></span><br>
+{%- else %} <code>{{value}}</code><br>
+{%- endif %}
+{%- endmacro %}
+{% macro pipestage(label, state) -%}
+{% set tone = 'pass' if state=='PASS' else 'fail' if state=='FAILED' else 'ready' if state in ['BUILDING','DEPLOYING','QUEUED','UPLOADING','VERIFYING'] else 'pending' %}
+{% set vi = {'PASS':'PASS','FAILED':'LỖI','NOT_TESTED':'CHƯA CHẠY','NOT_DEPLOYED':'CHƯA TRIỂN KHAI','BUILDING':'ĐANG BUILD','DEPLOYING':'ĐANG TRIỂN KHAI','QUEUED':'ĐANG XẾP HÀNG','UPLOADING':'ĐANG UPLOAD','VERIFYING':'ĐANG KIỂM TRA','IDLE':'CHƯA CHẠY'} %}
+<div class="ops-pipeline-stage {{tone}}{{' production' if label=='PRODUCTION' else ''}}"><div class="label">{{label}}</div><div class="state">{{vi.get(state, state)}}</div></div>
+{%- endmacro %}
+{# Determine the one next actionable stage for a component (task section 8).
+   Jinja macros can only return rendered TEXT, never an object usable via
+   dot-notation by the caller -- so this is inlined at each of the two call
+   sites (MESFlow/QA) below via {% set na = namespace(...) %}, not a macro. #}
+
+{% if job and job.status in ['queued','uploading','validating','building','deploying','verifying'] %}
+<div class="rel-card rel-inprogress">
+  <h3>Đang triển khai MESFlow {{job.from_version}} → {{job.version}}</h3>
+  <p class="sub">Stage: <b>{{job.status|upper}}</b> · <span class="elapsed" id="mesJobElapsed" data-started="{{job.started_at}}">—</span></p>
+  <p>{{job.message}}</p>
+  <details><summary>Xem chi tiết</summary><pre>{{job.log_tail}}</pre></details>
+</div>
+{% endif %}
+{% if qa_local_deploy_job and qa_local_deploy_job.status == 'DEPLOYING' %}
+<div class="rel-card rel-inprogress">
+  <h3>Đang triển khai QA Center {{qa_local_deploy_job.version}}</h3>
+  <p class="sub">{{qa_local_deploy_job.message}}</p>
+</div>
+{% endif %}
+
+{% if release_summary.contamination and release_summary.contamination.contaminated %}
+<div class="rel-card" style="background:#4a1010;color:#ffb4b4;border-color:#ff6b6b">⚠ CONTAMINATED: {{release_summary.contamination.reason}}</div>
+{% endif %}
+
+{# ---- Common component matrix (MESFlow/QA Center/Deploy Agent) ---- #}
+{% set dp_label={'MESFLOW':'MESFlow','QA_CENTER':'QA Center','DEPLOY_AGENT':'Deploy Agent'} %}
+<div id="deploymentPlatformSummary" class="rel-card" style="display:flex;gap:28px;flex-wrap:wrap;padding:12px 18px">
+{% for c in deployment_platform.components %}
+<div style="min-width:150px">
+  <div class="label">{{dp_label.get(c.component, c.component)}}</div>
+  <div style="font-weight:700">{{c.running}}</div>
+  <div class="label">{{'Khoẻ mạnh' if c.healthy else 'Không khoẻ mạnh'}}</div>
+</div>
+{% endfor %}
+</div>
+
+{# ---- MESFlow current release card ---- #}
+{% set s = release_summary.states %}
+{% set blocked = release_summary.blocked %}
+{% set latest = release_summary.latest %}
+{% set na = namespace(stage='production',label='Promote to Production',why=blocked.production,enabled=(not blocked.production),id='mesNextProd') %}
+{% if s.build != 'PASS' %}
+  {% set na.stage='build' %}{% set na.label='Build Release' %}{% set na.why=blocked.build %}{% set na.enabled=(mes_build_enabled and not blocked.build) %}{% set na.id='mesNextBuild' %}
+{% elif s.local != 'PASS' %}
+  {% set na.stage='local' %}{% set na.label='Deploy Local' %}{% set na.why=blocked.local %}{% set na.enabled=(not blocked.local) %}{% set na.id='mesNextLocal' %}
+{% elif s.test != 'PASS' %}
+  {% set na.stage='test' %}{% set na.label='Promote to Test' %}{% set na.why=blocked.test %}{% set na.enabled=(not blocked.test) %}{% set na.id='mesNextTest' %}
+{% endif %}
+<div class="rel-card">
+  <div class="rel-current">
+    <div><h3>MESFlow</h3>
+      <div class="v">{% if latest and latest.version %}{{latest.version}}{% else %}Chưa build{% endif %}</div>
+    </div>
+    <span class="ops-badge {{'pass' if latest and latest.package_sha256 else ''}}">{% if latest and latest.package_sha256 %}Artifact VERIFIED{% else %}Chưa có artifact{% endif %}</span>
+  </div>
+  <div class="ops-pipeline" aria-label="MESFlow release pipeline">{{pipestage('BUILD', s.build)}}{{pipestage('LOCAL', s.local)}}{{pipestage('TEST', s.test)}}{{pipestage('PRODUCTION', s.production)}}</div>
+  <div class="rel-next">
+    <button id="{{na.id}}" class="btn btn-primary" data-stage="{{na.stage}}" {% if not na.enabled %}disabled{% endif %}>{{na.label}}</button>
+    {% if na.why %}<span class="why">{{na.why}}</span>{% endif %}
+    <span class="label" style="margin-left:auto">Version nguồn (workspace): <b>{{release_summary.source_version or '—'}}</b></span>
+  </div>
+  <div id="releaseBuildStatus" class="label upload-state" style="margin:10px 0" aria-live="polite">{% if release_summary.promotion.local_message %}{{release_summary.promotion.local_message}}{% else %}Sẵn sàng.{% endif %}</div>
+
+  {# One grouped disclosure per card instead of 3 stacked accordions
+     (Thao tác khác / Xem chi tiết artifact / Production Preflight) -- real
+     user report: nested/stacked accordions read as "tabs inside tabs". Sub-
+     headings below keep everything reachable without extra toggle layers.
+     The stage already shown as the primary Next Action button above is
+     skipped here so the same action never appears twice on screen. #}
+  <details id="releaseEvidenceDrawer" class="rel-more" {% if na.stage=='production' %}open{% endif %}><summary>Thao tác khác &amp; chi tiết ⋯</summary>
+  <div style="margin-top:10px">
+  <h4 class="rel-more-heading">Thao tác khác</h4>
+  <div class="stage-actions">
+    {% if na.stage != 'build' %}<div class="stage-action"><button id="releaseBuildButton" class="secondary btn" type="button" {% if not mes_build_enabled or blocked.build %}disabled{% endif %}>Build Release</button><span class="why">{{blocked.build or ''}}</span></div>{% endif %}
+    {% if na.stage != 'local' %}<div class="stage-action"><button id="releaseLocalButton" class="secondary btn" type="button" {% if blocked.local %}disabled{% endif %}>Deploy Local</button><span class="why">{{blocked.local or ''}}</span></div>{% endif %}
+    {% if na.stage != 'test' %}<div class="stage-action"><button id="releaseTestButton" class="secondary btn" type="button" {% if blocked.test %}disabled{% endif %}>Promote to Test</button><span class="why">{{blocked.test or ''}}</span></div>{% endif %}
+    {% if na.stage != 'production' %}<div class="stage-action"><button id="releaseProdButton" class="btn btn-danger" type="button" {% if blocked.production %}disabled{% endif %} title="Yêu cầu xác nhận thủ công của con người">Promote to Production</button><span class="why">{{blocked.production or ''}}</span></div>{% endif %}
+  </div>
+  <p style="margin-top:12px"><input id="bumpVersionTarget" type="text" placeholder="Để trống = tự +1 (vd 65.8.44.70)" style="width:240px" {% if not mes_build_enabled %}disabled{% endif %}>
+  <button id="bumpVersionButton" class="secondary btn" type="button" {% if not mes_build_enabled %}disabled{% endif %} title="Chỉ sửa VERSION.txt/__init__.py/release.json/compose.yml -- không build">Nâng version (chưa build)</button>
+  {% if version_bump %}<span class="label"> · Lần nâng gần nhất: {{version_bump.before}} → <b>{{version_bump.after}}</b> ({{version_bump.at}})</span>{% endif %}</p>
+
+  <h4 class="rel-more-heading">Chi tiết artifact / evidence</h4>
+  <div class="grid"><div>{% if latest and latest.version %}{{hashline('Source commit', latest.source_commit or release_summary.git)}}{{hashline('ZIP SHA', latest.package_sha256)}}{{hashline('Image digest', latest.digest)}}{{hashline('Image id', latest.image_id)}}{% else %}<span class="label">NOT BUILT</span>{% endif %}</div>
+  <div><div class="label">Schema</div><b>{{'PASS' if release_summary.promotion.schema_pass else 'CHƯA XÁC MINH'}}</b> — Expected: <code>{{(release_summary.promotion.expected_schema_revision or '—')[:20]}}</code> · Actual: <code>{{(release_summary.promotion.actual_schema_revision or '—')[:20]}}</code></div></div>
+  {% set ge=release_summary.release_gate_evidence %}
+  {% if ge %}
+  <div class="job-phases" style="margin-top:8px">
+  {% for state,label in [(ge.build.status,'Build'),(ge.local.status,'Local QA'),(ge.test_deployment.status,'Test Deploy'),(ge.test.status,'Test QA'),('PASS' if ge.evidence_complete else 'INCOMPLETE','Evidence'),('PASS' if ge.decision.ready else ge.decision.decision,'Sẵn sàng Production')] %}
+  <span class="job-phase {{'done' if state=='PASS' else 'failed' if state in ['FAIL','FAILED','ERROR'] else 'current'}}"><b>{{label}}</b>: {{state}}</span>
+  {% endfor %}</div>
+  <p class="label">Artifact: {{hashline('digest', ge.release.artifact_digest, 10, 8)}} LOCAL run: {{ge.local.run_id or '—'}} · TEST run: {{ge.test.run_id or '—'}} · Vấn đề chặn: {{ge.known_blocking_issues}}</p>
+  {% if ge.decision.reasons %}<p class="bad">{{ge.decision.reasons|join(' · ')}}</p>{% endif %}
+  {% endif %}
+  <p class="label">Release history: {{release_summary.promotion.history|join(' → ')}}</p>
+
+  {% if na.stage == 'production' or s.production not in ('NOT_DEPLOYED',) %}
+  <h4 class="rel-more-heading">Production Preflight (read-only)</h4>
+  <p><button id="releaseProdPreflightButton" class="secondary btn" type="button" {% if not release_summary.production_target_configured %}disabled{% endif %}>Run Production Preflight</button>
+  {% if not release_summary.production_target_configured %}<span class="label"> — chưa cấu hình target (set MESFLOW_PRODUCTION_AGENT_URL/_USER/_PASSWORD)</span>{% endif %}</p>
+  {% set pf=release_summary.production_preflight %}
+  {% if pf and pf.checked_at %}
+  <div class="grid">
+  <div><div class="label">Target</div><b>Kiểm tra lúc:</b> {{pf.checked_at}} ({{'mới' if release_summary.production_preflight_fresh else 'CŨ — chạy lại trước khi promote'}})<br>
+  <b>Agent:</b> {{pf.agent.version or '—'}} · role={{pf.agent.server_role or '—'}}<br>
+  <b>MESFlow version:</b> {{pf.mes.version or '—'}} · <b>healthy:</b> {{pf.mes.healthy}}</div>
+  <div><div class="label">Hạ tầng</div>
+  <b>Postgres:</b> {{pf.postgres.health if pf.postgres else '—'}}<br>
+  <b>Disk:</b> {% if pf.disk and pf.disk.percent is defined %}{{pf.disk.percent}}%{% else %}—{% endif %}<br>
+  <b>Backup:</b> {% if pf.backups and pf.backups.count is defined %}{{pf.backups.count}} bản{% else %}—{% endif %}<br>
+  <b>Tổng thể:</b> <span class="{{'ok' if pf.healthy else 'bad'}}">{{'SẴN SÀNG' if pf.healthy else 'CHƯA SẴN SÀNG'}}</span></div>
+  </div>
+  {% else %}<p class="label">Chưa chạy preflight.</p>{% endif %}
+  {% endif %}
+  </div>
+  </details>
+</div>
+
+{# ---- QA Center current release card (same visual pattern) ---- #}
+{% set qs = qa_release_summary.states %}
+{% set qblocked = qa_release_summary.blocked %}
+{% set qlatest = qa_release_summary.latest %}
+{% set qna = namespace(stage='production',label='Promote to Production',why=qblocked.production,enabled=(not qblocked.production),id='qaNextProd') %}
+{% if qs.build != 'PASS' %}
+  {% set qna.stage='build' %}{% set qna.label='Build Release' %}{% set qna.why=qblocked.build %}{% set qna.enabled=(mes_build_enabled and not qblocked.build) %}{% set qna.id='qaNextBuild' %}
+{% elif qs.local != 'PASS' %}
+  {% set qna.stage='local' %}{% set qna.label='Deploy Local' %}{% set qna.why=qblocked.local %}{% set qna.enabled=(not qblocked.local) %}{% set qna.id='qaNextLocal' %}
+{% elif qs.test != 'PASS' %}
+  {% set qna.stage='test' %}{% set qna.label='Promote to Test' %}{% set qna.why=qblocked.test %}{% set qna.enabled=(not qblocked.test) %}{% set qna.id='qaNextTest' %}
+{% endif %}
+<div class="rel-card">
+  <div class="rel-current">
+    <div><h3>QA Center</h3>
+      <div class="v">{% if qlatest and qlatest.version %}{{qlatest.version}}{% else %}Chưa build{% endif %}</div>
+    </div>
+    <span class="ops-badge {{'pass' if qlatest and qlatest.package_sha256 else ''}}">{% if qlatest and qlatest.package_sha256 %}Artifact VERIFIED{% else %}Chưa có artifact{% endif %}</span>
+  </div>
+  <div class="ops-pipeline" aria-label="QA release pipeline">{{pipestage('BUILD', qs.build)}}{{pipestage('LOCAL', qs.local)}}{{pipestage('TEST', qs.test)}}{{pipestage('PRODUCTION', qs.production)}}</div>
+  <div class="rel-next">
+    <button id="{{qna.id}}" class="btn btn-primary" data-stage="{{qna.stage}}" {% if not qna.enabled %}disabled{% endif %}>{{qna.label}}</button>
+    {% if qna.why %}<span class="why">{{qna.why}}</span>{% endif %}
+    <span class="label" style="margin-left:auto">Version nguồn: <b>{{qa_release_summary.source_version or '—'}}</b></span>
+  </div>
+  <div id="qaReleaseBuildStatus" class="label upload-state" style="margin:10px 0" aria-live="polite">{% if qa_release_summary.promotion.local_message %}{{qa_release_summary.promotion.local_message}}{% else %}Sẵn sàng.{% endif %}</div>
+
+  <details class="rel-more"><summary>Thao tác khác &amp; chi tiết ⋯</summary>
+  <div style="margin-top:10px">
+  <h4 class="rel-more-heading">Thao tác khác</h4>
+  <div class="stage-actions">
+    {% if qna.stage != 'build' %}<div class="stage-action"><button id="qaReleaseBuildButton" class="secondary btn" type="button" {% if not mes_build_enabled or qblocked.build %}disabled{% endif %}>Build Release</button><span class="why">{{qblocked.build or ''}}</span></div>{% endif %}
+    {% if qna.stage != 'local' %}<div class="stage-action"><button id="qaReleaseLocalButton" class="secondary btn" type="button" {% if qblocked.local %}disabled{% endif %}>Deploy Local</button><span class="why">{{qblocked.local or ''}}</span></div>{% endif %}
+    {% if qna.stage != 'test' %}<div class="stage-action"><button id="qaReleaseTestButton" class="secondary btn" type="button" {% if qblocked.test %}disabled{% endif %}>Promote to Test</button><span class="why">{{qblocked.test or ''}}</span></div>{% endif %}
+    {% if qna.stage != 'production' %}<div class="stage-action"><button id="qaReleaseProdButton" class="btn btn-danger" type="button" {% if qblocked.production %}disabled{% endif %} title="Yêu cầu xác nhận thủ công của con người">Promote to Production</button><span class="why">{{qblocked.production or ''}}</span></div>{% endif %}
+  </div>
+
+  <h4 class="rel-more-heading">Chi tiết artifact</h4>
+  <div class="grid"><div>{% if qlatest and qlatest.version %}{{hashline('Source commit', qlatest.source_commit or qa_release_summary.git)}}{{hashline('ZIP SHA', qlatest.package_sha256)}}{{hashline('Image digest', qlatest.digest)}}{{hashline('Image id', qlatest.image_id)}}{% else %}<span class="label">NOT BUILT</span>{% endif %}</div>
+  <div><div class="label">Schema</div><b>Không áp dụng</b> — QA Center không có database riêng.</div></div>
+
+  <h4 class="rel-more-heading">Dịch vụ QA Center (Start/Stop)</h4>
+  <div class="grid">
+    <div><div class="label">QA Center</div><div class="value {{'ok' if qa.online else 'bad'}}">{{'ONLINE' if qa.online else 'OFFLINE'}}</div></div>
+    <div><div class="label">Version</div><div class="value">{{qa.version}}</div></div>
+    <div><div class="label">Port</div><div class="value">{{qa.port}}</div></div>
+    <div><div class="label">Điều khiển</div><div class="actions" style="margin-top:8px"><a class="btn" href="{{qa_open_url}}" target="_blank">Mở QA Center</a><form method="post" action="{{url_for('qa_restart')}}"><input type="hidden" name="csrf" value="{{csrf}}"><button class="secondary btn">Restart</button></form><form method="post" action="{{url_for('qa_stop')}}"><input type="hidden" name="csrf" value="{{csrf}}"><button class="btn btn-danger">Stop</button></form></div></div>
+  </div>
+  </div>
+  </details>
+</div>
+
+{# ESP Firmware Builder / ESP Tutorial moved to their own pages under
+   /kiosk/firmware and /kiosk/tutorial (task: ESP_KIOSK_UI_SEPARATION) --
+   see templates/kiosk/_firmware_tab.html and _tutorial_tab.html. Reachable
+   from the sidebar's ESP KIOSK nav group. #}
+
+<script>
+(function(){
+  async function runReleaseAction(buttonId,url,busyText,fallbackError,reloadDelay,statusId){
+    const button=document.getElementById(buttonId), status=document.getElementById(statusId||'releaseBuildStatus');
+    if(!button)return;
+    button.onclick=async()=>{
+      button.disabled=true; if(status) status.textContent=busyText;
+      try{
+        const response=await fetch(url,{method:'POST',credentials:'same-origin',headers:{'X-CSRF-Token':CSRF,'X-Requested-With':'XMLHttpRequest'}});
+        const ct=response.headers.get('content-type')||'';
+        const payload=ct.includes('application/json') ? await response.json() : {};
+        if(!response.ok) throw new Error(payload.error||payload.message||(fallbackError+' (HTTP '+response.status+')'));
+        if(status) status.textContent=payload.message||'Đã nhận yêu cầu.';
+        setTimeout(()=>location.reload(),reloadDelay);
+      }catch(err){
+        if(status) status.textContent=fallbackError+': '+(err&&err.message?err.message:String(err));
+        button.disabled=false;
+      }
+    };
+  }
+  function wireProdButton(buttonId,statusId,url,confirmMsg){
+    const button=document.getElementById(buttonId), status=document.getElementById(statusId);
+    if(!button)return;
+    button.onclick=async()=>{
+      if(!confirm(confirmMsg))return;
+      button.disabled=true; if(status) status.textContent='Đang gửi yêu cầu Promote Production…';
+      try{
+        const response=await fetch(url,{method:'POST',credentials:'same-origin',
+          headers:{'Content-Type':'application/json','X-CSRF-Token':CSRF,'X-Requested-With':'XMLHttpRequest'},
+          body:JSON.stringify({confirm:true})});
+        const payload=await response.json().catch(()=>({}));
+        if(status) status.textContent=(payload.error||payload.detail||('HTTP '+response.status))+(payload.detail?(': '+payload.detail):'');
+      }catch(err){
+        if(status) status.textContent='Promote Production request failed: '+(err&&err.message?err.message:String(err));
+      }finally{ button.disabled=false; }
+    };
+  }
+  // Secondary "More actions" -- stable ids, always wired the same regardless
+  // of which one is currently promoted to the primary Next Action slot.
+  runReleaseAction('releaseBuildButton','{{url_for("release_manager_build")}}','QUEUED — Đang build image…','Build failed',700);
+  runReleaseAction('releaseLocalButton','{{url_for("release_manager_deploy_local")}}','LOCAL_DEPLOYING — Đang deploy image release…','Local deploy failed',1200);
+  runReleaseAction('releaseTestButton','{{url_for("release_manager_promote_test")}}','UPLOADING — Đang promote sang Test…','Promote Test failed',1500);
+  runReleaseAction('releaseProdPreflightButton','{{url_for("release_manager_production_preflight")}}','Đang kiểm tra Production (read-only)…','Production preflight failed',700);
+  runReleaseAction('qaReleaseBuildButton','{{url_for("qa_release_manager_build")}}','QUEUED — Đang build QA image…','Build failed',700,'qaReleaseBuildStatus');
+  runReleaseAction('qaReleaseLocalButton','{{url_for("qa_release_manager_deploy_local")}}','Đang deploy QA image release…','Local deploy failed',1200,'qaReleaseBuildStatus');
+  runReleaseAction('qaReleaseTestButton','{{url_for("qa_release_manager_promote_test")}}','UPLOADING — Đang promote QA sang Test…','Promote Test failed',1500,'qaReleaseBuildStatus');
+  wireProdButton('releaseProdButton','releaseBuildStatus','{{url_for("release_manager_promote_production")}}','Xác nhận triển khai PRODUCTION? Hành động này cần con người phê duyệt và không thể tự động hoàn tác.');
+  wireProdButton('qaReleaseProdButton','qaReleaseBuildStatus','{{url_for("qa_release_manager_promote_production")}}','Xác nhận triển khai QA Center lên PRODUCTION? Hành động này cần con người phê duyệt và không thể tự động hoàn tác.');
+  // Primary "Next Action" buttons: same underlying endpoints, chosen by the
+  // server (Jinja next_action()) based on current pipeline state -- never
+  // re-derived in JS, so there is exactly one source of truth for "what's next".
+  const nextActionMap={
+    mes:{build:['{{url_for("release_manager_build")}}','QUEUED — Đang build image…','Build failed',700],
+         local:['{{url_for("release_manager_deploy_local")}}','LOCAL_DEPLOYING — Đang deploy image release…','Local deploy failed',1200],
+         test:['{{url_for("release_manager_promote_test")}}','UPLOADING — Đang promote sang Test…','Promote Test failed',1500]},
+    qa:{build:['{{url_for("qa_release_manager_build")}}','QUEUED — Đang build QA image…','Build failed',700],
+        local:['{{url_for("qa_release_manager_deploy_local")}}','Đang deploy QA image release…','Local deploy failed',1200],
+        test:['{{url_for("qa_release_manager_promote_test")}}','UPLOADING — Đang promote QA sang Test…','Promote Test failed',1500]}
+  };
+  ['mes','qa'].forEach(prefix=>{
+    const btn=document.querySelector(`[id^="${prefix}Next"]`);
+    if(!btn)return;
+    const stage=btn.dataset.stage;
+    const statusId=prefix==='qa'?'qaReleaseBuildStatus':'releaseBuildStatus';
+    if(stage==='production'){
+      const url=prefix==='qa'?'{{url_for("qa_release_manager_promote_production")}}':'{{url_for("release_manager_promote_production")}}';
+      const msg=prefix==='qa'?'Xác nhận triển khai QA Center lên PRODUCTION? Hành động này cần con người phê duyệt và không thể tự động hoàn tác.':'Xác nhận triển khai PRODUCTION? Hành động này cần con người phê duyệt và không thể tự động hoàn tác.';
+      wireProdButton(btn.id,statusId,url,msg);
+    }else{
+      const [url,busy,fallback,delay]=nextActionMap[prefix][stage];
+      runReleaseAction(btn.id,url,busy,fallback,delay,statusId);
+    }
+  });
+  (function(){
+    const button=document.getElementById('bumpVersionButton'), input=document.getElementById('bumpVersionTarget'), status=document.getElementById('releaseBuildStatus');
+    if(!button)return;
+    button.onclick=async()=>{
+      const target=(input&&input.value||'').trim();
+      if(target && !/^\d+\.\d+\.\d+\.\d+$/.test(target)){alert('Version phải dạng X.Y.Z.W, ví dụ 65.8.44.70');return}
+      if(!confirm('Nâng version MESFlow'+(target?(' lên '+target):' (tự +1)')+'? Chỉ sửa VERSION.txt/__init__.py/release.json/compose.yml, KHÔNG build.'))return;
+      button.disabled=true; if(status) status.textContent='Đang nâng version…';
+      try{
+        const response=await fetch('{{url_for("release_manager_bump_version")}}',{method:'POST',credentials:'same-origin',
+          headers:{'Content-Type':'application/json','X-CSRF-Token':CSRF,'X-Requested-With':'XMLHttpRequest'},
+          body:JSON.stringify({target_version:target})});
+        const payload=await response.json().catch(()=>({}));
+        if(!response.ok||!payload.ok) throw new Error(payload.error||('HTTP '+response.status));
+        if(status) status.textContent='Đã nâng version: '+payload.before+' → '+payload.after+'. Chưa build.';
+        setTimeout(()=>location.reload(),700);
+      }catch(err){
+        if(status) status.textContent='Nâng version failed: '+(err&&err.message?err.message:String(err));
+        button.disabled=false;
+      }
+    };
+  })();
+  // Elapsed-time ticker for an in-progress deployment banner (task section
+  // 13/41: update only the relevant status, never reload/reset the page for
+  // routine polling).
+  const elapsedEl=document.getElementById('mesJobElapsed');
+  if(elapsedEl){
+    const started=new Date(elapsedEl.dataset.started.replace(' ','T')+'Z').getTime();
+    setInterval(()=>{
+      if(!started||isNaN(started))return;
+      const sec=Math.max(0,Math.floor((Date.now()-started)/1000));
+      elapsedEl.textContent=`Elapsed: ${Math.floor(sec/60)}m ${sec%60}s`;
+    },1000);
+  }
+  // Do not reload the whole Release page every 3 seconds. A full reload
+  // recomputes release summaries, Docker/health state and previously also
+  // tailed local logs, which can make the browser and Agent sluggish. Poll a
+  // tiny state-only endpoint while a job is active, update the visible status
+  // text, and perform one final reload only when the job transitions to idle.
+  const releaseHadActiveJob={{ 'true' if (job and job.status in ['queued','uploading','validating','building','deploying','verifying']) or (qa_local_deploy_job and qa_local_deploy_job.status=='DEPLOYING') or (promote_test_job and promote_test_job.status in ['QUEUED','UPLOADING','DEPLOYING','VERIFYING']) or (qa_promote_test_job and qa_promote_test_job.status in ['QUEUED','UPLOADING','DEPLOYING','VERIFYING']) or (release_build_job and release_build_job.status in ['QUEUED','BUILDING']) or (qa_release_build_job and qa_release_build_job.status in ['QUEUED','BUILDING']) else 'false' }};
+  if(releaseHadActiveJob){
+    let wasActive=true, pollInFlight=false;
+    const pollReleaseState=async()=>{
+      if(document.hidden)return;
+      if(pollInFlight)return;  // never stack a second request behind a slow/stuck one
+      pollInFlight=true;
+      try{
+        const response=await fetch('{{url_for("release_manager_live_status")}}',{credentials:'same-origin',cache:'no-store'});
+        if(!response.ok)return;
+        const data=await response.json();
+        const mesBuild=data.jobs&&data.jobs.release_build_job||{};
+        const mesDeploy=data.jobs&&data.jobs.job||{};
+        const mesPromote=data.jobs&&data.jobs.promote_test_job||{};
+        const qaBuild=data.jobs&&data.jobs.qa_release_build_job||{};
+        const qaDeploy=data.jobs&&data.jobs.qa_local_deploy_job||{};
+        const qaPromote=data.jobs&&data.jobs.qa_promote_test_job||{};
+        const mesStatus=[mesBuild,mesDeploy,mesPromote].find(j=>j&&j.status);
+        const qaStatus=[qaBuild,qaDeploy,qaPromote].find(j=>j&&j.status);
+        if(mesStatus&&document.getElementById('releaseBuildStatus'))
+          document.getElementById('releaseBuildStatus').textContent=(mesStatus.status||'')+(mesStatus.message?' — '+mesStatus.message:'');
+        if(qaStatus&&document.getElementById('qaReleaseBuildStatus'))
+          document.getElementById('qaReleaseBuildStatus').textContent=(qaStatus.status||'')+(qaStatus.message?' — '+qaStatus.message:'');
+        if(wasActive&&!data.active){
+          wasActive=false;
+          window.setTimeout(()=>location.reload(),500);
+        }
+      }catch(_err){ /* status polling is best-effort; never freeze the page */ }
+      finally{ pollInFlight=false; }
+    };
+    window.setInterval(pollReleaseState,5000);
+    window.setTimeout(pollReleaseState,1200);
+    // Section 9 (task: DEPLOY_AGENT_REFRESH_PERFORMANCE_FIX): resume with an
+    // immediate refresh the moment the tab becomes visible again, rather
+    // than waiting out the rest of a stale 5s interval.
+    document.addEventListener('visibilitychange',()=>{ if(!document.hidden) pollReleaseState(); });
+  }
+  // Real bug found+fixed (reports/RELEASE_DEPLOY_UX_CLEANUP.md): a link
+  // anchoring into a <details> that's collapsed by default scrolls the
+  // browser to a closed, empty-looking section with no auto-expand, which
+  // reads as the page "jumping to nowhere". Any hash target that is itself
+  // a <details> now force-opens before scrolling into view (generic, not
+  // tied to any specific card -- the ESP Kiosk cards that used to rely on
+  // this moved to their own pages under /kiosk/*).
+  if(location.hash){
+    const target=document.querySelector(location.hash);
+    if(target && target.tagName==='DETAILS'){
+      target.open=true;
+      target.scrollIntoView({block:'start'});
+    }
+  }
+})();
+</script>

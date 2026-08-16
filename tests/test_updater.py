@@ -7,6 +7,7 @@ Imported directly from the workspace file via importlib -- this script is
 intentionally NOT part of the deploy-agent package (it must keep working
 even if agent.py's own dependencies are broken).
 """
+import fcntl
 import hashlib
 import importlib.util
 import json
@@ -195,6 +196,57 @@ class UpdateFlowTests(unittest.TestCase):
             if "compose" in cmd and "up" in cmd:
                 self.assertIn("mesflow-deploy-agent", cmd)
                 self.assertEqual(cmd[-1], "mesflow-deploy-agent", "must scope the up to exactly one service")
+
+    def test_downgrade_is_rejected_before_any_mutation(self):
+        # Installed tag is 8.8.8 (see setUp); uploading 1.0.0 is a downgrade.
+        zip_path, _ = build_artifact(self.tmp_path, version="1.0.0-docker-runtime")
+        self.expected_id = "sha256:" + "b" * 64
+        self.compose_up_rc = 0
+        with patch("subprocess.run", side_effect=self._patched_run([{}])):
+            with self.assertRaisesRegex(ValueError, "DOWNGRADE_REJECTED"):
+                self.updater.do_update(zip_path.read_bytes())
+        self.assertEqual(self.commands, [], "must not touch docker at all once rejected as a downgrade")
+        self.assertEqual(self.updater.compose_env()["AGENT_IMAGE"], "mesflow-deploy-agent:8.8.8")
+
+    def test_downgrade_allowed_with_explicit_override(self):
+        zip_path, manifest = build_artifact(self.tmp_path, version="1.0.0-docker-runtime")
+        self.expected_id = manifest["image_id"]
+        self.compose_up_rc = 0
+        health_ok = {"agent_version": "1.0.0-docker-runtime", "server_role": "PRODUCTION_TEST"}
+        with patch("subprocess.run", side_effect=self._patched_run([health_ok])), \
+             patch.object(self.updater, "HEALTH_POLL_TIMEOUT", 5):
+            result = self.updater.do_update(zip_path.read_bytes(), allow_downgrade=True)
+        self.assertEqual(result["status"], "SUCCESS")
+
+    def test_same_version_is_not_treated_as_a_downgrade(self):
+        zip_path, manifest = build_artifact(self.tmp_path, version="8.8.8-docker-runtime")
+        self.expected_id = manifest["image_id"]
+        self.compose_up_rc = 0
+        health_ok = {"agent_version": "8.8.8-docker-runtime", "server_role": "PRODUCTION_TEST"}
+        with patch("subprocess.run", side_effect=self._patched_run([health_ok])), \
+             patch.object(self.updater, "HEALTH_POLL_TIMEOUT", 5):
+            result = self.updater.do_update(zip_path.read_bytes())
+        self.assertEqual(result["status"], "SUCCESS")
+
+    def test_concurrent_update_is_rejected(self):
+        zip_path, manifest = build_artifact(self.tmp_path, version="9.9.9-docker-runtime")
+        lock_path = self.updater.STATE_DIR / "update.lock"
+        held = open(lock_path, "w")
+        try:
+            fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with self.assertRaisesRegex(ValueError, "AGENT_UPDATE_ALREADY_RUNNING"):
+                self.updater.do_update(zip_path.read_bytes())
+        finally:
+            fcntl.flock(held, fcntl.LOCK_UN)
+            held.close()
+        # Lock released afterward -- a follow-up call succeeds normally.
+        self.expected_id = manifest["image_id"]
+        self.compose_up_rc = 0
+        health_ok = {"agent_version": "9.9.9-docker-runtime", "server_role": "PRODUCTION_TEST"}
+        with patch("subprocess.run", side_effect=self._patched_run([health_ok])), \
+             patch.object(self.updater, "HEALTH_POLL_TIMEOUT", 5):
+            result = self.updater.do_update(zip_path.read_bytes())
+        self.assertEqual(result["status"], "SUCCESS")
 
 
 if __name__ == "__main__":

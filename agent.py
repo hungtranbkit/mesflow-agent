@@ -1,6 +1,6 @@
 from __future__ import annotations
 import hashlib, hmac, http.cookiejar, io, json, os, secrets, shutil, socket, ssl, subprocess, sys, threading, time, urllib.request, urllib.error, uuid, zipfile, platform, re, tempfile
-from urllib.parse import quote, urlencode
+from urllib.parse import quote, urlencode, urlparse
 import psutil
 import paramiko
 from datetime import datetime
@@ -12,8 +12,21 @@ from werkzeug.middleware.proxy_fix import ProxyFix
 from werkzeug.security import check_password_hash, generate_password_hash
 from werkzeug.utils import secure_filename
 import ota_control as ota
+from dataclasses import asdict
+from release_gate import CheckResult,ReleaseEvidenceStore,ReleaseGatePolicy,ReleaseIdentity,TestRun
+from predictive import DisabledAIProvider,HTTPJSONAIProvider,IncidentAIService,MetricStore,deterministic_suggestions,linear_forecast,recurring_failures,robust_anomaly
+from agent_backend.system_health import collect_summary as collect_system_health_summary
+from agent_backend.system_health import format_bytes as _bytes
+from agent_backend.system_health import run_capture as _run_capture
+from agent_backend.notifications import EmailChannel,NotificationDispatcher,TelegramChannel,WebChannel,environment_label
+from deployment_platform import DeploymentComponent, DeploymentEnvironment, DeploymentEvidenceStore, RetentionPolicy, RetentionService
+import agent_backend.db_backup as db_backup  # P4 Backup/DB/Storage Center -- referenced as db_backup.X to avoid
+                                              # colliding with deployment_platform.RetentionService (release
+                                              # retention, a different concern -- see db_backup.py module docstring).
+import agent_backend.fleet as fleet  # P5 Multi-server: Server Registry / Fleet Health -- see fleet.py module docstring.
+import agent_backend.incident_recovery as recovery  # Server Incident Recovery Console -- see incident_recovery.py module docstring.
 
-AGENT_VERSION="2.19.0-docker-runtime"
+AGENT_VERSION="2.24.3-docker-runtime"
 # Bumped when the wire contract changes in a way a caller might need to
 # branch on (new required fields, new endpoints a promotion depends on).
 # Independent of AGENT_VERSION: two different AGENT_VERSION builds can
@@ -23,7 +36,7 @@ API_PROTOCOL_VERSION=2
 # Capabilities this Agent build actually implements. A promotion (or the
 # DEV Target Agents table) checks REQUIRED_CAPABILITIES against this list
 # -- never AGENT_VERSION strings -- to decide COMPATIBLE/INCOMPATIBLE.
-AGENT_CAPABILITIES=["image_release_receive","digest_verify","remote_deploy","deploy_status","health_status","agent_self_update"]
+AGENT_CAPABILITIES=["image_release_receive","digest_verify","remote_deploy","deploy_status","health_status","agent_self_update","qa_image_release_receive","qa_deploy","release_gate_evidence","operations_incidents","predictive_health","incident_ai_advisory","deployment_platform","build_once_local"]
 AGENT_HOME=Path(os.environ.get("WORKSHOP_AGENT_HOME","/opt/mesflow-agent"))
 TARGET_HOME=Path(os.environ.get("WORKSHOP_TARGET_HOME","/opt/mesflow"))
 QA_HOME=Path(os.environ.get("MESFLOW_QA_HOME","/opt/mesflow-qa-center"))
@@ -45,7 +58,14 @@ IMAGE_RELEASE_TYPE="mesflow-image-release"
 CONFIG_DIR=AGENT_HOME/"config"; DATA_DIR=AGENT_HOME/"data"; UPLOAD_DIR=DATA_DIR/"uploads"; RELEASES_DIR=DATA_DIR/"releases"; LOG_DIR=DATA_DIR/"logs"
 STATE_FILE=DATA_DIR/"state.json"; CONFIG_FILE=CONFIG_DIR/"agent.json"; AGENT_LOG=LOG_DIR/"agent.log"
 DEPLOY_TX_FILE=DATA_DIR/"deploy_transaction.json"; DEPLOY_LOCK_FILE=DATA_DIR/"deploy.lock"
-QA_RELEASES_DIR=DATA_DIR/"qa_releases"; QA_UPLOAD_DIR=DATA_DIR/"qa_uploads"; QA_LOG=LOG_DIR/"qa_process.log"
+QA_UPLOAD_DIR=DATA_DIR/"qa_uploads"; QA_LOG=LOG_DIR/"qa_process.log"
+# QA_UPLOAD_DIR is scratch extraction space shared by the current
+# /qa-release/upload receiver and _stage_qa_release_from_workspace_artifact
+# (DEV's own Deploy Local). The legacy full-source QA deploy path that used
+# to also share this directory (plus its own QA_RELEASES_DIR final-storage
+# dir, /qa/upload, /qa/deploy/<version>, /qa/delete/<version>) was removed --
+# see reports/RELEASE_DEPLOY_UX_CLEANUP.md.
+QA_IMAGE_RELEASES_DIR=DATA_DIR/"qa_image_releases"
 ESP_TUTORIAL_UPLOAD_DIR=DATA_DIR/"esp_tutorial_uploads"
 ESP_TUTORIAL_HOME=Path(os.environ.get("MESFLOW_ESP_TUTORIAL_HOME",str(TARGET_HOME/"runtime/tutorials/esp-kiosk")))
 ESP_TUTORIAL_MAX_MB=max(32,int(os.environ.get("MESFLOW_ESP_TUTORIAL_MAX_MB","512")))
@@ -85,8 +105,47 @@ ESP_BUILDER_LOCK=threading.Lock()
 MESFLOW_SOURCE_DIR=Path(os.environ.get("MESFLOW_SOURCE_DIR",str(WORKSPACE_ROOT/"mesflow"))).expanduser()
 MESFLOW_BUILD_ENABLED=os.environ.get("MESFLOW_BUILD_ENABLED","1").strip().lower() in {"1","true","yes","on"}
 MESFLOW_BUILD_LOCK=threading.Lock()
+# task: AGENT_PACKAGE_BUILD_PUSH -- Build Agent Package (scripts/build-agent-release.sh).
+# Same convention as MESFLOW_SOURCE_DIR/ESP_KIOSK_SOURCE_DIR: Path(__file__)
+# resolves to /app/agent.py (the image's own baked copy, which does NOT
+# include scripts/ -- see docker/Dockerfile's COPY list) inside a running
+# container, not the workspace-mounted source the build script and its own
+# `cd "$(dirname ...)/.."` need. An explicit env var (set in
+# compose.dev.override.yml alongside MESFLOW_SOURCE_DIR) points this at the
+# real bind-mounted workspace path.
+DEPLOY_AGENT_SOURCE_DIR=Path(os.environ.get("DEPLOY_AGENT_SOURCE_DIR",str(WORKSPACE_ROOT/"deploy-agent"))).expanduser()
+AGENT_PACKAGE_BUILD_LOCK=threading.Lock()
+# Release retention: how many built application releases (artifacts/releases/
+# <version>) to keep as full deployable artifacts (ZIP + local staging copy +
+# Docker image). "3" means current + previous + previous-2 -- enough to
+# support an immediate rollback plus one extra safety margin. Never affects
+# database backups (DATA_DIR/mes_backups), which are retained separately and
+# untouched by _cleanup_old_releases(). See docs/operations for the policy.
+MESFLOW_RELEASE_RETENTION=max(1,int(os.environ.get("MESFLOW_RELEASE_RETENTION","3") or "3"))
+
+# --- QA Center: Build Once / Promote Same Artifact, applied to the second
+# application this Agent can build/deploy/promote. Deliberately independent
+# globals/state/locks from every MESFlow one above -- QA and MESFlow
+# promotion state must never cross-contaminate (see AGENTS.md, "Release
+# Manager Safety"). Same DEV-only build gate (MESFLOW_BUILD_ENABLED) since
+# both applications build on the same DEV host.
+QA_CENTER_SOURCE_DIR=Path(os.environ.get("QA_CENTER_SOURCE_DIR",str(WORKSPACE_ROOT/"qa-center"))).expanduser()
+QA_BUILD_LOCK=threading.Lock()
+QA_RELEASE_RETENTION=max(1,int(os.environ.get("QA_RELEASE_RETENTION","3") or "3"))
 SERVER_ROLE=os.environ.get("SERVER_ROLE","DEV").strip().upper()
-for d in (CONFIG_DIR,UPLOAD_DIR,RELEASES_DIR,LOG_DIR,QA_RELEASES_DIR,QA_UPLOAD_DIR,ESP_TUTORIAL_UPLOAD_DIR): d.mkdir(parents=True,exist_ok=True)
+
+def _source_build_allowed() -> bool:
+    """Return whether this Agent is the explicitly configured LOCAL builder."""
+    return SERVER_ROLE == "DEV" and MESFLOW_BUILD_ENABLED
+
+def _require_local_source_build(component: str) -> None:
+    """Prevent legacy source packages from becoming a target-side rebuild path."""
+    if not _source_build_allowed():
+        raise RuntimeError(
+            f"TARGET_SOURCE_BUILD_FORBIDDEN: {component} source builds are allowed only "
+            "on the DEV/LOCAL Agent; upload an immutable image release instead"
+        )
+for d in (CONFIG_DIR,UPLOAD_DIR,RELEASES_DIR,LOG_DIR,QA_UPLOAD_DIR,QA_IMAGE_RELEASES_DIR,ESP_TUTORIAL_UPLOAD_DIR): d.mkdir(parents=True,exist_ok=True)
 app=Flask(__name__); app.config.update(
     MAX_CONTENT_LENGTH=MAX_UPLOAD_MB*1024*1024,
     APPLICATION_ROOT=URL_PREFIX or "/",
@@ -111,6 +170,51 @@ app.wsgi_app=DirectPrefixMiddleware(
     ProxyFix(app.wsgi_app,x_for=1,x_proto=1,x_host=1,x_port=1,x_prefix=1),
     URL_PREFIX,
 )
+
+# ---------------------------------------------------------------------
+# Frontend cache busting (reports/DEPLOY_AGENT_FRONTEND_CACHE_BUST.md).
+# A rebuilt Agent must never require the operator to hard-refresh/
+# Incognito to see new JS/CSS -- every template references static assets
+# through static_url() below, which appends a query string that changes
+# exactly when the underlying static file bytes change (a deterministic
+# content hash, not mtime -- an mtime-only signal changes on every
+# rebuild even for byte-identical content, defeating the whole point of
+# letting versioned assets be cached aggressively).
+# ---------------------------------------------------------------------
+def _compute_frontend_build_id(static_dir=None) -> str:
+    static_dir=Path(static_dir if static_dir is not None else app.static_folder)
+    h=hashlib.sha256()
+    try:
+        for path in sorted(static_dir.rglob("*")):
+            if path.is_file():
+                h.update(path.relative_to(static_dir).as_posix().encode("utf-8"))
+                h.update(path.read_bytes())
+    except OSError:
+        pass
+    return h.hexdigest()[:10]
+
+FRONTEND_BUILD_ID=f"{AGENT_VERSION}-{_compute_frontend_build_id()}"
+
+def static_url(filename:str)->str:
+    """Cache-busted static asset URL. An explicit helper -- deliberately
+    NOT a global override of url_for() -- so this only ever touches
+    static asset URLs; every other url_for() call in this codebase
+    (redirects, form actions, API endpoints) is completely unaffected."""
+    return url_for('static',filename=filename)+'?v='+FRONTEND_BUILD_ID
+app.jinja_env.globals['static_url']=static_url
+
+@app.after_request
+def _apply_cache_policy(response):
+    """Versioned static assets: safe to cache aggressively/immutably --
+    their URL only ever repeats for byte-identical content. Everything
+    else (HTML pages, JSON APIs): must always revalidate, so a freshly
+    rebuilt Agent's new HTML -- which references the new asset URL --
+    is never served stale from a shared/browser cache."""
+    if request.path.startswith('/static/'):
+        response.headers['Cache-Control']='public, max-age=31536000, immutable'
+    else:
+        response.headers['Cache-Control']='no-cache, must-revalidate'
+    return response
 _state_lock=threading.Lock(); _job_lock=threading.Lock(); _qa_job_lock=threading.Lock(); _tutorial_job_lock=threading.Lock(); _esp_tutorial_job_lock=threading.Lock()
 MES_JOB_ACTIVE_STATES={"queued","uploading","validating","building","deploying","verifying"}
 def now_text(): return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -181,6 +285,13 @@ def start_esp_builder():
 
 PROMOTION_STATE_FILE=CONFIG_DIR/"promotion-state.json"
 _promotion_lock=threading.Lock()
+# Independent QA Center promotion state -- separate file, separate lock,
+# separate state.json keys throughout (qa_release_build_job,
+# qa_local_deploy_job, qa_promote_test_job, ...). MESFlow's promotion state
+# is never read or written by any QA_* function and vice versa.
+QA_PROMOTION_STATE_FILE=CONFIG_DIR/"promotion-state.qa-center.json"
+_qa_promotion_lock=threading.Lock()
+_qa_promote_test_lock=threading.Lock()
 
 def _releases_root():
     return MESFLOW_SOURCE_DIR.parent/"artifacts"/"releases"
@@ -274,6 +385,87 @@ def _update_promotion_state(version,artifact,**fields):
     _sync_release_promotion_json(version,state)
     return state
 
+def _v70_release(version):
+    try:return int(str(version).split('.')[0])>=70
+    except (ValueError,IndexError):return False
+
+def _gate_identity(version):
+    artifact=_artifact_for_release(version)
+    ident=ReleaseIdentity(version=str(artifact.get("version") or version),source_commit=str(artifact.get("source_commit") or ""),
+        artifact=str(artifact.get("image") or ""),artifact_digest=str(artifact.get("digest") or artifact.get("image_digest") or ""),
+        package_sha256=str(artifact.get("package_sha256") or ""),schema_revision=str(artifact.get("schema_revision") or ""))
+    ident.validate();return ident
+
+def _run_from_payload(payload):
+    checks=tuple(CheckResult(str(x.get("name") or "unnamed"),str(x.get("status") or "ERROR").replace("PASSED","PASS"),
+        bool(x.get("required",True)),str(x.get("message") or ""),dict(x.get("metadata") or {})) for x in payload.get("checks",[]))
+    status=str(payload.get("status") or "ERROR").replace("PASSED","PASS").replace("FAILED","FAIL")
+    return TestRun(str(payload.get("run_id") or ""),str(payload.get("environment") or ""),str(payload.get("profile") or ""),status,
+        str(payload.get("artifact_digest") or ""),str(payload.get("started_at") or ""),str(payload.get("finished_at") or payload.get("ended_at") or ""),checks,
+        int(payload.get("total_tests") or payload.get("total") or 0),int(payload.get("passed_tests") or payload.get("passed") or 0),
+        int(payload.get("failed_tests") or payload.get("failed") or 0),int(payload.get("skipped_tests") or 0),str(payload.get("target_url") or ""),
+        str(payload.get("report_path") or payload.get("report_file") or ""),str(payload.get("log_path") or payload.get("log_file") or ""))
+
+def _gate_evidence(version,write=True):
+    ident=_gate_identity(version);store=ReleaseEvidenceStore(_release_dir_for(version));raw=store.list_runs()
+    runs=[_run_from_payload(x) for x in raw]
+    local=next((x for x in reversed(runs) if x.environment=="LOCAL" and x.artifact_digest==ident.artifact_digest),None)
+    test=next((x for x in reversed(runs) if x.environment=="TEST" and x.artifact_digest==ident.artifact_digest),None)
+    promotion=load_json(PROMOTION_STATE_FILE,{}) if _load_promotion_state().get("version")==version else {}
+    deployment={"status":"PASS" if promotion.get("test_deployment_verified") else str(promotion.get("test_status") or "NOT_DEPLOYED"),
+                "deployed_digest":str(promotion.get("test_deployed_digest") or ""),"target":str(promotion.get("test_target") or "")}
+    issues=load_json(_release_dir_for(version)/"KNOWN_ISSUES.json",[]);issues=issues if isinstance(issues,list) else []
+    evidence_complete=bool(raw and local and test and promotion.get("test_deployment_verified"))
+    decision=ReleaseGatePolicy.evaluate(ident,build_status="PASS",local_run=local,test_deployment=deployment,test_run=test,
+        known_issues=issues,evidence_complete=evidence_complete)
+    payload={"release":{"version":ident.version,"source_commit":ident.source_commit,"artifact":ident.artifact,
+              "artifact_digest":ident.artifact_digest,"package_sha256":ident.package_sha256,"schema_revision":ident.schema_revision},
+             "build":{"status":"PASS"},"local":{"status":local.status if local else "NOT_RUN","run_id":local.run_id if local else None},
+             "test_deployment":deployment,"test":{"status":test.status if test else "NOT_RUN","run_id":test.run_id if test else None},
+             "known_issues":issues,"known_blocking_issues":sum(bool(x.get("blocking") and not x.get("resolved_at")) for x in issues),
+             "evidence_complete":evidence_complete,"decision":decision,"runs":raw}
+    if write:payload["evidence_files"]=store.write_summary(payload)
+    return payload
+
+def _record_gate_run(version,payload):
+    ident=_gate_identity(version);run=_run_from_payload(payload)
+    if not run.run_id or run.environment not in {"LOCAL","TEST"}:raise ValueError("INVALID_TEST_RUN")
+    if run.artifact_digest!=ident.artifact_digest:raise ValueError("ARTIFACT_MISMATCH")
+    store=ReleaseEvidenceStore(_release_dir_for(version));store.append_run(run)
+    evidence=_gate_evidence(version)
+    fields={"release_gate":evidence["decision"]["decision"],"evidence_complete":evidence["evidence_complete"]}
+    if run.environment=="LOCAL":fields.update(local_pass=evidence["local"]["status"]=="PASS",local_status=evidence["local"]["status"])
+    if run.environment=="TEST":fields.update(test_pass=evidence["decision"]["decision"]=="READY_FOR_PRODUCTION_APPROVAL",test_status=evidence["test"]["status"])
+    _update_promotion_state(version,_artifact_for_release(version),**fields)
+    return evidence
+
+def _invoke_qa_profile(version,environment,timeout=600):
+    ident=_gate_identity(version);profile="release-local" if environment=="LOCAL" else "release-test"
+    body=json.dumps({"profile":profile,"release_version":version,"artifact_digest":ident.artifact_digest}).encode()
+    request_start=urllib.request.Request(QA_URL+"/api/release-runs",data=body,method="POST",headers={"Content-Type":"application/json"})
+    try:
+        with urllib.request.urlopen(request_start,timeout=20) as response:started=json.loads(response.read().decode())
+    except Exception as exc:raise RuntimeError(f"QA_RUNNER_UNAVAILABLE:{type(exc).__name__}:{exc}") from exc
+    run_id=str((started.get("run") or {}).get("run_id") or "")
+    if not run_id:raise RuntimeError("QA_RUNNER_INVALID_RESPONSE")
+    deadline=time.time()+timeout;last={}
+    while time.time()<deadline:
+        time.sleep(2)
+        with urllib.request.urlopen(QA_URL+f"/api/runs/{quote(run_id)}",timeout=20) as response:last=json.loads(response.read().decode()).get("run") or {}
+        if last.get("status") not in {"RUNNING","QUEUED"}:break
+    else:raise RuntimeError("QA_RUN_TIMEOUT")
+    payload={**last,"run_id":run_id,"environment":environment,"profile":profile,"artifact_digest":ident.artifact_digest,
+             "finished_at":last.get("ended_at"),"total_tests":last.get("total",0),"passed_tests":last.get("passed",0),"failed_tests":last.get("failed",0)}
+    return _record_gate_run(version,payload)
+
+def _run_local_gate(version):
+    try:
+        evidence=_invoke_qa_profile(version,"LOCAL")
+        update_state(lambda s:s.update(release_local_gate_job={"version":version,"status":evidence["local"]["status"],"finished_at":now_text(),"decision":evidence["decision"]}))
+    except Exception as exc:
+        artifact=_artifact_for_release(version);_update_promotion_state(version,artifact,local_status="BLOCKED",local_pass=False,local_message=str(exc))
+        update_state(lambda s:s.update(release_local_gate_job={"version":version,"status":"BLOCKED","finished_at":now_text(),"message":str(exc)}))
+
 def _actual_running_mes_image_id():
     ds=_docker_mes_state()
     cid=(ds.get("container_ids") or {}).get("mesflow","")
@@ -333,16 +525,27 @@ def _record_local_deploy_result(version,success,message=""):
     actual_schema=_actual_schema_revision()
     schema_ok=bool(expected_schema) and expected_schema not in ("unknown","") and actual_schema==expected_schema
     smoke_ok=_http_smoke_ok()
-    local_pass=image_ok and schema_ok and smoke_ok
+    infrastructure_ok=image_ok and schema_ok and smoke_ok
+    # V70 separates successful deployment/preflight from machine-produced QA.
+    # The latter arrives as an immutable release-local TestRun.
+    local_pass=infrastructure_ok and not _v70_release(version)
     reasons=[]
     if not image_ok: reasons.append(f"running image id {actual_id or 'unknown'} != frozen id {expected_id or 'unknown'}")
     if not schema_ok: reasons.append(f"schema expected={expected_schema or 'unknown'} actual={actual_schema or 'unknown'}")
     if not smoke_ok: reasons.append("browser/HTTP smoke check failed")
     _update_promotion_state(version,artifact,
-        local_status="PASS" if local_pass else "FAILED",local_pass=local_pass,
-        local_message="LOCAL_PASS" if local_pass else "; ".join(reasons),
+        local_status=("PASS" if local_pass else "AWAITING_QA" if infrastructure_ok else "FAILED"),local_pass=local_pass,
+        local_message=("LOCAL_PASS" if local_pass else "Infrastructure verified; release-local QA evidence required" if infrastructure_ok else "; ".join(reasons)),
         actual_schema_revision=actual_schema,image_id_verified=image_ok,smoke_ok=smoke_ok,
         zip_sha_unchanged=True,image_digest_unchanged=image_ok)
+    if infrastructure_ok and _v70_release(version):
+        update_state(lambda s:s.update(release_local_gate_job={"version":version,"status":"QUEUED","started_at":now_text()}))
+        threading.Thread(target=_run_local_gate,args=(version,),daemon=True).start()
+    if local_pass:
+        # Run cleanup only after a successful, verified deployment -- never
+        # on a failed or unverified one.
+        try: _cleanup_old_releases("LOCAL_PASS")
+        except Exception as ex: append_log(f"Release cleanup after LOCAL_PASS failed: {type(ex).__name__}: {ex}")
 
 def _release_summary():
     version_file=MESFLOW_SOURCE_DIR/"VERSION.txt"
@@ -380,6 +583,10 @@ def _release_summary():
     except (ValueError,TypeError): pass
     preflight_fresh=preflight_age is not None and 0<=preflight_age<=PREFLIGHT_MAX_AGE_SECONDS
     target_healthy=preflight_fresh and bool(preflight.get("healthy"))
+    evidence_gate=None
+    if _v70_release(str(build.get("version") or "")):
+        try:evidence_gate=_gate_evidence(str(build["version"]),write=False);test_pass=bool(evidence_gate["decision"]["ready"])
+        except Exception:evidence_gate=None;test_pass=False
     gate_ok=local_pass and test_pass and zip_ok and digest_ok and schema_pass and not contamination.get("contaminated") and target_healthy
     # Exact blocking reason, so the UI never just shows a disabled button.
     build_block=None if MESFLOW_BUILD_ENABLED else "Build is disabled on this Agent (MESFLOW_BUILD_ENABLED=0 — this host is not DEV)."
@@ -428,6 +635,7 @@ def _release_summary():
             "blocked":{"build":build_block,"local":local_block,"test":test_block,"production":production_block},
             "production_preflight":preflight,"production_preflight_fresh":preflight_fresh,"production_target_healthy":target_healthy,
             "production_target_configured":bool((os.environ.get("MESFLOW_PRODUCTION_AGENT_URL") or "").strip()),
+            "release_gate_evidence":evidence_gate,
             "promotion":{**promotion,"expected_schema_revision":expected,"actual_schema_revision":actual,"schema_pass":schema_pass,
                         "production_gate":gate_ok,"production_promote_enabled":production_promote_enabled,
                         "history":["Built" if build.get("version") else "Not built",
@@ -469,6 +677,35 @@ def start_release_build():
     except Exception:
         MESFLOW_BUILD_LOCK.release();raise
 
+def _run_version_bump(target_version=""):
+    """Run scripts/bump-version.sh: a fast, source-only edit (VERSION.txt,
+    __init__.py, release.json, compose.yml) -- never builds/tags/pushes a
+    Docker image. DEV-only (build-enabled), same as Build Release, since
+    Production Test/Production never carry or need MESFlow source."""
+    if not MESFLOW_BUILD_ENABLED: raise ValueError("BUILD_DISABLED")
+    if not MESFLOW_SOURCE_DIR.is_dir(): raise ValueError("SOURCE_NOT_FOUND")
+    script=MESFLOW_SOURCE_DIR/"scripts"/"bump-version.sh"
+    if not script.is_file(): raise ValueError("BUMP_SCRIPT_NOT_FOUND")
+    before=(MESFLOW_SOURCE_DIR/"VERSION.txt").read_text(encoding="utf-8-sig").strip() if (MESFLOW_SOURCE_DIR/"VERSION.txt").is_file() else ""
+    args=[str(script)]
+    target_version=str(target_version or "").strip()
+    if target_version:
+        if not re.fullmatch(r"\d+\.\d+\.\d+\.\d+",target_version): raise ValueError("VERSION_INVALID")
+        args.append(target_version)
+    log_path=LOG_DIR/"version-bump.log"
+    with log_path.open("w",encoding="utf-8") as log:
+        result=subprocess.run(args,cwd=str(MESFLOW_SOURCE_DIR),stdout=log,stderr=subprocess.STDOUT,text=True,timeout=30)
+    log_tail=tail(log_path,60)
+    if result.returncode:
+        lines=[ln for ln in log_tail.strip().splitlines() if ln.strip()]
+        raise RuntimeError(lines[-1] if lines else "VERSION_BUMP_FAILED")
+    after=(MESFLOW_SOURCE_DIR/"VERSION.txt").read_text(encoding="utf-8-sig").strip() if (MESFLOW_SOURCE_DIR/"VERSION.txt").is_file() else ""
+    entry={"at":now_text(),"before":before,"after":after,"log_tail":log_tail}
+    def f(s): s["version_bump"]=entry
+    update_state(f)
+    append_log(f"Version bump: {before} -> {after}")
+    return entry
+
 def _promotion_state(version):
     p=MESFLOW_SOURCE_DIR.parent/"artifacts"/"releases"/version/"PROMOTION.json"
     return load_json(p,{}) if p.is_file() else {}
@@ -481,6 +718,258 @@ def _artifact_for_release(version):
             "image_id":meta.get("image_id",""),"schema_revision":meta.get("schema_revision",""),
             "package":str(package),"package_sha256":sha(package) if package.is_file() else "",
             "source_commit":meta.get("source_commit",""),"built_at":meta.get("built_at","")}
+
+# --- Unified deployment history (Release/Deploy UX cleanup) ---------------
+# One cross-component record store, additive alongside the existing
+# per-component job/history state (job/history for MESFlow LOCAL,
+# qa_local_deploy_job/qa_target_deploy_job for QA) which stays exactly as it
+# was -- nothing here replaces or migrates old state. This is the backing
+# store for the Deployment History tab: it is the only place a TEST-stage
+# promotion or an Agent Update ever gets a persisted history entry (those
+# previously only ever kept a single "latest job" slot, no history array).
+DEPLOYMENT_HISTORY_TERMINAL={"success","failed","SUCCESS","FAILED","rolled_back","ROLLED_BACK","interrupted"}
+
+def _record_deployment_history(component,environment,*,version="",from_version="",status="",message="",
+                                started_at="",finished_at="",deployment_id="",log_file="",rolled_back_to=None,steps=None):
+    if status not in DEPLOYMENT_HISTORY_TERMINAL:
+        return None
+    entry={"id":uuid.uuid4().hex,"component":component,"environment":environment,
+           "version":version,"from_version":from_version,"status":status,"message":message,
+           "started_at":started_at,"finished_at":finished_at,"deployment_id":deployment_id,
+           "log_file":log_file,"rolled_back_to":rolled_back_to,"steps":steps or {},
+           "recorded_at":now_text()}
+    def mutate(s):
+        lst=s.setdefault("deployment_history",[])
+        # A worker can call its own *_update() more than once with the same
+        # terminal status (retries/duplicate finalization) -- de-dupe on
+        # deployment_id when one is present so refreshing doesn't double-count.
+        if deployment_id and any(x.get("deployment_id")==deployment_id and x.get("component")==component for x in lst):
+            return
+        lst.insert(0,entry)
+        s["deployment_history"]=lst[:500]
+    update_state(mutate)
+    return entry
+
+def _deployment_history_result(status,rolled_back_to):
+    """Normalize the many raw status spellings into the 4 outcomes the UI
+    must visually distinguish (task section 17): a plain FAILED must never
+    look the same as a FAILED that WAS rolled back or a FAILED whose
+    rollback itself failed."""
+    s=str(status or "").lower()
+    if s in ("success",): return "SUCCESS"
+    if s in ("failed","interrupted"):
+        if rolled_back_to: return "ROLLED_BACK"
+        return "FAILED"
+    return str(status or "").upper() or "UNKNOWN"
+
+def _deployment_history_query(component=None,environment=None,result=None,q=None,page=1,page_size=20):
+    items=list(load_state().get("deployment_history") or [])
+    def matches(e):
+        if component and e.get("component")!=component: return False
+        if environment and e.get("environment")!=environment: return False
+        if result and _deployment_history_result(e.get("status"),e.get("rolled_back_to"))!=result: return False
+        if q:
+            hay=f"{e.get('version','')} {e.get('from_version','')} {e.get('message','')}".lower()
+            if q.lower() not in hay: return False
+        return True
+    filtered=[e for e in items if matches(e)]
+    total=len(filtered)
+    page=max(1,int(page or 1)); page_size=max(1,min(100,int(page_size or 20)))
+    start=(page-1)*page_size
+    page_items=filtered[start:start+page_size]
+    out=[]
+    for e in page_items:
+        d=dict(e); d["result"]=_deployment_history_result(e.get("status"),e.get("rolled_back_to"))
+        try:
+            if e.get("started_at") and e.get("finished_at"):
+                from datetime import datetime as _dt
+                fmt="%Y-%m-%d %H:%M:%S"
+                dur=(_dt.strptime(e["finished_at"][:19],fmt)-_dt.strptime(e["started_at"][:19],fmt)).total_seconds()
+                d["duration_seconds"]=max(0,int(dur))
+        except Exception:
+            pass
+        out.append(d)
+    return {"items":out,"total":total,"page":page,"page_size":page_size}
+
+# --- Release retention / cleanup ------------------------------------------
+# Two independent, config-only policies (never touches database backups):
+# keep the newest MESFLOW_RELEASE_RETENTION built application releases as
+# full deployable artifacts (release ZIP + local staging copy + Docker
+# image); everything older is removed only once it is provably safe. This
+# never runs unattended -- it is only ever invoked right after a verified
+# successful local deploy (LOCAL_PASS) or a verified successful Production
+# Test promotion (TEST_PASS). See reports/SESSION_EXCEPTION_SIMPLIFICATION.md
+# ("RELEASE RETENTION") and docs/operations for the full policy writeup.
+
+def _dir_size(path):
+    total=0
+    try:
+        for p in Path(path).rglob('*'):
+            if p.is_file():
+                try: total+=p.stat().st_size
+                except OSError: pass
+    except OSError: pass
+    return total
+
+def _release_cleanup_candidates():
+    """All built application release versions under artifacts/releases,
+    newest-build-first (by release.json's mtime -- the moment the build was
+    frozen -- falling back to the directory's own mtime for a partial/
+    corrupt entry so it never sorts ahead of real releases)."""
+    root=_releases_root()
+    if not root.is_dir(): return []
+    out=[]
+    for d in root.iterdir():
+        if not d.is_dir() or d.name.startswith('.'): continue
+        marker=d/"release.json"
+        try: mtime=marker.stat().st_mtime if marker.is_file() else d.stat().st_mtime
+        except OSError: continue
+        out.append((mtime,d.name))
+    out.sort(reverse=True)
+    return [name for _,name in out]
+
+def _release_cleanup_blockers(version,keep_versions):
+    """Every reason `version` must NOT be cleaned up right now; [] means safe.
+    Named 1:1 against the policy: currently deployed / active rollback
+    target / part of an active deployment / being promoted / referenced by
+    an active job. Never a version-count heuristic alone."""
+    if version in keep_versions:
+        return ["WITHIN_RETENTION_WINDOW"]
+    reasons=[]
+    target=canonical_version(version)
+    try:
+        if target and canonical_version(current_file_version())==target:
+            reasons.append("CURRENTLY_DEPLOYED")
+    except Exception: pass
+    state=load_state()
+    job=state.get("job") or {}
+    if job.get("status") in MES_JOB_ACTIVE_STATES:
+        if canonical_version(str(job.get("version") or ""))==target:
+            reasons.append("ACTIVE_DEPLOYMENT_JOB")
+        if canonical_version(str(job.get("from_version") or ""))==target:
+            reasons.append("ACTIVE_ROLLBACK_TARGET")  # what an in-flight deploy would roll back to on failure
+    history=state.get("history") or []
+    if history and canonical_version(str(history[0].get("from_version") or ""))==target:
+        reasons.append("ROLLBACK_TARGET_OF_LAST_DEPLOY")  # what a manual rollback of the last deploy would restore
+    promote_job=state.get("promote_test_job") or {}
+    if promote_job.get("status") in ("QUEUED","UPLOADING","DEPLOYING","VERIFYING") and canonical_version(str(promote_job.get("version") or ""))==target:
+        reasons.append("BEING_PROMOTED")
+    agent_job=state.get("agent_update_job") or {}
+    if agent_job.get("status") in ("QUEUED","PUSHING","UPDATING") and canonical_version(str(agent_job.get("mes_version") or ""))==target:
+        reasons.append("REFERENCED_BY_ACTIVE_AGENT_UPDATE_JOB")
+    promotion=load_json(PROMOTION_STATE_FILE,{})
+    if canonical_version(str(promotion.get("version") or ""))==target and not (promotion.get("local_pass") and promotion.get("test_pass")):
+        reasons.append("PROMOTION_IN_PROGRESS")  # not yet fully proven through Build Once/Promote Same Artifact
+    return reasons
+
+def _cleanup_stray_staging(now,removed,bytes_freed,errors):
+    """Orphaned temp-upload/staging leftovers from an interrupted upload or
+    a crash mid-copy (normal operation always cleans these up inline in a
+    `finally` block; this only ever catches what a crash left behind).
+    Age-gated at 1 hour so an upload genuinely in progress is never touched."""
+    cutoff=now-3600
+    for base,label in ((UPLOAD_DIR,"temp_upload"),):
+        if not base.is_dir(): continue
+        for entry in base.iterdir():
+            try:
+                if entry.stat().st_mtime>=cutoff: continue
+                size=_dir_size(entry) if entry.is_dir() else entry.stat().st_size
+                if entry.is_dir(): shutil.rmtree(entry)
+                else: entry.unlink()
+                removed.append({"type":label,"path":str(entry),"bytes":size})
+                bytes_freed["value"]+=size
+            except OSError as ex:
+                errors.append(f"{entry}: {ex}")
+    if RELEASES_DIR.is_dir():
+        for entry in RELEASES_DIR.iterdir():
+            if not entry.name.startswith('.'): continue  # .{version}.replacement-*/.{version}.previous-* only
+            try:
+                if entry.stat().st_mtime>=cutoff: continue
+                size=_dir_size(entry)
+                shutil.rmtree(entry)
+                removed.append({"type":"old_staging","path":str(entry),"bytes":size})
+                bytes_freed["value"]+=size
+            except OSError as ex:
+                errors.append(f"{entry}: {ex}")
+
+def _cleanup_old_releases(trigger):
+    """Run the release retention policy. Safe to call any number of times;
+    idempotent (nothing left to remove on a repeat call is not an error).
+    Returns and persists a report of exactly what was removed/kept/blocked."""
+    now=time.time()
+    removed=[]; kept=[]; blocked={}; errors=[]; bytes_freed={"value":0}
+    candidates=_release_cleanup_candidates()
+    keep_versions=set(candidates[:MESFLOW_RELEASE_RETENTION])
+    for version in candidates:
+        reasons=_release_cleanup_blockers(version,keep_versions)
+        if reasons:
+            if reasons==["WITHIN_RETENTION_WINDOW"]: kept.append(version)
+            else: blocked[version]=reasons
+            continue
+        root=_release_dir_for(version)
+        # Old release ZIP (+ its checksum sidecar) -- never release.json /
+        # checksums.txt / PROMOTION.json / image-info.json / BUILD_REPORT.md,
+        # which the immutable-once build guard depends on existing forever.
+        for pattern in (f"MESFlow_{version}.deploy.zip",f"MESFlow_{version}.deploy.zip.sha256"):
+            f=root/pattern
+            if f.is_file():
+                try:
+                    size=f.stat().st_size; f.unlink()
+                    removed.append({"type":"release_zip","version":version,"path":str(f),"bytes":size})
+                    bytes_freed["value"]+=size
+                except OSError as ex: errors.append(f"{f}: {ex}")
+        # Old local staging/bundle copy (the unpacked release this Agent
+        # would deploy locally from) -- RELEASES_DIR/<version>.
+        staging=RELEASES_DIR/version
+        if staging.is_dir():
+            try:
+                size=_dir_size(staging); shutil.rmtree(staging)
+                removed.append({"type":"old_staging","version":version,"path":str(staging),"bytes":size})
+                bytes_freed["value"]+=size
+            except OSError as ex: errors.append(f"{staging}: {ex}")
+        # Corresponding unused Docker image -- targeted `docker rmi` of this
+        # exact tag only. Never `docker system prune`. A failure here (e.g.
+        # the image is still referenced by a stopped container) is logged,
+        # not fatal to the rest of the cleanup pass.
+        image_tag=f"{os.environ.get('MESFLOW_IMAGE_REPOSITORY','mesflow-app')}:{version}"
+        r=_run_capture(["docker","rmi",image_tag],30)
+        if r.get("ok"):
+            removed.append({"type":"docker_image","version":version,"image":image_tag})
+        elif "No such image" not in (r.get("stderr") or ""):
+            errors.append(f"docker rmi {image_tag}: {(r.get('stderr') or '').strip()[:200]}")
+    # Second pass: local staging copies (RELEASES_DIR/<version>) whose
+    # artifacts/releases build record is already gone entirely (e.g. from
+    # before this retention policy existed, or from any external cleanup of
+    # artifacts/releases). Same safety checks apply; a version already
+    # missing its build record can never be "within the retention window".
+    if RELEASES_DIR.is_dir():
+        candidate_set=set(candidates)
+        for entry in RELEASES_DIR.iterdir():
+            if not entry.is_dir() or entry.name.startswith('.') or entry.name in candidate_set: continue
+            version=entry.name
+            reasons=_release_cleanup_blockers(version,keep_versions)
+            if reasons:
+                if reasons!=["WITHIN_RETENTION_WINDOW"]: blocked[version]=reasons
+                continue
+            try:
+                size=_dir_size(entry); shutil.rmtree(entry)
+                removed.append({"type":"old_staging","version":version,"path":str(entry),"bytes":size})
+                bytes_freed["value"]+=size
+            except OSError as ex:
+                errors.append(f"{entry}: {ex}"); continue
+            image_tag=f"{os.environ.get('MESFLOW_IMAGE_REPOSITORY','mesflow-app')}:{version}"
+            r=_run_capture(["docker","rmi",image_tag],30)
+            if r.get("ok"):
+                removed.append({"type":"docker_image","version":version,"image":image_tag})
+            elif "No such image" not in (r.get("stderr") or ""):
+                errors.append(f"docker rmi {image_tag}: {(r.get('stderr') or '').strip()[:200]}")
+    _cleanup_stray_staging(now,removed,bytes_freed,errors)
+    report={"at":now_text(),"trigger":trigger,"retention":MESFLOW_RELEASE_RETENTION,
+            "kept":kept,"blocked":blocked,"removed":removed,"bytes_freed":bytes_freed["value"],"errors":errors}
+    def f(s): s["release_cleanup_report"]=report
+    update_state(f)
+    append_log(f"Release cleanup ({trigger}): removed={len(removed)} kept={len(kept)} blocked={len(blocked)} freed={_bytes(bytes_freed['value'])}"+(f" errors={len(errors)}" if errors else ""))
+    return report
 
 def _release_targets():
     raw=load_json(CONFIG_DIR/"release-targets.json",{})
@@ -515,32 +1004,42 @@ def _remote_agent_client(base_url,user,password,timeout=20):
     if not csrf2: raise _RemoteAgentError("REMOTE_LOGIN_FAILED: no session/csrf obtained (check target URL/credentials)")
     return opener,base,csrf2
 
-def _remote_agent_upload(opener,base,csrf,zip_path,timeout=600):
-    """multipart/form-data POST of the release ZIP to the remote /upload endpoint."""
+def _remote_agent_upload(opener,base,csrf,zip_path,timeout=600,path="/upload",field_name="release_zip"):
+    """multipart/form-data POST of a release ZIP to a remote Agent endpoint.
+    Defaults to MESFlow's /upload; QA promotion passes path="/qa-release/upload"
+    (same opener/CSRF contract, different route -- see _remote_agent_qa_upload)."""
     boundary=uuid.uuid4().hex
     zip_path=Path(zip_path)
     parts=[]
     def field(name,value):
         parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"\r\n\r\n{value}\r\n'.encode())
     field("csrf",csrf)
-    parts.append((f'--{boundary}\r\nContent-Disposition: form-data; name="release_zip"; filename="{zip_path.name}"\r\n'
+    parts.append((f'--{boundary}\r\nContent-Disposition: form-data; name="{field_name}"; filename="{zip_path.name}"\r\n'
                    'Content-Type: application/zip\r\n\r\n').encode())
     parts.append(zip_path.read_bytes())
     parts.append(f"\r\n--{boundary}--\r\n".encode())
     body=b"".join(parts)
-    req=urllib.request.Request(base+"/upload",data=body,headers={
+    req=urllib.request.Request(base+path,data=body,headers={
         "Content-Type":f"multipart/form-data; boundary={boundary}",
         "X-CSRF-Token":csrf,"User-Agent":"MESFlow-Deploy-Agent-Promote"})
     with opener.open(req,timeout=timeout) as r:
         return r.status,r.read().decode("utf-8",errors="replace")
 
-def _remote_agent_deploy(opener,base,csrf,version,timeout=600):
-    req=urllib.request.Request(base+f"/deploy/{quote(version,safe='')}",data=urlencode({"csrf":csrf}).encode(),
+def _remote_agent_deploy(opener,base,csrf,version,timeout=600,path_fmt="/deploy/{}"):
+    """POST to a remote Agent's deploy-by-version endpoint. Defaults to
+    MESFlow's /deploy/<version>; QA promotion passes path_fmt="/qa-release/deploy/{}"."""
+    req=urllib.request.Request(base+path_fmt.format(quote(version,safe='')),data=urlencode({"csrf":csrf}).encode(),
         headers={"Content-Type":"application/x-www-form-urlencoded","X-CSRF-Token":csrf,"User-Agent":"MESFlow-Deploy-Agent-Promote"})
     with opener.open(req,timeout=timeout) as r:
         return r.status,r.read().decode("utf-8",errors="replace")
 
-def _remote_agent_status(opener,base,timeout=15):
+def _remote_agent_qa_upload(opener,base,csrf,zip_path,timeout=600):
+    return _remote_agent_upload(opener,base,csrf,zip_path,timeout=timeout,path="/qa-release/upload",field_name="qa_release_zip")
+
+def _remote_agent_qa_deploy(opener,base,csrf,version,timeout=600):
+    return _remote_agent_deploy(opener,base,csrf,version,timeout=timeout,path_fmt="/qa-release/deploy/{}")
+
+def _remote_agent_status(opener,base,timeout=25):
     # Must reuse the authenticated opener (session cookie from
     # _remote_agent_client): /api/status is not in the Agent's login-exempt
     # route list, so an unauthenticated request gets redirected to the
@@ -567,13 +1066,22 @@ def _production_target():
 # receive MESFlow releases perfectly well without supporting the Agent
 # self-update protocol.
 REQUIRED_PROMOTION_CAPABILITIES={"image_release_receive","digest_verify","remote_deploy","deploy_status","health_status"}
+# Same idea for QA Center promotion -- a distinct capability set so an
+# older target that can receive MESFlow releases but not QA ones (or vice
+# versa) is reported precisely, never conflated with the MESFlow gate.
+QA_REQUIRED_PROMOTION_CAPABILITIES={"qa_image_release_receive","qa_deploy","digest_verify","deploy_status","health_status"}
 
-def _agent_compatibility(target_status):
+def _agent_compatibility(target_status,required=None):
     """Classify a target Agent's /api/status (or None/error on unreachable)
     as COMPATIBLE / UPDATE_AVAILABLE / INCOMPATIBLE / OFFLINE / NOT_CONFIGURED.
 
     Never blocks solely because AGENT_VERSION strings differ -- only a
-    genuinely missing required capability makes it INCOMPATIBLE."""
+    genuinely missing required capability makes it INCOMPATIBLE. `required`
+    defaults to the MESFlow gate; pass QA_REQUIRED_PROMOTION_CAPABILITIES
+    (or any other set) to check a different application's gate against the
+    exact same target-status payload -- different applications may well
+    have different capability requirements against the same Agent."""
+    required=REQUIRED_PROMOTION_CAPABILITIES if required is None else required
     if not target_status or target_status.get("_unreachable"):
         return {"status":"OFFLINE","reason":str((target_status or {}).get("error") or "Target Agent unreachable"),"missing":[]}
     caps=target_status.get("capabilities")
@@ -588,7 +1096,7 @@ def _agent_compatibility(target_status):
                 "reason":f"Target Agent {target_status.get('agent_version','?')} does not report capabilities (predates API protocol {API_PROTOCOL_VERSION}). Treated as compatible based on legacy behavior; update recommended for explicit verification.",
                 "missing":[]}
     caps=set(caps or [])
-    missing=sorted(REQUIRED_PROMOTION_CAPABILITIES-caps)
+    missing=sorted(required-caps)
     if missing:
         return {"status":"INCOMPATIBLE",
                 "reason":f"Target Agent {target_status.get('agent_version','?')} lacks {', '.join(missing)}",
@@ -646,8 +1154,156 @@ def _latest_agent_release():
     if not candidates: return {}
     manifest=load_json(candidates[0],{})
     version=str(manifest.get("version") or "")
-    package=candidates[0].parent/f"AGENT_UPDATE_{version}.zip"
-    return {**manifest,"package":str(package),"package_exists":package.is_file()}
+    release_dir=candidates[0].parent
+    package=release_dir/f"AGENT_UPDATE_{version}.zip"
+    package_exists=package.is_file()
+    package_sha256=""
+    sha_file=release_dir/f"AGENT_UPDATE_{version}.zip.sha256"
+    if sha_file.is_file():
+        # sha256sum(1) format: "<hex>  <filename>" -- take just the hex.
+        package_sha256=sha_file.read_text(encoding="utf-8",errors="replace").split()[0:1]
+        package_sha256=package_sha256[0] if package_sha256 else ""
+    return {**manifest,"package":str(package),"package_exists":package_exists,
+            "package_size":package.stat().st_size if package_exists else 0,
+            "package_sha256":package_sha256,"release_dir":str(release_dir)}
+
+# ---------------- Build Agent Package (task: AGENT_PACKAGE_BUILD_PUSH) ----------------
+# DEV-only pipeline that turns the current workspace source into the exact
+# immutable AGENT_UPDATE_<version>.zip artifact Bootstrap's /updater/update
+# already knows how to install (deploy-agent/updater/updater.py's
+# extract_and_verify_artifact() -- unmodified, untouched by this task; see
+# bootstrap/AGENTS.md: "Bootstrap must remain the installer/update
+# authority", "do not duplicate updater logic in DEV Agent"). This job only
+# produces the artifact and reuses the existing _push_agent_update()/
+# start_agent_update() to hand it to Bootstrap -- it does not reimplement
+# verify/install/restart/health-check, all of which stay inside Bootstrap's
+# single synchronous /updater/update call.
+def agent_package_build_job_update(status,message,**extra):
+    def mutate(state):
+        job=dict(state.get("agent_package_build_job") or {})
+        job.update(status=status,message=message,updated_at=now_text(),**extra)
+        transitions=list(job.get("transitions") or [])
+        if not transitions or transitions[-1].get("status")!=status:
+            transitions.append({"status":status,"at":now_text(),"message":message})
+        job["transitions"]=transitions
+        state["agent_package_build_job"]=job
+    return update_state(mutate).get("agent_package_build_job")
+
+def _run_agent_package_build():
+    try:
+        script=DEPLOY_AGENT_SOURCE_DIR/"scripts"/"build-agent-release.sh"
+        if not DEPLOY_AGENT_SOURCE_DIR.is_dir():
+            agent_package_build_job_update("FAILED","SOURCE_NOT_FOUND",error_code="SOURCE_NOT_FOUND");return
+        if not script.is_file():
+            agent_package_build_job_update("FAILED","BUILD_SCRIPT_NOT_FOUND",error_code="BUILD_SCRIPT_NOT_FOUND");return
+        agent_package_build_job_update("BUILDING","Preflight, version check, tests, package build")
+        log_path=LOG_DIR/"agent-package-builder.log"
+        with log_path.open("w",encoding="utf-8") as log:
+            result=subprocess.run([str(script)],cwd=str(DEPLOY_AGENT_SOURCE_DIR),stdout=log,stderr=subprocess.STDOUT,text=True,timeout=BUILD_TIMEOUT)
+        log_tail=tail(log_path,120)
+        if result.returncode!=0:
+            reason="TESTS_FAILED" if "TESTS_FAILED" in log_tail else \
+                   "VERSION_ALREADY_RELEASED" if "VERSION_ALREADY_RELEASED" in log_tail else \
+                   "VERSION_INVALID" if "VERSION_INVALID" in log_tail else \
+                   "IMAGE_TAG_CONTAMINATED" if "IMAGE_TAG_CONTAMINATED" in log_tail else "BUILD_FAILED"
+            agent_package_build_job_update("FAILED",reason,error_code=reason,log_file=str(log_path),log_tail=log_tail);return
+        release=_latest_agent_release()
+        agent_package_build_job_update("SUCCESS",f"Package {release.get('version','')} sẵn sàng",
+            release=release,log_file=str(log_path),log_tail=log_tail)
+    except subprocess.TimeoutExpired:
+        agent_package_build_job_update("FAILED","BUILD_TIMEOUT",error_code="BUILD_TIMEOUT")
+    except Exception as exc:
+        code=str(exc) if str(exc).isupper() else "BUILD_FAILED"
+        agent_package_build_job_update("FAILED",code,error_code=code)
+    finally:
+        if AGENT_PACKAGE_BUILD_LOCK.locked(): AGENT_PACKAGE_BUILD_LOCK.release()
+
+def start_agent_package_build():
+    if not AGENT_PACKAGE_BUILD_LOCK.acquire(False): raise RuntimeError("AGENT_PACKAGE_BUILD_ALREADY_RUNNING")
+    try:
+        agent_package_build_job_update("QUEUED","Build Agent Package đã được xếp hàng")
+        threading.Thread(target=_run_agent_package_build,daemon=True).start()
+    except Exception:
+        AGENT_PACKAGE_BUILD_LOCK.release(); raise
+
+def _deployment_platform_store():
+    return DeploymentEvidenceStore(DATA_DIR/"deployment_platform")
+
+def _deployment_platform_summary(mes=None,qa=None,mes_release=None,qa_release=None):
+    """Normalized read model over the three existing deployment adapters.
+
+    Mutation remains in the proven MESFlow/QA/updater paths; this projection
+    gives Release Manager one vocabulary without duplicating those mechanics.
+
+    Release Tab Performance Fix follow-up (reports/
+    DEPLOY_AGENT_REFRESH_PERFORMANCE_FIX.md): mes/qa/mes_release/qa_release
+    are optional so a caller that already computed them (the Release Deploy
+    tab context builder) can pass them straight through instead of this
+    function silently recomputing all four -- each one a real Docker
+    inspect / QA network probe / release-summary (SHA-hashing) call --
+    a SECOND time for the exact same request. A standalone caller (the
+    /api/deployment-platform route) omits them and gets the previous
+    from-scratch behavior, unchanged.
+    """
+    state=load_state()
+    mes=mes if mes is not None else mes_status()
+    qa=qa if qa is not None else qa_status()
+    mes_release=mes_release if mes_release is not None else _release_summary()
+    qa_release=qa_release if qa_release is not None else _qa_release_summary()
+    agent_release=_latest_agent_release()
+    mes_history=list(state.get("history") or []);qa_history=list(state.get("qa_history") or [])
+    def component(name,running,healthy,latest,previous,states,rollback):
+        return {"component":name,"running":running or "UNKNOWN","available":str((latest or {}).get("version") or ""),
+                "previous":previous or "","healthy":bool(healthy),"artifact_digest":str((latest or {}).get("digest") or (latest or {}).get("image_digest") or ""),
+                "artifact":str((latest or {}).get("package") or ""),"states":states,"rollback_available":bool(rollback)}
+    components=[
+      component(DeploymentComponent.MESFLOW.value,mes.get("version"),mes.get("healthy"),mes_release.get("latest"),
+                str((mes_history[0] if mes_history else {}).get("from_version") or ""),mes_release.get("states") or {},bool(mes_history)),
+      component(DeploymentComponent.QA_CENTER.value,qa.get("version"),qa.get("online"),qa_release.get("latest"),
+                str((qa_history[0] if qa_history else {}).get("from_version") or ""),qa_release.get("states") or {},bool(qa_history)),
+      component(DeploymentComponent.DEPLOY_AGENT.value,AGENT_VERSION,True,agent_release,
+                str((state.get("agent_update_job") or {}).get("from_version") or ""),{"update":str((state.get("agent_update_job") or {}).get("status") or "IDLE")},
+                bool((state.get("agent_update_job") or {}).get("from_version"))),
+    ]
+    return {"components":components,"environments":[e.value for e in DeploymentEnvironment],
+            "artifact_policy":{"build_environment":"LOCAL","build_role":"DEV","build_enabled":_source_build_allowed(),
+                               "test_rebuild":False,"production_rebuild":False,
+                               "target_actions":["receive","verify","load","activate","health","rollback"]},
+            "deployments":_deployment_platform_store().list(50),"generated_at":datetime.now().astimezone().isoformat(timespec="seconds")}
+
+def _platform_retention_preview(component_name):
+    component=DeploymentComponent(component_name)
+    if component is DeploymentComponent.MESFLOW:
+        candidates=_release_cleanup_candidates();root=_releases_root();retention=MESFLOW_RELEASE_RETENTION
+        rows=[]
+        versions=[str(version) for version in candidates]
+        keep=set(versions[:retention])
+        for version in versions:
+            release_dir=_release_dir_for(version);meta=load_json(release_dir/"release.json",{});reasons=_release_cleanup_blockers(version,keep)
+            rows.append({"version":version,"path":str(release_dir),"size_bytes":_dir_size(release_dir),"status":"SUCCESS",
+                         "built_at":str(meta.get("built_at") or meta.get("created_at") or ""),"current":"CURRENTLY_DEPLOYED" in reasons,"previous":"ROLLBACK_TARGET_OF_LAST_DEPLOY" in reasons,
+                         "pinned":(release_dir/"PINNED").is_file(),
+                         "active_deployment":bool({"ACTIVE_DEPLOYMENT_JOB","ACTIVE_ROLLBACK_TARGET","BEING_PROMOTED"}&set(reasons)),
+                         "evidence_protected":"PROMOTION_IN_PROGRESS" in reasons})
+    elif component is DeploymentComponent.QA_CENTER:
+        candidates=_qa_release_cleanup_candidates();root=_qa_releases_root();retention=QA_RELEASE_RETENTION
+        versions=[str(version) for version in candidates];keep=set(versions[:retention]);rows=[]
+        for version in versions:
+            release_dir=_qa_release_dir_for(version);meta=load_json(release_dir/"release.json",{});reasons=_qa_release_cleanup_blockers(version,keep)
+            rows.append({"version":version,"path":str(release_dir),"size_bytes":_dir_size(release_dir),"status":"SUCCESS",
+                         "built_at":str(meta.get("built_at") or meta.get("created_at") or ""),"current":"CURRENTLY_DEPLOYED" in reasons,"previous":False,
+                         "pinned":(release_dir/"PINNED").is_file(),
+                         "active_deployment":bool({"ACTIVE_DEPLOYMENT_JOB","BEING_PROMOTED"}&set(reasons)),
+                         "evidence_protected":"PROMOTION_IN_PROGRESS" in reasons})
+    else:
+        root=_agent_releases_root();retention=max(2,int(os.environ.get("MESFLOW_AGENT_RELEASE_RETENTION","5")));latest=_latest_agent_release();rows=[]
+        manifests=sorted(root.glob("*/agent-release.json"),key=lambda p:p.stat().st_mtime,reverse=True) if root.is_dir() else []
+        for manifest_path in manifests:
+            meta=load_json(manifest_path,{});version=str(meta.get("version") or manifest_path.parent.name)
+            rows.append({"version":version,"path":str(manifest_path.parent),"size_bytes":_dir_size(manifest_path.parent),"status":"SUCCESS",
+                         "built_at":str(meta.get("built_at") or ""),"current":version==AGENT_VERSION,"previous":False,"pinned":(manifest_path.parent/"PINNED").is_file(),
+                         "active_deployment":False,"evidence_protected":version==str(latest.get("version") or "")})
+    return RetentionService(root,RetentionPolicy(keep_last_successful=retention)).preview(rows)
 
 def _agent_updater_target(role):
     prefix="MESFLOW_PRODUCTION_TEST_AGENT" if role=="PRODUCTION_TEST" else "MESFLOW_PRODUCTION_AGENT"
@@ -670,7 +1326,16 @@ def _push_agent_update(url,token,zip_path,timeout=300):
 def agent_update_job_update(status,message,**extra):
     def mutate(s):
         j=dict(s.get("agent_update_job") or {});j.update(status=status,message=message,updated_at=now_text(),**extra);s["agent_update_job"]=j
-    return update_state(mutate).get("agent_update_job")
+    job=update_state(mutate).get("agent_update_job")
+    if status in DEPLOYMENT_HISTORY_TERMINAL:
+        role=str((job or {}).get("role") or "")
+        env={"PRODUCTION_TEST":"TEST","PRODUCTION":"PRODUCTION"}.get(role,role or "LOCAL")
+        try:
+            _record_deployment_history("DEPLOY_AGENT",env,version=str((job or {}).get("version") or ""),
+                status=status,message=message,started_at=(job or {}).get("started_at",""),finished_at=now_text(),
+                deployment_id=f"agent-update-{role}-{(job or {}).get('version','')}-{(job or {}).get('updated_at','')}")
+        except Exception as ex: append_log(f"Deployment history recording failed (agent update): {type(ex).__name__}: {ex}")
+    return job
 
 _agent_update_lock=threading.Lock()
 
@@ -705,6 +1370,16 @@ def start_agent_update(role):
 
 def _remote_agent_get_json(opener,base,path,timeout=20):
     req=urllib.request.Request(base+path,headers={"User-Agent":"MESFlow-Deploy-Agent-Promote"})
+    with opener.open(req,timeout=timeout) as r:
+        return json.loads(r.read().decode("utf-8",errors="replace"))
+
+def _remote_agent_post_json(opener,base,path,csrf,payload=None,timeout=30):
+    """POST a JSON body to an already-authenticated remote Agent route,
+    same CSRF contract as every other _remote_agent_* call (P5 fleet
+    proxy routes: remote backup trigger, restore-drill trigger, etc)."""
+    body=json.dumps(payload or {}).encode()
+    req=urllib.request.Request(base+path,data=body,method="POST",
+        headers={"Content-Type":"application/json","X-CSRF-Token":csrf,"User-Agent":"MESFlow-Deploy-Agent-Promote"})
     with opener.open(req,timeout=timeout) as r:
         return json.loads(r.read().decode("utf-8",errors="replace"))
 
@@ -756,7 +1431,14 @@ def _run_production_preflight():
 def promote_test_update(status,message,**extra):
     def mutate(s):
         j=dict(s.get("promote_test_job") or {});j.update(status=status,message=message,updated_at=now_text(),**extra);s["promote_test_job"]=j
-    return update_state(mutate).get("promote_test_job")
+    job=update_state(mutate).get("promote_test_job")
+    if status in DEPLOYMENT_HISTORY_TERMINAL:
+        try:
+            _record_deployment_history("MESFLOW","TEST",version=str((job or {}).get("version") or ""),
+                status=status,message=message,started_at=(job or {}).get("started_at",""),finished_at=now_text(),
+                deployment_id=f"promote-test-{(job or {}).get('version','')}-{(job or {}).get('updated_at','')}")
+        except Exception as ex: append_log(f"Deployment history recording failed (promote test): {type(ex).__name__}: {ex}")
+    return job
 
 def _run_promote_test(version):
     try:
@@ -818,11 +1500,16 @@ def _run_promote_test(version):
         if not (version_ok and healthy_ok):
             raise _RemoteAgentError(f"REMOTE_VERIFY_FAILED: version_ok={version_ok} healthy_ok={healthy_ok} mes={mes}")
         promote_test_update("VERIFYING","Checking remote schema and browser smoke",version=version)
+        v70=_v70_release(version)
         _update_promotion_state(version,artifact,
-            test_status="PASS",test_pass=True,
-            test_message=f"TEST_PASS: remote version={remote_version} healthy={healthy_ok}",
+            test_status="AWAITING_QA" if v70 else "PASS",test_pass=not v70,
+            test_deployment_verified=True,test_deployed_digest=str(artifact.get("digest") or artifact.get("image_digest") or ""),
+            test_message=("TEST deployment verified; release-test QA evidence required" if v70 else f"TEST_PASS: remote version={remote_version} healthy={healthy_ok}"),
             test_target=url)
-        promote_test_update("SUCCESS",f"TEST_PASS: {version} verified on {url}",version=version)
+        promote_test_update("SUCCESS",f"TEST deployed and digest verified: {version}" if v70 else f"TEST_PASS: {version} verified on {url}",version=version)
+        # Run cleanup only after a successful, verified promotion.
+        try: _cleanup_old_releases("TEST_PASS")
+        except Exception as ex: append_log(f"Release cleanup after TEST_PASS failed: {type(ex).__name__}: {ex}")
     except Exception as exc:
         code=str(exc) if isinstance(exc,_RemoteAgentError) else f"{type(exc).__name__}: {exc}"
         try:
@@ -837,10 +1524,630 @@ def _run_promote_test(version):
 def start_promote_test(version):
     if not _promote_test_lock.acquire(False): raise RuntimeError("PROMOTE_TEST_ALREADY_RUNNING")
     try:
-        promote_test_update("QUEUED","Promote to Production Test queued",version=version)
+        promote_test_update("QUEUED","Promote to Production Test queued",version=version,started_at=now_text())
         threading.Thread(target=_run_promote_test,args=(version,),daemon=True).start()
     except Exception:
         _promote_test_lock.release(); raise
+
+# =====================================================================
+# QA Center: Build Once / Promote Same Artifact
+#
+# Applies the exact same architecture as MESFlow above -- immutable image,
+# immutable release ZIP (image + compose.yml + metadata only, never
+# application source), Deploy Local -> LOCAL_PASS -> Promote Production
+# Test -> TEST_PASS -> human-gated Promote Production -- to the second
+# application this Agent can build/deploy/promote. Reuses, unmodified, the
+# exact same low-level plumbing MESFlow uses: load_json/save_json/
+# update_state/load_state, sha()/canonical_version()/norm()/
+# safe_extract_zip(), _run_capture()/_dir_size()/_bytes(), and the whole
+# _remote_agent_* HTTP client (_remote_agent_client/_remote_agent_qa_upload/
+# _remote_agent_qa_deploy/_remote_agent_status/_remote_agent_get_json) and
+# _agent_compatibility() capability gate. Only the QA-specific policy
+# (what "currently deployed"/"healthy"/"the compose file" mean for QA) is
+# written fresh -- MESFlow's own functions above are never modified to
+# reach here, so the existing, tested MESFlow pipeline is unaffected.
+# QA's promotion state, jobs and locks are 100% independent of MESFlow's
+# (separate state.json keys, separate QA_PROMOTION_STATE_FILE) -- see
+# AGENTS.md "Release Manager Safety".
+# =====================================================================
+
+def _qa_releases_root():
+    return QA_CENTER_SOURCE_DIR.parent/"artifacts"/"qa-center"/"releases"
+
+def _qa_release_dir_for(version):
+    return _qa_releases_root()/version
+
+def _qa_release_contamination(version):
+    """Identical policy to _release_contamination(), scoped to QA's own
+    releases root and image tag."""
+    root=_qa_release_dir_for(version)
+    marker=load_json(root/"CONTAMINATED.json",{})
+    if marker.get("contaminated"):
+        return {"contaminated":True,"reason":marker.get("reason","Marked contaminated"),"source":"marker"}
+    meta=load_json(root/"release.json",{})
+    image=str(meta.get("image") or ""); expected_id=str(meta.get("image_id") or "")
+    if image and expected_id:
+        try:
+            r=subprocess.run(["docker","image","inspect",image,"--format","{{.Id}}"],capture_output=True,text=True,timeout=15)
+            if r.returncode==0:
+                actual_id=r.stdout.strip()
+                if actual_id and actual_id!=expected_id:
+                    return {"contaminated":True,"reason":f"Docker tag {image} now points at {actual_id}, not the frozen id {expected_id}. A later build moved the tag.","source":"tag_drift"}
+        except Exception: pass
+    return {"contaminated":False}
+
+def _qa_artifact_for_release(version):
+    root=_qa_release_dir_for(version)
+    package=root/f"QACenter_{version}.deploy.zip"
+    info=load_json(root/"image-info.json",{}); meta=load_json(root/"release.json",{})
+    return {"version":version,"image":meta.get("image",info.get("image")),"digest":meta.get("image_digest",info.get("digest")),
+            "image_id":meta.get("image_id",""),"package":str(package),"package_sha256":sha(package) if package.is_file() else "",
+            "source_commit":meta.get("source_commit",""),"built_at":meta.get("built_at","")}
+
+def _qa_load_promotion_state():
+    with _qa_promotion_lock:
+        return load_json(QA_PROMOTION_STATE_FILE,{})
+
+def _qa_reset_promotion_state(version,artifact):
+    state={"application":"qa-center","version":version,"source_commit":artifact.get("source_commit",""),
+           "package_sha256":artifact.get("package_sha256",""),"image":artifact.get("image",""),
+           "image_digest":artifact.get("digest") or artifact.get("image_digest",""),"image_id":artifact.get("image_id",""),
+           "build_status":"PASS","local_status":"NOT_TESTED","local_pass":False,
+           "test_status":"NOT_DEPLOYED","test_pass":False,"production_status":"NOT_DEPLOYED","production_pass":False}
+    with _qa_promotion_lock: save_json(QA_PROMOTION_STATE_FILE,state)
+    return state
+
+def _qa_sync_release_promotion_json(version,state):
+    path=_qa_release_dir_for(version)/"PROMOTION.json"
+    doc=load_json(path,{})
+    doc.update(application="qa-center",version=version,image_digest=state.get("image_digest",""),source_commit=state.get("source_commit",""))
+    doc["local"]={"status":"success" if state.get("local_pass") else (state.get("local_status") or "NOT_DEPLOYED"),"message":state.get("local_message","")}
+    doc["production_test"]={"status":"success" if state.get("test_pass") else (state.get("test_status") or "NOT_DEPLOYED"),"message":state.get("test_message","")}
+    doc["production"]={"status":"success" if state.get("production_pass") else (state.get("production_status") or "NOT_DEPLOYED"),"message":state.get("production_message","")}
+    try: save_json(path,doc)
+    except OSError: pass
+
+def _qa_update_promotion_state(version,artifact,**fields):
+    with _qa_promotion_lock:
+        state=load_json(QA_PROMOTION_STATE_FILE,{})
+    if state.get("version")!=version:
+        state=_qa_reset_promotion_state(version,artifact)
+    state.update(fields)
+    with _qa_promotion_lock: save_json(QA_PROMOTION_STATE_FILE,state)
+    _qa_sync_release_promotion_json(version,state)
+    return state
+
+# --- QA build (DEV only) -------------------------------------------------
+
+def qa_release_build_update(status,message,**extra):
+    def mutate(s):
+        j=dict(s.get("qa_release_build_job") or {});j.update(status=status,message=message,updated_at=now_text(),**extra);s["qa_release_build_job"]=j
+    return update_state(mutate).get("qa_release_build_job")
+
+def _qa_release_summary():
+    version_file=QA_CENTER_SOURCE_DIR/"current"/"VERSION"
+    version=version_file.read_text(encoding="utf-8-sig").strip() if version_file.is_file() else "—"
+    try:
+        commit=subprocess.run(["git","-C",str(QA_CENTER_SOURCE_DIR),"rev-parse","--short","HEAD"],capture_output=True,text=True,timeout=5).stdout.strip() or "unknown"
+    except Exception: commit="unknown"
+    latest=sorted(_qa_releases_root().glob("*/image-info.json"),key=lambda p:p.stat().st_mtime,reverse=True) if _qa_releases_root().is_dir() else []
+    build=load_json(latest[0],{}) if latest else {}
+    if latest:
+        package=latest[0].parent/f"QACenter_{build.get('version','')}.deploy.zip"
+        release_meta=load_json(latest[0].parent/"release.json",{})
+        build={**build,"package":str(package),"package_sha256":sha(package) if package.is_file() else "",
+               "image_id":release_meta.get("image_id","")}
+    contamination=_qa_release_contamination(build.get("version","")) if build.get("version") else {"contaminated":False}
+    build_job=load_state().get("qa_release_build_job") or {}
+    build_state={"QUEUED":"BUILDING","BUILDING":"BUILDING","SUCCESS":"PASS","FAILED":"FAILED"}.get(build_job.get("status",""),"IDLE" if not build_job else "IDLE")
+    promotion=load_json(QA_PROMOTION_STATE_FILE,{})
+    if promotion.get("version")!=build.get("version"): promotion={"version":build.get("version",""),"local_status":"NOT_TESTED","test_status":"NOT_DEPLOYED","production_status":"NOT_DEPLOYED"}
+    local_pass=bool(promotion.get("local_pass")); test_pass=bool(promotion.get("test_pass"))
+    zip_ok=bool(promotion.get("zip_sha_unchanged")); digest_ok=bool(promotion.get("image_digest_unchanged"))
+    production_promote_enabled=os.environ.get("MESFLOW_PRODUCTION_PROMOTE_ENABLED","").strip().lower() in {"1","true","yes","on"}
+    gate_ok=local_pass and test_pass and zip_ok and digest_ok and not contamination.get("contaminated")
+    build_block=None if MESFLOW_BUILD_ENABLED else "Build is disabled on this Agent (MESFLOW_BUILD_ENABLED=0 — this host is not DEV)."
+    local_block=None
+    if not build.get("version"): local_block="No QA release has been built yet."
+    elif contamination.get("contaminated"): local_block=f"Release {build.get('version')} is CONTAMINATED: {contamination.get('reason')}"
+    test_block=None
+    if not local_pass: test_block="LOCAL_PASS is required before promoting to Production Test."
+    elif contamination.get("contaminated"): test_block=f"Release {build.get('version')} is CONTAMINATED: {contamination.get('reason')}"
+    elif not (os.environ.get("MESFLOW_PRODUCTION_TEST_AGENT_URL") or "").strip(): test_block="No Production Test Agent is configured (set MESFLOW_PRODUCTION_TEST_AGENT_URL/_USER/_PASSWORD)."
+    production_block=None
+    if not gate_ok:
+        missing=[]
+        if not local_pass: missing.append("LOCAL_PASS")
+        if not test_pass: missing.append("TEST_PASS")
+        if not zip_ok: missing.append("ZIP SHA unchanged")
+        if not digest_ok: missing.append("image digest unchanged")
+        if contamination.get("contaminated"): missing.append("not contaminated")
+        production_block="Missing: "+", ".join(missing)
+    elif not production_promote_enabled:
+        production_block="MESFLOW_PRODUCTION_PROMOTE_ENABLED is not set on this Agent."
+    return {"application":"qa-center","source_path":str(QA_CENTER_SOURCE_DIR),"source_exists":QA_CENTER_SOURCE_DIR.is_dir(),
+            "source_version":version,"git":commit,"latest":build,"contamination":contamination,
+            "states":{"build":build_state,"local":promotion.get("local_status","NOT_TESTED"),
+                      "test":promotion.get("test_status","NOT_DEPLOYED"),"production":promotion.get("production_status","NOT_DEPLOYED")},
+            "promotion":{**promotion,"production_gate":gate_ok,"production_promote_enabled":production_promote_enabled},
+            "blocked":{"build":build_block,"local":local_block,"test":test_block,"production":production_block},
+            "production_target_configured":bool((os.environ.get("MESFLOW_PRODUCTION_AGENT_URL") or "").strip())}
+
+def _run_qa_release_build():
+    try:
+        if not MESFLOW_BUILD_ENABLED: raise ValueError("BUILD_DISABLED")
+        script=QA_CENTER_SOURCE_DIR/"scripts"/"build-release.sh"
+        if not QA_CENTER_SOURCE_DIR.is_dir(): raise ValueError("SOURCE_NOT_FOUND")
+        if not script.is_file(): raise ValueError("BUILD_SCRIPT_NOT_FOUND")
+        qa_release_build_update("BUILDING","Đang build QA Center Docker image tại DEV",source_path=str(QA_CENTER_SOURCE_DIR))
+        log_path=LOG_DIR/"qa-release-builder.log"
+        with log_path.open("w",encoding="utf-8") as log:
+            result=subprocess.run([str(script)],cwd=str(QA_CENTER_SOURCE_DIR),stdout=log,stderr=subprocess.STDOUT,text=True,timeout=BUILD_TIMEOUT)
+        log_tail=tail(log_path,120)
+        if result.returncode: qa_release_build_update("FAILED","BUILD_FAILED",error_code="BUILD_FAILED",log_tail=log_tail,log_file=str(log_path));return
+        latest=sorted(_qa_releases_root().glob("*/image-info.json"),key=lambda p:p.stat().st_mtime,reverse=True)
+        if not latest: raise ValueError("PACKAGE_NOT_FOUND")
+        info=load_json(latest[0],{})
+        qa_release_build_update("SUCCESS","QA local build complete",
+            latest={**info,"package":str(latest[0].parent/("QACenter_"+info.get("version","")+".deploy.zip"))},
+            source=_qa_release_summary(),log_tail=log_tail,log_file=str(log_path))
+    except subprocess.TimeoutExpired:
+        qa_release_build_update("FAILED","BUILD_TIMEOUT",error_code="BUILD_TIMEOUT")
+    except Exception as exc:
+        code=str(exc) if str(exc).isupper() else "BUILD_FAILED";qa_release_build_update("FAILED",code,error_code=code)
+    finally:
+        if QA_BUILD_LOCK.locked(): QA_BUILD_LOCK.release()
+
+def start_qa_release_build():
+    if not QA_BUILD_LOCK.acquire(False): raise RuntimeError("BUILD_ALREADY_RUNNING")
+    try:
+        qa_release_build_update("QUEUED","QA build release queued");threading.Thread(target=_run_qa_release_build,daemon=True).start()
+    except Exception:
+        QA_BUILD_LOCK.release();raise
+
+# --- QA Deploy Local (DEV, --no-build) -----------------------------------
+
+def _qa_release_compose(log,args,check=True,timeout=300,env_extra=None):
+    """Same shape as _docker_compose(), scoped to QA_HOME/compose.yml and
+    MESFLOW_QA_IMAGE instead of TARGET_HOME/compose.yml and MESFLOW_IMAGE.
+    Deliberately NOT named _qa_compose(): that name is already used by the
+    legacy full-source QA deploy path below (different signature, different
+    compose file -- QA_HOME/current/docker/compose.yml, project "mesflow-qa")
+    -- a real bug caught live (Python silently shadows same-named top-level
+    defs; calling this under the old name actually invoked the *legacy*
+    function with mismatched positional args, corrupting nothing but raising
+    a confusing io.UnsupportedOperation). Two distinctly-named functions
+    keep both deploy paths independently correct during the transition
+    (see section 13, "Legacy Deploy" in reports/QA_CENTER_BUILD_ONCE_PROMOTION.md)."""
+    compose=QA_HOME/"compose.yml"
+    if not compose.is_file(): raise RuntimeError(f"Missing {compose}")
+    cmd=["docker","compose","-p",_qa_release_project_name(),"-f",str(compose),*args]
+    log.write("RUN: "+" ".join(cmd)+"\n"); log.flush()
+    env=os.environ.copy(); meta=load_json(QA_HOME/"release.json",{})
+    if meta.get("image"): env["MESFLOW_QA_IMAGE"]=str(meta.get("image"))
+    env.update(env_extra or {})
+    r=subprocess.run(cmd,cwd=str(QA_HOME),env=env,stdout=log,stderr=subprocess.STDOUT,text=True,timeout=timeout)
+    if check and r.returncode:
+        raise RuntimeError(f"docker compose {' '.join(args)} failed with code {r.returncode}")
+    return r.returncode
+
+def _qa_release_project_name():
+    """Stable Compose ownership identity for QA image releases."""
+    configured=(os.environ.get("MESFLOW_QA_COMPOSE_PROJECT") or "").strip()
+    return configured or QA_HOME.name.replace("_","-").lower()
+
+def _qa_takeover_legacy_container_if_needed(log):
+    """Remove only a conflicting legacy/manual QA container.
+
+    Once the named container belongs to this image-release Compose project,
+    subsequent deploys rely on compose --force-recreate and do not perform a
+    manual docker rm. Host bind-mounted runtime data is never touched.
+    """
+    inspect=subprocess.run([
+        "docker","inspect","mesflow-qa-center","--format",
+        '{{ index .Config.Labels "com.docker.compose.project" }}'
+    ],capture_output=True,text=True,timeout=15)
+    if inspect.returncode!=0:
+        return False
+    owner=(inspect.stdout or "").strip()
+    expected=_qa_release_project_name()
+    if owner==expected:
+        log.write(f"Existing mesflow-qa-center already owned by Compose project {expected}; normal release update\n"); log.flush()
+        return False
+    log.write(f"Taking over legacy mesflow-qa-center container (owner={owner or 'none'}; expected={expected})\n"); log.flush()
+    removed=subprocess.run(["docker","rm","-f","mesflow-qa-center"],capture_output=True,text=True,timeout=30)
+    log.write((removed.stdout or "")+(removed.stderr or "")+"\n"); log.flush()
+    if removed.returncode:
+        raise RuntimeError(f"QA_LEGACY_TAKEOVER_FAILED: {(removed.stderr or removed.stdout or '').strip()}")
+    return True
+
+def _migrate_qa_runtime_data_if_needed(log):
+    """One-time, safe migration of QA's real persistent data (state/logs/
+    reports/config -- see reports/QA_CENTER_BUILD_ONCE_PROMOTION.md for the
+    read-only audit that found it) from the legacy location
+    (QA_HOME/current/runtime, bind-mounted by the old source-deploy
+    compose.yml) to the new top-level QA_HOME/runtime (mounted by the new
+    image-release compose.yml). Never runs if the new location already has
+    content -- copy-once, never overwrite, old copy is left in place as a
+    safety net (never deleted by this function)."""
+    old=QA_HOME/"current"/"runtime"
+    new=QA_HOME/"runtime"
+    if not old.is_dir():
+        return
+    if new.is_dir() and any(new.iterdir()):
+        return  # already migrated (or already has independent data) -- do not touch
+    try:
+        new.mkdir(parents=True,exist_ok=True)
+        for item in old.iterdir():
+            dest=new/item.name
+            if item.is_dir(): shutil.copytree(item,dest,dirs_exist_ok=True)
+            else: shutil.copy2(item,dest)
+        log.write(f"Migrated QA persistent data: {old} -> {new} (old copy left in place)\n"); log.flush()
+        append_log(f"QA runtime data migrated: {old} -> {new}")
+    except OSError as ex:
+        log.write(f"WARNING: QA runtime data migration failed ({ex}); continuing with a fresh {new}\n"); log.flush()
+
+def _qa_actual_running_image_id():
+    try:
+        r=subprocess.run(["docker","inspect","mesflow-qa-center","--format","{{.Image}}"],capture_output=True,text=True,timeout=15)
+        return r.stdout.strip() if r.returncode==0 else ""
+    except Exception: return ""
+
+def _qa_http_smoke_ok(timeout=6):
+    try:
+        payload,code=qa_http_json("/api/version",timeout)
+        return code==200 and bool(payload.get("ok"))
+    except Exception:
+        return False
+
+def _record_qa_local_deploy_result(version,success,message=""):
+    """Same evidence-based LOCAL_PASS policy as _record_local_deploy_result():
+    computed from the real running image id + real reported version + a real
+    HTTP smoke check, never from the deploy job's return code alone."""
+    artifact=_qa_artifact_for_release(version)
+    if not artifact.get("version"): return
+    contamination=_qa_release_contamination(version)
+    if not success:
+        _qa_update_promotion_state(version,artifact,local_status="FAILED",local_pass=False,local_message=message); return
+    if contamination.get("contaminated"):
+        _qa_update_promotion_state(version,artifact,local_status="FAILED",local_pass=False,
+                                    local_message=f"CONTAMINATED release: {contamination.get('reason')}"); return
+    actual_id=_qa_actual_running_image_id()
+    expected_id=str(artifact.get("image_id") or "")
+    image_ok=bool(expected_id) and actual_id==expected_id
+    version_payload,code=qa_http_json("/api/version",6)
+    actual_version=str(version_payload.get("version") or "")
+    version_ok=code==200 and canonical_version(actual_version)==canonical_version(version)
+    smoke_ok=_qa_http_smoke_ok()
+    local_pass=image_ok and version_ok and smoke_ok
+    reasons=[]
+    if not image_ok: reasons.append(f"running image id {actual_id or 'unknown'} != frozen id {expected_id or 'unknown'}")
+    if not version_ok: reasons.append(f"reported version {actual_version or 'unknown'} != {version}")
+    if not smoke_ok: reasons.append("HTTP smoke check (/api/version) failed")
+    _qa_update_promotion_state(version,artifact,
+        local_status="PASS" if local_pass else "FAILED",local_pass=local_pass,
+        local_message="LOCAL_PASS" if local_pass else "; ".join(reasons),
+        actual_version=actual_version,image_id_verified=image_ok,smoke_ok=smoke_ok,
+        zip_sha_unchanged=True,image_digest_unchanged=image_ok)
+    if local_pass:
+        # Run cleanup only after a successful, verified deployment.
+        try: _qa_cleanup_old_releases("LOCAL_PASS")
+        except Exception as ex: append_log(f"QA release cleanup after LOCAL_PASS failed: {type(ex).__name__}: {ex}")
+
+def qa_local_deploy_update(status,message,**extra):
+    def mutate(s):
+        j=dict(s.get("qa_local_deploy_job") or {});j.update(status=status,message=message,updated_at=now_text(),**extra);s["qa_local_deploy_job"]=j
+    job=update_state(mutate).get("qa_local_deploy_job")
+    if status in DEPLOYMENT_HISTORY_TERMINAL:
+        try:
+            _record_deployment_history("QA_CENTER","LOCAL",version=str((job or {}).get("version") or ""),
+                status=status,message=message,started_at=(job or {}).get("started_at",""),finished_at=now_text(),
+                log_file=(job or {}).get("log_file",""),
+                deployment_id=f"qa-local-{(job or {}).get('version','')}-{(job or {}).get('updated_at','')}")
+        except Exception as ex: append_log(f"Deployment history recording failed (QA local deploy): {type(ex).__name__}: {ex}")
+    return job
+
+def _qa_deploy_from_staging(version,log):
+    """The one shared deploy mechanic, used identically whether this Agent
+    is DEV (staging populated from the workspace artifact) or a target
+    (staging populated by /qa-release/upload): verify checksums -> docker
+    load exact image -> verify digest -> install compose.yml/release.json
+    at QA_HOME -> docker compose up -d --no-build (mesflow-qa-center only)
+    -> health -> version. Never touches mesflow-app, PostgreSQL, or ESP
+    services -- the compose command is scoped to exactly one service name.
+    Raises on any failure; caller records the outcome into its own job key."""
+    root=QA_IMAGE_RELEASES_DIR/version
+    if not (root/"release.json").is_file(): raise RuntimeError(f"STAGED_RELEASE_NOT_FOUND: {root}")
+    rel_version,meta=validate_qa_image_release_contract(root)
+    if canonical_version(rel_version)!=canonical_version(version): raise RuntimeError(f"VERSION_MISMATCH in staged release: {rel_version}")
+    for line in (root/"checksums.txt").read_text(encoding="utf-8").splitlines():
+        parts=line.split(None,1)
+        if len(parts)!=2: continue
+        expected_sha,fname=parts[0].strip(),parts[1].strip()
+        fpath=root/fname
+        if fpath.is_file() and sha(fpath)!=expected_sha:
+            raise RuntimeError(f"CHECKSUM_MISMATCH: {fname}")
+    log.write("Checksums verified\n"); log.flush()
+    tar_path=root/str(meta.get("bundle") or "")
+    if not tar_path.is_file(): raise RuntimeError("IMAGE_BUNDLE_NOT_FOUND")
+    log.write(f"docker load {tar_path.name}\n"); log.flush()
+    r=subprocess.run(["docker","load","-i",str(tar_path)],capture_output=True,text=True,timeout=600)
+    log.write((r.stdout or "")+(r.stderr or "")+"\n"); log.flush()
+    if r.returncode: raise RuntimeError("DOCKER_LOAD_FAILED")
+    expected_id=str(meta.get("image_id") or "")
+    idr=subprocess.run(["docker","image","inspect",str(meta.get("image")),"--format","{{.Id}}"],capture_output=True,text=True,timeout=15)
+    actual_id=idr.stdout.strip()
+    if expected_id and actual_id!=expected_id: raise RuntimeError(f"IMAGE_DIGEST_MISMATCH: expected {expected_id} got {actual_id}")
+    log.write(f"Image verified: {actual_id}\n"); log.flush()
+    QA_HOME.mkdir(parents=True,exist_ok=True)
+    shutil.copy2(root/"compose.yml",QA_HOME/"compose.yml")
+    shutil.copy2(root/"release.json",QA_HOME/"release.json")
+    _migrate_qa_runtime_data_if_needed(log)
+    _qa_takeover_legacy_container_if_needed(log)
+    # existing QA stays up until recreate: `up -d --force-recreate` only
+    # tears the old mesflow-qa-center container down once the new one is
+    # created from the newly-loaded image, so QA Center never goes fully
+    # dark mid-deploy the way a stop-then-start sequence would.
+    log.write(f"docker compose up -d --no-build --force-recreate mesflow-qa-center (image={meta.get('image')})\n"); log.flush()
+    _qa_release_compose(log,["up","-d","--no-build","--force-recreate","mesflow-qa-center"])
+    deadline=time.time()+90; healthy=False; last_seen=""
+    while time.time()<deadline:
+        time.sleep(2)
+        v,code=qa_http_json("/api/version",4)
+        last_seen=f"code={code} version={v.get('version')}"
+        if code==200 and canonical_version(str(v.get("version") or ""))==canonical_version(version):
+            healthy=True; break
+    log.write(f"Health poll: {last_seen} healthy={healthy}\n")
+    if not healthy: raise RuntimeError(f"QA_VERIFY_TIMEOUT: last seen {last_seen}")
+
+def _stage_qa_release_from_workspace_artifact(version):
+    """DEV only: copy the frozen workspace artifact (artifacts/qa-center/
+    releases/<version>, from the immutable build) into this Agent's own
+    local staging (QA_IMAGE_RELEASES_DIR) -- the same staging area a target
+    Agent's /qa-release/upload would populate from a network upload. After
+    this, DEV deploys from staging exactly like every other Agent does."""
+    artifact=_qa_artifact_for_release(version)
+    if not artifact.get("package") or not Path(artifact["package"]).is_file(): raise RuntimeError("PACKAGE_NOT_FOUND")
+    extract=QA_UPLOAD_DIR/f"qa_image_release_{uuid.uuid4().hex}"; extract.mkdir(parents=True)
+    try:
+        safe_extract_zip(Path(artifact["package"]),extract)
+        root=locate_qa_image_release_root(extract)
+        validate_qa_image_release_contract(root)
+        target=QA_IMAGE_RELEASES_DIR/version
+        if target.exists(): shutil.rmtree(target)
+        shutil.copytree(root,target)
+    finally:
+        shutil.rmtree(extract,ignore_errors=True)
+
+def _run_qa_local_deploy(version):
+    """DEV: stage from the workspace artifact, deploy, then record
+    LOCAL_PASS from real evidence (image id, reported version, HTTP smoke)."""
+    qa_local_deploy_update("DEPLOYING",f"Deploying QA Center {version}",version=version,started_at=now_text())
+    log_path=LOG_DIR/f"qa_deploy_{version}_{datetime.now():%Y%m%d_%H%M%S}.log"
+    status="failed"; message=""
+    try:
+        contamination=_qa_release_contamination(version)
+        if contamination.get("contaminated"): raise RuntimeError(f"RELEASE_CONTAMINATED: {contamination.get('reason')}")
+        with log_path.open("w",encoding="utf-8") as log:
+            log.write(f"Deploying QA Center {version} (image-release, --no-build)\n"); log.flush()
+            _stage_qa_release_from_workspace_artifact(version)
+            _qa_deploy_from_staging(version,log)
+        status="success"; message=f"QA {version} deployed and verified"
+    except Exception as e:
+        message=f"{type(e).__name__}: {e}"; append_log(f"QA local deploy failed: {message}")
+    qa_local_deploy_update(status,message,version=version,log_file=str(log_path))
+    try: _record_qa_local_deploy_result(version,status=="success",message)
+    except Exception as ex: append_log(f"QA LOCAL_PASS recording failed: {type(ex).__name__}: {ex}")
+
+def start_qa_local_deploy(version):
+    threading.Thread(target=_run_qa_local_deploy,args=(version,),daemon=True).start()
+
+def qa_target_deploy_update(status,message,**extra):
+    def mutate(s):
+        j=dict(s.get("qa_image_deploy_job") or {});j.update(status=status,message=message,updated_at=now_text(),**extra);s["qa_image_deploy_job"]=j
+    job=update_state(mutate).get("qa_image_deploy_job")
+    if status in DEPLOYMENT_HISTORY_TERMINAL:
+        env={"PRODUCTION_TEST":"TEST","PRODUCTION":"PRODUCTION"}.get(SERVER_ROLE,SERVER_ROLE or "LOCAL")
+        try:
+            _record_deployment_history("QA_CENTER",env,version=str((job or {}).get("version") or ""),
+                status=status,message=message,started_at=(job or {}).get("started_at",""),finished_at=now_text(),
+                log_file=(job or {}).get("log_file",""),
+                deployment_id=f"qa-target-{(job or {}).get('version','')}-{(job or {}).get('updated_at','')}")
+        except Exception as ex: append_log(f"Deployment history recording failed (QA target deploy): {type(ex).__name__}: {ex}")
+    return job
+
+def _run_qa_target_deploy(version):
+    """Target (PRODUCTION_TEST/PRODUCTION): deploy an already-uploaded,
+    staged release. Never touches DEV-only promotion state -- the DEV side
+    records TEST_PASS itself after polling this job to success."""
+    qa_target_deploy_update("running",f"Deploying QA Center {version}",version=version,started_at=now_text())
+    log_path=LOG_DIR/f"qa_target_deploy_{version}_{datetime.now():%Y%m%d_%H%M%S}.log"
+    status="failed"; message=""
+    try:
+        contamination=_qa_release_contamination(version)
+        if contamination.get("contaminated"): raise RuntimeError(f"RELEASE_CONTAMINATED: {contamination.get('reason')}")
+        with log_path.open("w",encoding="utf-8") as log:
+            log.write(f"Deploying QA Center {version} (image-release, --no-build)\n"); log.flush()
+            _qa_deploy_from_staging(version,log)
+        status="success"; message=f"QA {version} deployed and verified"
+    except Exception as e:
+        message=f"{type(e).__name__}: {e}"; append_log(f"QA target deploy failed: {message}")
+    qa_target_deploy_update(status,message,version=version,log_file=str(log_path))
+
+def start_qa_target_deploy(version):
+    threading.Thread(target=_run_qa_target_deploy,args=(version,),daemon=True).start()
+
+# --- QA retention (independent QA_RELEASE_RETENTION policy) --------------
+
+def _qa_release_cleanup_candidates():
+    root=_qa_releases_root()
+    if not root.is_dir(): return []
+    out=[]
+    for d in root.iterdir():
+        if not d.is_dir() or d.name.startswith('.'): continue
+        marker=d/"release.json"
+        try: mtime=marker.stat().st_mtime if marker.is_file() else d.stat().st_mtime
+        except OSError: continue
+        out.append((mtime,d.name))
+    out.sort(reverse=True)
+    return [name for _,name in out]
+
+def _qa_release_cleanup_blockers(version,keep_versions):
+    """Same named-reason policy as _release_cleanup_blockers(), scoped to
+    QA's own current-version/job/promotion state."""
+    if version in keep_versions:
+        return ["WITHIN_RETENTION_WINDOW"]
+    reasons=[]; target=canonical_version(version)
+    try:
+        if target and canonical_version(qa_current_version())==target:
+            reasons.append("CURRENTLY_DEPLOYED")
+    except Exception: pass
+    state=load_state()
+    job=state.get("qa_local_deploy_job") or {}
+    if job.get("status") in ("running","DEPLOYING") and canonical_version(str(job.get("version") or ""))==target:
+        reasons.append("ACTIVE_DEPLOYMENT_JOB")
+    promote_job=state.get("qa_promote_test_job") or {}
+    if promote_job.get("status") in ("QUEUED","UPLOADING","DEPLOYING","VERIFYING") and canonical_version(str(promote_job.get("version") or ""))==target:
+        reasons.append("BEING_PROMOTED")
+    promotion=load_json(QA_PROMOTION_STATE_FILE,{})
+    if canonical_version(str(promotion.get("version") or ""))==target and not (promotion.get("local_pass") and promotion.get("test_pass")):
+        reasons.append("PROMOTION_IN_PROGRESS")
+    return reasons
+
+def _qa_cleanup_old_releases(trigger):
+    """QA's own release retention policy (QA_RELEASE_RETENTION, default 3).
+    Same invariants as _cleanup_old_releases(): never release.json/
+    checksums.txt/PROMOTION.json/image-info.json/BUILD_REPORT.md (the
+    immutable-once guard needs them forever); targeted `docker rmi` only,
+    never `docker system prune`; independent report/state key
+    (qa_release_cleanup_report) so it can never be confused with MESFlow's."""
+    now=time.time()
+    removed=[]; kept=[]; blocked={}; errors=[]; bytes_freed={"value":0}
+    candidates=_qa_release_cleanup_candidates()
+    keep_versions=set(candidates[:QA_RELEASE_RETENTION])
+    image_repo=os.environ.get("MESFLOW_QA_IMAGE_REPOSITORY","mesflow-qa-center")
+    for version in candidates:
+        reasons=_qa_release_cleanup_blockers(version,keep_versions)
+        if reasons:
+            if reasons==["WITHIN_RETENTION_WINDOW"]: kept.append(version)
+            else: blocked[version]=reasons
+            continue
+        root=_qa_release_dir_for(version)
+        for pattern in (f"QACenter_{version}.deploy.zip",f"QACenter_{version}.deploy.zip.sha256"):
+            f=root/pattern
+            if f.is_file():
+                try:
+                    size=f.stat().st_size; f.unlink()
+                    removed.append({"type":"release_zip","version":version,"path":str(f),"bytes":size})
+                    bytes_freed["value"]+=size
+                except OSError as ex: errors.append(f"{f}: {ex}")
+        staging=QA_IMAGE_RELEASES_DIR/version
+        if staging.is_dir():
+            try:
+                size=_dir_size(staging); shutil.rmtree(staging)
+                removed.append({"type":"old_staging","version":version,"path":str(staging),"bytes":size})
+                bytes_freed["value"]+=size
+            except OSError as ex: errors.append(f"{staging}: {ex}")
+        image_tag=f"{image_repo}:{version}"
+        r=_run_capture(["docker","rmi",image_tag],30)
+        if r.get("ok"): removed.append({"type":"docker_image","version":version,"image":image_tag})
+        elif "No such image" not in (r.get("stderr") or ""): errors.append(f"docker rmi {image_tag}: {(r.get('stderr') or '').strip()[:200]}")
+    report={"application":"qa-center","at":now_text(),"trigger":trigger,"retention":QA_RELEASE_RETENTION,
+            "kept":kept,"blocked":blocked,"removed":removed,"bytes_freed":bytes_freed["value"],"errors":errors}
+    def f(s): s["qa_release_cleanup_report"]=report
+    update_state(f)
+    append_log(f"QA release cleanup ({trigger}): removed={len(removed)} kept={len(kept)} blocked={len(blocked)} freed={_bytes(bytes_freed['value'])}"+(f" errors={len(errors)}" if errors else ""))
+    return report
+
+# --- QA Promote Production Test (same remote-agent client as MESFlow) ---
+
+def qa_promote_test_update(status,message,**extra):
+    def mutate(s):
+        j=dict(s.get("qa_promote_test_job") or {});j.update(status=status,message=message,updated_at=now_text(),**extra);s["qa_promote_test_job"]=j
+    job=update_state(mutate).get("qa_promote_test_job")
+    if status in DEPLOYMENT_HISTORY_TERMINAL:
+        try:
+            _record_deployment_history("QA_CENTER","TEST",version=str((job or {}).get("version") or ""),
+                status=status,message=message,started_at=(job or {}).get("started_at",""),finished_at=now_text(),
+                deployment_id=f"qa-promote-test-{(job or {}).get('version','')}-{(job or {}).get('updated_at','')}")
+        except Exception as ex: append_log(f"Deployment history recording failed (QA promote test): {type(ex).__name__}: {ex}")
+    return job
+
+def _run_qa_promote_test(version):
+    try:
+        artifact=_qa_artifact_for_release(version)
+        if not artifact.get("package") or not Path(artifact["package"]).is_file():
+            raise _RemoteAgentError("PACKAGE_NOT_FOUND")
+        contamination=_qa_release_contamination(version)
+        if contamination.get("contaminated"):
+            raise _RemoteAgentError(f"RELEASE_CONTAMINATED: {contamination.get('reason')}")
+        promotion=_qa_load_promotion_state()
+        if promotion.get("version")!=version or not promotion.get("local_pass"):
+            raise _RemoteAgentError("LOCAL_PASS_REQUIRED")
+        url,user,password=_production_test_target()
+        if not url or not password:
+            raise _RemoteAgentError("PRODUCTION_TEST_AGENT_NOT_CONFIGURED: set MESFLOW_PRODUCTION_TEST_AGENT_URL/_USER/_PASSWORD")
+        zip_path=Path(artifact["package"])
+        local_sha=sha(zip_path)
+        if artifact.get("package_sha256") and artifact["package_sha256"]!=local_sha:
+            raise _RemoteAgentError("PACKAGE_SHA_SELF_CHECK_FAILED")
+        opener,base,csrf=_remote_agent_client(url,user,password)
+        target_status=_remote_agent_get_json(opener,base,"/api/status")
+        compat=_agent_compatibility(target_status,QA_REQUIRED_PROMOTION_CAPABILITIES)
+        if compat["status"]=="INCOMPATIBLE":
+            raise _RemoteAgentError(f"TARGET_AGENT_INCOMPATIBLE: {compat['reason']}")
+        if target_status.get("server_role") not in ("PRODUCTION_TEST",):
+            raise _RemoteAgentError(f"TARGET_AGENT_WRONG_ROLE: expected PRODUCTION_TEST, target reports {target_status.get('server_role')!r}")
+        if target_status.get("build_enabled"):
+            raise _RemoteAgentError("TARGET_AGENT_BUILD_ENABLED: Production Test must not have source-build capability")
+        qa_promote_test_update("UPLOADING",f"Uploading {zip_path.name} (sha256={local_sha[:12]}...) to {url}",version=version)
+        _remote_agent_qa_upload(opener,base,csrf,zip_path)
+        qa_promote_test_update("DEPLOYING",f"Deploying QA {version} on target (--no-build)",version=version)
+        _remote_agent_qa_deploy(opener,base,csrf,version)
+        deadline=time.time()+180
+        last={}
+        while time.time()<deadline:
+            time.sleep(3)
+            try: last=_remote_agent_status(opener,base)
+            except Exception as ex: last={"error":str(ex)}; continue
+            job=last.get("qa_image_deploy_job") or {}
+            if job.get("status")=="success" and canonical_version(str(job.get("version") or ""))==canonical_version(version):
+                break
+            if job.get("status")=="failed":
+                raise _RemoteAgentError(f"REMOTE_DEPLOY_FAILED: {job.get('message')}")
+        else:
+            raise _RemoteAgentError(f"REMOTE_DEPLOY_TIMEOUT: last status {last}")
+        qa=(last or {}).get("qa") or {}
+        remote_version=canonical_version(str(qa.get("version") or ""))
+        version_ok=remote_version==canonical_version(version)
+        healthy_ok=bool(qa.get("online"))
+        if not (version_ok and healthy_ok):
+            raise _RemoteAgentError(f"REMOTE_VERIFY_FAILED: version_ok={version_ok} healthy_ok={healthy_ok} qa={qa}")
+        _qa_update_promotion_state(version,artifact,
+            test_status="PASS",test_pass=True,
+            test_message=f"TEST_PASS: remote version={remote_version} healthy={healthy_ok}",
+            test_target=url)
+        qa_promote_test_update("SUCCESS",f"TEST_PASS: QA {version} verified on {url}",version=version)
+        try: _qa_cleanup_old_releases("TEST_PASS")
+        except Exception as ex: append_log(f"QA release cleanup after TEST_PASS failed: {type(ex).__name__}: {ex}")
+    except Exception as exc:
+        code=str(exc) if isinstance(exc,_RemoteAgentError) else f"{type(exc).__name__}: {exc}"
+        try:
+            artifact=_qa_artifact_for_release(version)
+            _qa_update_promotion_state(version,artifact,test_status="FAILED",test_pass=False,test_message=code)
+        except Exception: pass
+        qa_promote_test_update("FAILED",code,error_code=code)
+    finally:
+        if _qa_promote_test_lock.locked(): _qa_promote_test_lock.release()
+
+def start_qa_promote_test(version):
+    if not _qa_promote_test_lock.acquire(False): raise RuntimeError("PROMOTE_TEST_ALREADY_RUNNING")
+    try:
+        qa_promote_test_update("QUEUED","Promote QA to Production Test queued",version=version,started_at=now_text())
+        threading.Thread(target=_run_qa_promote_test,args=(version,),daemon=True).start()
+    except Exception:
+        _qa_promote_test_lock.release(); raise
+
 def _new_recovery_code():
     raw=secrets.token_hex(8).upper()
     return "-".join(raw[i:i+4] for i in range(0,16,4))
@@ -852,6 +2159,11 @@ def ensure_config():
     if configured_password and len(configured_password)<10:
         raise RuntimeError("MESFLOW_AGENT_ADMIN_PASSWORD must contain at least 10 characters")
     if not c.get("secret_key"):c["secret_key"]=secrets.token_urlsafe(48);changed=True
+    # Section 8 (P5): a stable, persisted identity this Agent instance can
+    # report to a control plane -- distinct from agent_version (which many
+    # different real instances legitimately share) and from hostname
+    # (which can change). Generated once, kept forever.
+    if not c.get("agent_instance_id"):c["agent_instance_id"]="agent-"+secrets.token_hex(16);changed=True
     if configured_password:
         if not c.get("password_hash") or not check_password_hash(c["password_hash"],configured_password):
             c["password_hash"]=generate_password_hash(configured_password);c["password_changed_at"]=now_text();changed=True
@@ -875,6 +2187,14 @@ def ensure_config():
         old.write_text(text,encoding="utf-8")
     return c
 app.secret_key=ensure_config()["secret_key"]
+
+def _agent_instance_id():
+    # ensure_config() already ran once at module load (line above) so the
+    # field is guaranteed present by the time any request arrives -- a
+    # lightweight read here, not the full ensure_config() (which also does
+    # password/recovery-code file I/O), avoids adding that cost/any
+    # concurrent-write race to a route that may be polled frequently.
+    return load_json(CONFIG_FILE,{}).get("agent_instance_id","")
 def load_state():return load_json(STATE_FILE,{"job":None,"history":[],"tutorial_job":None,"tutorial_history":[],"esp_tutorial_job":None,"esp_tutorial_history":[],"esp_builder_job":None})
 def update_state(fn):
     with _state_lock:
@@ -882,7 +2202,10 @@ def update_state(fn):
 def logged_in():return bool(session.get("authenticated"))
 @app.before_request
 def protect():
-    if request.endpoint in {"login","forgot_password","local_reset","static","live","health","ota_console","ota_firmware_list","ota_devices","ota_upload_and_flash","ota_job_status","ota_jobs","ota_cancel_job","ota_device_check","ota_device_download","ota_device_event"}:return None
+    if request.endpoint in {"login","forgot_password","local_reset","static","live","health","ota_console","kiosk_ota_page","ota_firmware_list","ota_devices","ota_upload_and_flash","ota_job_status","ota_jobs","ota_cancel_job","ota_device_check","ota_device_download","ota_device_event","api_ops_summary","api_ops_docker","api_ops_logs","api_incidents","api_incident_detail","api_ops_predictions","api_ops_metric_trend","api_incident_ai_analysis","api_incident_notifications","api_notification_channels",
+        "api_ops_db_summary","api_ops_db_backups","api_ops_db_backup_detail","api_ops_restore_drills","api_ops_storage","api_ops_storage_retention_preview","api_ops_db_audit",
+        "api_servers_list","api_server_detail","api_server_health","api_server_storage","api_server_backups","api_server_incidents","api_fleet_summary","api_releases",
+        "api_recovery_services","api_recovery_service_detail","api_recovery_service_logs","api_recovery_service_ports","api_recovery_preflight","api_recovery_system_check","api_recovery_diagnose","api_recovery_audit"}:return None
     if not logged_in():return redirect(url_for("login",next=f"{request.script_root}{request.path}"))
 def verify_csrf():
     supplied=request.form.get("csrf","") or request.headers.get("X-CSRF-Token","")
@@ -909,44 +2232,18 @@ def safe_extract_zip(z,d):
             if d not in target.parents and target!=d:raise ValueError("ZIP contains unsafe path")
         a.extractall(d)
 def locate_root(e):
+    # Legacy pre-Docker "install/deploy_release.py" shape removed alongside
+    # the legacy source-ZIP upload UI/routes -- every current caller (Deploy
+    # Local, /upload's machine-to-machine artifact transfer) always deals in
+    # the image-release contract (compose.yml + release.json) exclusively.
     c=[]
     if (e/"VERSION.txt").is_file():c.append(e)
     c += [x for x in e.iterdir() if x.is_dir() and (x/"VERSION.txt").is_file()]
     if len(c)!=1:raise ValueError("ZIP must contain exactly one release root")
     r=c[0]
-    docker_release=(r/"compose.yml").is_file() and (r/"release.json").is_file()
-    legacy_release=(r/"install/deploy_release.py").is_file() and (r/"requirements.txt").is_file()
-    if not (docker_release or legacy_release):
-        raise ValueError("Release must contain compose.yml + release.json (Linux Docker) or legacy install/deploy_release.py")
+    if not ((r/"compose.yml").is_file() and (r/"release.json").is_file()):
+        raise ValueError("Release must contain compose.yml + release.json (Linux Docker image release)")
     return r
-def validate_mes_release_contract(root):
-    """Validate the portable MESFlow package contract before it enters releases."""
-    root=Path(root)
-    if not (root/"compose.yml").is_file():
-        raise ValueError("MESFlow package is missing compose.yml")
-    manifest=root/"release.json"
-    if not manifest.is_file():
-        raise ValueError("MESFlow package is missing release.json")
-    try: meta=json.loads(manifest.read_text(encoding="utf-8-sig"))
-    except json.JSONDecodeError as ex: raise ValueError(f"Invalid release.json: {ex.msg}") from ex
-    if not isinstance(meta,dict): raise ValueError("release.json must be a JSON object")
-    version=norm((root/"VERSION.txt").read_text(encoding="utf-8-sig"))
-    manifest_version=norm(str(meta.get("version", "")))
-    if canonical_version(manifest_version)!=canonical_version(version):
-        raise ValueError(f"VERSION.txt ({version}) does not match release.json ({manifest_version})")
-    if str(meta.get("name","")).strip().lower()!="mesflow":
-        raise ValueError("release.json name must be MESFlow")
-    promotion=load_json(root/"PROMOTION.json",{}) if (root/"PROMOTION.json").is_file() else {}
-    if promotion:
-        if not isinstance(promotion,dict): raise ValueError("PROMOTION.json must be a JSON object")
-        promoted_version=canonical_version(promotion.get("version"))
-        if promoted_version != canonical_version(version):
-            raise ValueError(f"PROMOTION.json version ({promoted_version}) does not match VERSION.txt ({version})")
-        declared_hash=str(promotion.get("sha256") or "").strip().lower()
-        if declared_hash and not re.fullmatch(r"[0-9a-f]{64}",declared_hash):
-            raise ValueError("PROMOTION.json sha256 must be 64 lowercase hexadecimal characters")
-    return version,meta
-
 def validate_image_release_contract(root):
     root=Path(root)
     required=("VERSION.txt","release.json","compose.yml","checksums.txt","PROMOTION.json")
@@ -961,6 +2258,34 @@ def validate_image_release_contract(root):
     promotion=json.loads((root/"PROMOTION.json").read_text(encoding="utf-8-sig"))
     if promotion.get("version") and canonical_version(str(promotion["version"])) != canonical_version(version): raise ValueError("PROMOTION version mismatch")
     return version,meta
+
+QA_IMAGE_RELEASE_TYPE="qa-center-image-release"
+def locate_qa_image_release_root(e):
+    """Same shape rule as locate_root(), for a QA Center image-release ZIP
+    (built by qa-center/scripts/build-release.sh) -- exactly one root
+    carrying VERSION + compose.yml + release.json."""
+    c=[]
+    if (e/"VERSION").is_file(): c.append(e)
+    c += [x for x in e.iterdir() if x.is_dir() and (x/"VERSION").is_file()]
+    if len(c)!=1: raise ValueError("QA release ZIP must contain exactly one root with VERSION")
+    r=c[0]
+    if not ((r/"compose.yml").is_file() and (r/"release.json").is_file()):
+        raise ValueError("QA image release must contain compose.yml + release.json")
+    return r
+def validate_qa_image_release_contract(root):
+    root=Path(root)
+    required=("VERSION","release.json","compose.yml","checksums.txt","PROMOTION.json")
+    missing=[x for x in required if not (root/x).is_file()]
+    if missing: raise ValueError("QA image release missing: "+", ".join(missing))
+    meta=json.loads((root/"release.json").read_text(encoding="utf-8-sig"))
+    version=norm((root/"VERSION").read_text(encoding="utf-8-sig"))
+    if meta.get("type") != QA_IMAGE_RELEASE_TYPE: raise ValueError("release.json type must be qa-center-image-release")
+    if canonical_version(str(meta.get("version",""))) != canonical_version(version): raise ValueError("QA image release version mismatch")
+    image=str(meta.get("image") or "").strip(); digest=str(meta.get("image_digest") or "").strip()
+    if not image or not re.fullmatch(r"sha256:[0-9a-f]{64}",digest): raise ValueError("QA image release requires image and image_digest")
+    promotion=json.loads((root/"PROMOTION.json").read_text(encoding="utf-8-sig"))
+    if promotion.get("version") and canonical_version(str(promotion["version"])) != canonical_version(version): raise ValueError("QA PROMOTION version mismatch")
+    return version,meta
 def norm(v):
     v=v.strip()
     if not v or len(v)>64 or any(ch not in set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-") for ch in v):raise ValueError("Invalid version")
@@ -969,11 +2294,36 @@ def canonical_version(v):
     # Compare deploy/runtime versions without harmless formatting differences.
     # Keep every numeric component: 65.8.44.7 must NOT equal 65.8.44.
     return str(v or "").strip().lstrip("Vv").strip()
-def sha(p):
+def _hash_file_sha256(p):
     h=hashlib.sha256()
     with p.open("rb") as f:
         for b in iter(lambda:f.read(1048576),b""):h.update(b)
     return h.hexdigest()
+_SHA_CACHE_LOCK=threading.Lock(); _SHA_CACHE={}  # str(path) -> (mtime_ns, size, hexdigest)
+def sha(p):
+    # Release Tab Performance Fix follow-up (reports/DEPLOY_AGENT_REFRESH_PERFORMANCE_FIX.md):
+    # release artifacts here are real 70-500+MB ZIPs (MESFlow/QA Center
+    # deploy packages). _release_summary()/_qa_release_summary() call this
+    # on EVERY page load of the Release & Deploy tab purely to display the
+    # already-built artifact's digest -- re-hashing hundreds of MB just to
+    # show the same unchanged value was the single most expensive thing
+    # that page did. Cached by (mtime_ns, size): any real change to the
+    # file (a fresh build overwrites it) gives it a different mtime/size,
+    # which invalidates the cache automatically -- a changed file is
+    # always re-hashed. This never returns a digest that doesn't match
+    # the file's current bytes, so authoritative deploy-time verification
+    # elsewhere (which compares against a freshly-read local hash) is not
+    # weakened by this cache either.
+    p=Path(p)
+    try: st=p.stat()
+    except OSError: return _hash_file_sha256(p)
+    key=str(p)
+    with _SHA_CACHE_LOCK:
+        cached=_SHA_CACHE.get(key)
+        if cached and cached[0]==st.st_mtime_ns and cached[1]==st.st_size: return cached[2]
+    digest=_hash_file_sha256(p)
+    with _SHA_CACHE_LOCK: _SHA_CACHE[key]=(st.st_mtime_ns,st.st_size,digest)
+    return digest
 def tail(p,n=200):
     try:return "\n".join(Path(p).read_text(encoding="utf-8",errors="replace").splitlines()[-n:])
     except OSError:return ""
@@ -1008,11 +2358,44 @@ def _http_json_base(base,path,timeout=4):
     except Exception as e:
         return {"ok":False,"error":str(e),"_agent_base_url":base},0
 
+# Real bug found+fixed live (reports/RELEASE_PAGE_PERFORMANCE_AUDIT.md): when
+# this Agent's container is not on the same Docker network as the MESFlow
+# container, resolving MES_URL's hostname (e.g. `mesflow-app`) fails with
+# glibc's resolver EAI_AGAIN -- which takes ~5s per attempt and, critically,
+# is NOT bounded by urlopen's `timeout=` parameter (that only covers the
+# socket connect/read stage, which never starts if DNS resolution itself
+# hangs). mes_status() alone makes 3 independent http_json() calls per
+# Release page load (version/health/ready), each re-walking the candidate
+# list from scratch -- measured 15.2s for mes_status() alone, ~99% of the
+# Release page's entire load time, on every single page load. A given base
+# URL's reachability does not change from one call to the next within a few
+# seconds, so remembering a fresh connection-level failure (HTTP status
+# code 0 -- DNS/connect/timeout, as opposed to a real HTTP error response)
+# for a short window is safe and turns 3 full 5s DNS stalls per page load
+# into at most one.
+_MES_BASE_UNREACHABLE_LOCK=threading.Lock()
+_MES_BASE_UNREACHABLE={}  # base_url -> monotonic() timestamp of last connection-level failure
+_MES_BASE_UNREACHABLE_TTL=45
+
+def _mes_base_recently_unreachable(base):
+    with _MES_BASE_UNREACHABLE_LOCK:
+        ts=_MES_BASE_UNREACHABLE.get(base)
+    return ts is not None and (time.monotonic()-ts)<_MES_BASE_UNREACHABLE_TTL
+
+def _mark_mes_base_reachability(base,code):
+    with _MES_BASE_UNREACHABLE_LOCK:
+        if code: _MES_BASE_UNREACHABLE.pop(base,None)  # any real HTTP response (even an error status) proves the network path works
+        else: _MES_BASE_UNREACHABLE[base]=time.monotonic()
+
 def http_json(path,timeout=4):
     last=({"ok":False,"error":"No MES URL candidates"},0)
     first_http_error=None
     for base in _mes_url_candidates():
+        if _mes_base_recently_unreachable(base):
+            last=({"ok":False,"error":"UNREACHABLE_CACHED","_agent_base_url":base},0)
+            continue
         payload,code=_http_json_base(base,path,timeout)
+        _mark_mes_base_reachability(base,code)
         last=(payload,code)
         if code==200:
             return payload,code
@@ -1066,13 +2449,31 @@ def _classify_health(payload, http_status):
 
 def mes_status():
     docker_state=_docker_mes_state()
-    v,vs=http_json("/api/system/version");h,hs=http_json("/api/system/health")
-    # /api/system/ready exposes the real applied Alembic head (migration_head).
-    # Deliberately not health_payload's schema_version, an app-defined label
-    # that looks like a version string -- see AGENTS.md: never infer schema
-    # from the app version. Read-only, best-effort: absence must never make
-    # mes_status() itself fail.
-    ready,readys=http_json("/api/system/ready")
+    # Live-verified follow-up (reports/DEPLOY_AGENT_REFRESH_PERFORMANCE_FIX.md):
+    # on a host where mesflow-app is genuinely stopped, these 3 http_json()
+    # calls each cascade through up to 5 URL candidates (MES_URL, both
+    # 127.0.0.1 schemes, both localhost schemes) before giving up -- measured
+    # 15s total for this one function alone. When docker_state already
+    # confirms (available=True, i.e. `docker compose ps` itself succeeded)
+    # that the required services are NOT running, no HTTP candidate could
+    # possibly succeed either -- skipping the probe changes nothing about
+    # the correct answer, only how long it takes to reach it. When Docker
+    # state is unavailable/ambiguous (Windows runtime, no compose.yml, a
+    # bare-process install) this still falls through to the full probe
+    # exactly as before -- that's the only path able to detect a
+    # non-Docker MESFlow at all.
+    docker_confirmed_not_running=docker_state.get("available") and not docker_state.get("running")
+    if docker_confirmed_not_running:
+        offline=({"ok":False,"error":"MESFLOW_CONTAINER_NOT_RUNNING"},0)
+        v,vs=offline;h,hs=offline;ready,readys=offline
+    else:
+        v,vs=http_json("/api/system/version");h,hs=http_json("/api/system/health")
+        # /api/system/ready exposes the real applied Alembic head (migration_head).
+        # Deliberately not health_payload's schema_version, an app-defined label
+        # that looks like a version string -- see AGENTS.md: never infer schema
+        # from the app version. Read-only, best-effort: absence must never make
+        # mes_status() itself fail.
+        ready,readys=http_json("/api/system/ready")
     migration_head=str(ready.get("migration_head") or "") if readys==200 else ""
     health_state=_classify_health(h,hs)
     api_online=(vs==200)
@@ -1275,8 +2676,8 @@ def process_alive(pid):
 
 def start_mes(log):
     if os.name!="nt" and (TARGET_HOME/"compose.yml").is_file():
-        _docker_compose(log,["up","-d","--build","postgres","mesflow"],check=True,timeout=900)
-        log.write("MES Docker stack started\n");log.flush()
+        _docker_compose(log,["up","-d","--no-build","--no-deps","mesflow"],check=True,timeout=300)
+        log.write("MES application started from an existing image; PostgreSQL unchanged\n");log.flush()
         return None
     python_exe=TARGET_HOME/".venv/Scripts/python.exe"
     current=TARGET_HOME/"app/current"
@@ -1409,6 +2810,9 @@ def _stage_linux_release(release, log):
     if image_mode:
         log.write("IMAGE RELEASE MODE: source build disabled\n");log.flush()
         image_ref=_verify_and_prepare_image_release(release,image_meta,log)
+    else:
+        _require_local_source_build("MESFlow")
+        log.write("LEGACY LOCAL SOURCE BUILD: DEV only; promotion targets require an immutable image release\n");log.flush()
     log.write("COMPOSE VALIDATION START\n"); log.flush()
     _compose_at(stage,log,["config","--quiet"],timeout=COMPOSE_VALIDATE_TIMEOUT,env_extra={"MESFLOW_IMAGE":image_ref} if image_ref else None)
     log.write("COMPOSE VALIDATION DONE\nBUILD START\nBUILD IMAGE mesflow\n"); log.flush()
@@ -1554,7 +2958,7 @@ def run_job(version, dry_run=False):
             if os.name!="nt" and (release/"compose.yml").is_file():
                 set_job_phase("validating","Validating compose, package contract and migration chain")
                 set_step("stage","running","Staging release; production remains online")
-                set_job_phase("building","Building MESFlow image; this can take several minutes")
+                set_job_phase("validating", "Verifying immutable image artifact" if release_meta.get("type")==IMAGE_RELEASE_TYPE else "Legacy DEV/LOCAL source build")
                 stage=_stage_linux_release(release,log)
                 set_step("stage","success",f"Validated stage: {stage}")
                 if dry_run:
@@ -1631,7 +3035,21 @@ def run_job(version, dry_run=False):
         j=s.get("job") or {};j.update(status=status,phase=status,finished_at=now_text(),return_code=rc,message=message,rolled_back_to=rolled)
         j.setdefault("transitions",[]).append({"status":status,"at":now_text(),"message":message})
         s["job"]=j;s.setdefault("history",[]).insert(0,dict(j));s["history"]=s["history"][:50]
-    try:update_state(done);append_log(f"Deploy finished status={status}: {message}")
+    try:
+        final_job=update_state(done).get("job") or {}
+        append_log(f"Deploy finished status={status}: {message}")
+        try:
+            # This same worker runs both DEV's own "Deploy Local" trigger and
+            # a TEST/PRODUCTION target's receiving-side auto-deploy after
+            # /upload -- each Agent only ever has its OWN state, so the
+            # environment this deploy actually represents is this Agent's own
+            # SERVER_ROLE, not a hardcoded "LOCAL" (matching the QA-side hook).
+            env={"PRODUCTION_TEST":"TEST","PRODUCTION":"PRODUCTION"}.get(SERVER_ROLE,SERVER_ROLE or "LOCAL")
+            _record_deployment_history("MESFLOW",env,version=final_job.get("version",""),from_version=final_job.get("from_version",""),
+                status=final_job.get("status",""),message=final_job.get("message",""),started_at=final_job.get("started_at",""),
+                finished_at=final_job.get("finished_at",""),deployment_id=final_job.get("deployment_id",""),
+                log_file=final_job.get("log_file",""),rolled_back_to=final_job.get("rolled_back_to"),steps=final_job.get("steps"))
+        except Exception as ex: append_log(f"Deployment history recording failed: {type(ex).__name__}: {ex}")
     finally:
         if stage and Path(stage).exists(): shutil.rmtree(stage,ignore_errors=True)
         DEPLOY_LOCK_FILE.unlink(missing_ok=True)
@@ -1673,6 +3091,43 @@ def start_deploy(v, dry_run=False):
         _job_lock.release()
         raise
 
+# Every job-tracking key in state.json represents work done by a background
+# thread of a PREVIOUS process. In-memory locks (_job_lock, _tutorial_job_
+# lock, ...) always reset to unlocked on a fresh process start, but only the
+# MESFlow "job" key has ever self-healed its persisted status to match (see
+# _mark_stale_job_interrupted(), called lazily from job_running()). Every
+# other job type left in a non-terminal status by a crash/restart/redeploy
+# mid-flight stays stuck showing "running"/"BUILDING"/"UPLOADING"/... in the
+# UI forever -- a real incident found live: tutorial_job sat at
+# status="running" for 3+ days after an earlier restart, permanently
+# rendering "Đang quay, lồng tiếng và publish video hướng dẫn" on the
+# Release Deploy tab with no indication anything was wrong. This runs once,
+# synchronously, before the Agent serves any request.
+_ORPHANABLE_JOB_KEYS=("job","qa_job","tutorial_job","esp_tutorial_job","esp_builder_job",
+    "release_build_job","promote_test_job","agent_update_job","agent_package_build_job",
+    "qa_release_build_job","qa_local_deploy_job","qa_promote_test_job","qa_image_deploy_job")
+_JOB_TERMINAL_STATUSES={"success","SUCCESS","failed","FAILED","rolled_back","ROLLED_BACK",
+    "interrupted","INTERRUPTED","warning","WARNING"}
+
+def reconcile_orphaned_jobs_on_startup():
+    reconciled=[]
+    def f(s):
+        for key in _ORPHANABLE_JOB_KEYS:
+            j=s.get(key)
+            if not isinstance(j,dict) or not j: continue
+            old_status=j.get("status")
+            if str(old_status or "") in _JOB_TERMINAL_STATUSES: continue
+            j=dict(j)
+            j.update(status="INTERRUPTED",
+                message=f"Interrupted by Agent restart (was {old_status!r}) -- no worker thread from a previous process can still be running.",
+                finished_at=now_text())
+            s[key]=j
+            reconciled.append((key,old_status))
+    update_state(f)  # cheap no-op (one JSON read+write) when nothing is stale
+    for key,old_status in reconciled:
+        append_log(f"Startup reconciliation: {key} was stuck at status={old_status!r}, marked INTERRUPTED")
+    return reconciled
+
 def recover_interrupted_deploy():
     """Recover a process crash after CUTOVER using the durable transaction journal."""
     tx=load_json(DEPLOY_TX_FILE,{})
@@ -1701,16 +3156,6 @@ def recover_interrupted_deploy():
         _save_deploy_tx(status="rollback_failed",phase="ROLLBACK_FAILED",error=str(ex),finished_at=now_text())
         append_log(f"ROLLBACK FAILED after Agent restart: {ex}"); return False
     finally: DEPLOY_LOCK_FILE.unlink(missing_ok=True)
-
-def locate_qa_root(e):
-    c=[]
-    if (e/"VERSION").is_file(): c.append(e)
-    c += [x for x in e.iterdir() if x.is_dir() and (x/"VERSION").is_file()]
-    if len(c)!=1: raise ValueError("QA ZIP must contain exactly one root with VERSION")
-    r=c[0]
-    for q in (r/"agent.py", r/"requirements.txt", r/"templates"):
-        if not q.exists(): raise ValueError(f"Missing QA file/folder: {q.relative_to(r)}")
-    return r
 
 def _qa_source_dir():
     current=QA_HOME/"current"
@@ -1765,28 +3210,28 @@ def _qa_service_state():
         return {"active":False,"pid":0}
 
 def qa_status():
-    v,code=qa_http_json("/api/version",3)
-    actual=str(v.get("version") or qa_current_version())
+    # Live-verified follow-up (reports/DEPLOY_AGENT_REFRESH_PERFORMANCE_FIX.md):
+    # when QA_URL's hostname doesn't resolve/connect (QA Center stopped),
+    # qa_http_json() alone measured ~5s (DNS retry + connect timeout). On
+    # Linux, _qa_service_state() (docker inspect / systemctl -- both local,
+    # no network) gives an authoritative "is it even running" answer first;
+    # skip the network probe when it says no, since nothing could be
+    # listening anyway. Windows has no reliable local check here yet
+    # (_qa_service_state() is a stub there, always "active":False), so that
+    # path always falls through to the real probe exactly as before.
     svc=_qa_service_state()
+    if os.name!="nt" and not svc.get("active"):
+        v,code=({"ok":False,"error":"QA_CENTER_NOT_RUNNING"},0)
+    else:
+        v,code=qa_http_json("/api/version",3)
+    actual=str(v.get("version") or qa_current_version())
     return {"online": code==200 and bool(v.get("ok",True)), "version":actual, "payload":v, "port":QA_PORT, "home":str(QA_HOME), "service_active":svc.get("active",False), "service_pid":svc.get("pid",0)}
 
-def list_qa_releases():
-    out=[]
-    for x in QA_RELEASES_DIR.iterdir():
-        if x.is_dir() and not x.name.startswith('.'):
-            m=load_json(x/"agent_manifest.json",{})
-            out.append({"version":x.name,"uploaded_at":m.get("uploaded_at",""),"source_name":m.get("source_name","")})
-    return sorted(out,key=lambda z:z["uploaded_at"],reverse=True)
 
 def qa_job_running():
     j=(load_state().get("qa_job") or {})
     return j.get("status")=="running"
 
-def set_qa_step(name,status,message=""):
-    def f(st):
-        j=st.get("qa_job") or {}; steps=j.setdefault("steps",{})
-        steps[name]={"status":status,"message":message,"at":now_text()}; j["message"]=message or name; st["qa_job"]=j
-    update_state(f)
 
 def _qa_runtime_signature(source: Path) -> str:
     manifest=source/"docker"/"runtime-manifest.json"
@@ -1845,6 +3290,8 @@ def _qa_docker_stop(log=None):
     _qa_compose(["stop","mesflow-qa-center"],log=log,check=False,timeout=60)
 
 def _qa_docker_start(log=None, build=True):
+    if build:
+        _require_local_source_build("QA Center")
     args=["up","-d"]
     if build:
         args.append("--build")
@@ -1861,9 +3308,22 @@ def _qa_docker_start(log=None, build=True):
     return 0
 
 def _stop_qa(timeout=30):
+    # Real bug found+fixed while wiring the new "QA Center" service card
+    # (reports/RELEASE_DEPLOY_UX_CLEANUP.md): the current Build-Once image
+    # release installs to QA_HOME/compose.yml (see _qa_deploy_from_staging),
+    # never to the legacy QA_HOME/current/docker/compose.yml that
+    # _qa_docker_stop()/_qa_docker_start() (below) target. Route the current
+    # layout through _qa_release_compose (same mechanism the real deploy
+    # path uses); fall back to the legacy helper only for a pre-migration
+    # install that still has the old layout on disk.
     end=time.time()+timeout
     if RUNTIME_MODE=="docker-linux":
-        _qa_docker_stop()
+        if (QA_HOME/"compose.yml").is_file():
+            log_path=LOG_DIR/f"qa_stop_{datetime.now():%Y%m%d_%H%M%S}.log"
+            with log_path.open("w",encoding="utf-8") as log:
+                _qa_release_compose(log,["stop","mesflow-qa-center"],check=False,timeout=60)
+        else:
+            _qa_docker_stop()
         return
     if os.name!="nt":
         subprocess.run(["systemctl","stop","mesflow-qa-center.service"],capture_output=True,text=True,timeout=20)
@@ -1930,6 +3390,14 @@ WantedBy=multi-user.target
     subprocess.run(["systemctl","enable","mesflow-qa-center.service"],check=True,capture_output=True,text=True,timeout=20)
 
 def _start_qa(log=None, build=True):
+    # See _stop_qa() comment: current image-release installs never populate
+    # QA_HOME/current/agent.py, so the old unconditional entry-file check
+    # below (kept for the legacy pre-migration layout) must not run first.
+    if RUNTIME_MODE=="docker-linux" and (QA_HOME/"compose.yml").is_file():
+        log_path=LOG_DIR/f"qa_start_{datetime.now():%Y%m%d_%H%M%S}.log"
+        with log_path.open("w",encoding="utf-8") as l:
+            _qa_release_compose(l,["up","-d","--no-build","--force-recreate","mesflow-qa-center"])
+        return 0
     current=QA_HOME/"current"; entry=current/"agent.py"
     if not entry.is_file(): raise RuntimeError(f"Missing QA entry: {entry}")
     if RUNTIME_MODE=="docker-linux":
@@ -1978,82 +3446,6 @@ def _wait_qa(version,timeout=None,pid=None):
     extra=_qa_docker_log_tail(80) if RUNTIME_MODE=="docker-linux" else tail(QA_LOG,80)
     raise RuntimeError(f"QA Center verify timeout. Last response: {last}. Log tail:\n{extra}")
 
-def _preserve_qa_data(old_current,new_current):
-    # Keep operator configuration and reports across QA upgrades, including legacy root installs.
-    if not old_current.is_dir(): return
-    for name in ("config.json","reports","runtime"):
-        src=old_current/name; dst=new_current/name
-        if not src.exists(): continue
-        if dst.exists(): shutil.rmtree(dst) if dst.is_dir() else dst.unlink()
-        shutil.copytree(src,dst) if src.is_dir() else shutil.copy2(src,dst)
-
-def run_qa_job(version):
-    release=QA_RELEASES_DIR/version; logpath=LOG_DIR/f"qa_deploy_{version}_{datetime.now():%Y%m%d_%H%M%S}.log"; before=qa_current_version()
-    def begin(st): st["qa_job"]={"type":"qa_deploy","version":version,"from_version":before,"status":"running","started_at":now_text(),"finished_at":None,"log_file":str(logpath),"message":"Starting","steps":{}}
-    update_state(begin); append_log(f"QA deploy {before} -> {version}")
-    status="failed"; message=""; rc=-1; rolled=""
-    current=QA_HOME/"current"; previous=QA_HOME/"previous"; staging=QA_HOME/f"staging_{uuid.uuid4().hex[:8]}"
-    old_source=_qa_source_dir()
-    old_runtime_sig=_qa_runtime_signature(old_source) if old_source.is_dir() else ""
-    new_runtime_sig=_qa_runtime_signature(release)
-    runtime_image_ready=_qa_runtime_image_exists(old_source) if old_source.is_dir() else False
-    fast_deploy=bool(old_runtime_sig and new_runtime_sig and old_runtime_sig==new_runtime_sig and runtime_image_ready)
-    try:
-        with logpath.open("a",encoding="utf-8") as log:
-            set_qa_step("stop","skipped","Blue/green-style source staging; existing QA stays up until recreate")
-            set_qa_step("backup","running","Backing up current QA Center")
-            if previous.exists(): shutil.rmtree(previous,ignore_errors=True)
-            if old_source.is_dir() and (old_source/"agent.py").is_file():
-                ignore=shutil.ignore_patterns(".venv","current","previous","staging_*","qa_process.json","__pycache__",".pytest_cache")
-                shutil.copytree(old_source,previous,ignore=ignore)
-            set_qa_step("backup","success",f"Backup: {before}")
-            set_qa_step("install","running","Installing QA release and dependencies")
-            shutil.copytree(release,staging,ignore=shutil.ignore_patterns("agent_manifest.json","__pycache__",".pytest_cache"))
-            _preserve_qa_data(old_source,staging)
-            if RUNTIME_MODE!="docker-linux":
-                _ensure_qa_venv(staging,log)
-            if current.exists(): shutil.rmtree(current)
-            staging.replace(current)
-            set_qa_step("install","success",f"Installed QA {version}")
-            set_qa_step("start","running","Fast recreate" if fast_deploy else "Building runtime and starting QA Center")
-            pid=_start_qa(log,build=not fast_deploy)
-            set_qa_step("start","success","FAST DEPLOY" if fast_deploy else f"Runtime rebuilt; PID {pid}")
-            set_qa_step("health","running","Verifying /api/version")
-            _wait_qa(version,pid=pid); set_qa_step("health","success",f"QA {version} healthy")
-            set_qa_step("rollback","skipped","Not required")
-            status="success"; message=f"QA deployment verified: {version}"; rc=0
-    except Exception as ex:
-        message=str(ex); append_log(f"QA deploy failed: {ex}")
-        try:
-            if staging.exists(): shutil.rmtree(staging,ignore_errors=True)
-            if previous.is_dir():
-                set_qa_step("rollback","running","Restoring previous QA Center")
-                _stop_qa()
-                if current.exists(): shutil.rmtree(current,ignore_errors=True)
-                shutil.copytree(previous,current)
-                with logpath.open("a",encoding="utf-8") as log:
-                    if RUNTIME_MODE!="docker-linux":
-                        _ensure_qa_venv(current,log)
-                    rollback_build=not _qa_runtime_image_exists(current)
-                    pid=_start_qa(log,build=rollback_build); _wait_qa(before,pid=pid)
-                rolled=before; set_qa_step("rollback","success",f"Rolled back to {before}")
-                message += f"; rolled back to {before}"
-        except Exception as re: message += f"; rollback failed: {re}"
-    def done(st):
-        j=st.get("qa_job") or {}; j.update(status=status,finished_at=now_text(),return_code=rc,message=message,rolled_back_to=rolled); st["qa_job"]=j; st.setdefault("qa_history",[]).insert(0,dict(j)); st["qa_history"]=st["qa_history"][:50]
-    update_state(done); append_log(f"QA deploy finished status={status}: {message}")
-    if _qa_job_lock.locked(): _qa_job_lock.release()
-
-def start_qa_deploy(version):
-    if not HOST_OPS_ENABLED and RUNTIME_MODE!="docker-linux":
-        raise RuntimeError("QA deployment is disabled in this runtime")
-    if not (QA_RELEASES_DIR/version).is_dir(): raise FileNotFoundError("QA release not found")
-    if qa_job_running(): raise RuntimeError("QA deployment is already running")
-    if not _qa_job_lock.acquire(False): raise RuntimeError("Another QA deployment is running")
-    try: threading.Thread(target=run_qa_job,args=(version,),daemon=True).start()
-    except Exception:
-        _qa_job_lock.release(); raise
-
 def _password_valid(value):
     return len(value or "")>=10
 def _set_password(new_password):
@@ -2061,9 +3453,36 @@ def _set_password(new_password):
     c=ensure_config();c["password_hash"]=generate_password_hash(new_password);c["password_changed_at"]=now_text();save_json(CONFIG_FILE,c)
     (CONFIG_DIR/"FIRST_LOGIN.txt").unlink(missing_ok=True)
     append_log("Administrator password reset")
+def _docker_bridge_gateway():
+    """This container's own default-route gateway IP (Linux only). A host
+    browser hitting a `docker run/compose -p 127.0.0.1:PORT:PORT`
+    published port is source-NAT'd on the hairpin path -- the connection
+    arrives here appearing to come FROM that gateway address, never from
+    literal 127.0.0.1. Read live from /proc/net/route (never hardcoded,
+    varies per Docker network); returns "" if undeterminable."""
+    try:
+        with open("/proc/net/route",encoding="ascii") as f:
+            next(f)  # header line
+            for line in f:
+                fields=line.split()
+                if len(fields)>=3 and fields[1]=="00000000":  # destination 0.0.0.0 = default route
+                    hex_gw=fields[2]
+                    return ".".join(str(int(hex_gw[i:i+2],16)) for i in (6,4,2,0))
+    except (OSError,ValueError,StopIteration):
+        pass
+    return ""
 def _is_local_reset_request():
     host=(request.host or "").split(":",1)[0].strip("[]").lower()
-    return request.remote_addr in {"127.0.0.1","::1"} and host in {"127.0.0.1","localhost","::1"}
+    if host not in {"127.0.0.1","localhost","::1"}:return False
+    remote=request.remote_addr
+    if remote in {"127.0.0.1","::1"}:return True
+    # Docker NAT hairpin (see _docker_bridge_gateway docstring) -- only
+    # trust this when it matches THIS container's own live-read gateway,
+    # so it can't be spoofed by guessing a common private IP.
+    if RUNTIME_MODE=="docker-linux":
+        gateway=_docker_bridge_gateway()
+        if gateway and remote==gateway:return True
+    return False
 @app.route("/login",methods=["GET","POST"])
 def login():
     if request.method=="POST":
@@ -2488,9 +3907,11 @@ def publish_esp_tutorial(zip_path,source_name):
 
 @app.post("/esp-kiosk-tutorial/upload")
 def esp_tutorial_upload():
+    # Redirect target moved from the Release page's #espTutorialCard anchor
+    # to the dedicated ESP Kiosk Tutorial page (task: ESP_KIOSK_UI_SEPARATION).
     verify_csrf();upload=request.files.get("tutorial_zip")
-    if not upload or not upload.filename: flash("Hãy chọn ZIP tutorial ESP Kiosk","error");return redirect(url_for("index"))
-    if not upload.filename.lower().endswith(".zip"): flash("Chỉ chấp nhận file ZIP","error");return redirect(url_for("index"))
+    if not upload or not upload.filename: flash("Hãy chọn ZIP tutorial ESP Kiosk","error");return redirect(url_for("kiosk_tutorial_page"))
+    if not upload.filename.lower().endswith(".zip"): flash("Chỉ chấp nhận file ZIP","error");return redirect(url_for("kiosk_tutorial_page"))
     saved=ESP_TUTORIAL_UPLOAD_DIR/f"{uuid.uuid4().hex}_{secure_filename(upload.filename)}"
     try:
         upload.save(saved);version=publish_esp_tutorial(saved,upload.filename);flash(f"Đã publish video ESP Kiosk {version}","success")
@@ -2498,32 +3919,281 @@ def esp_tutorial_upload():
     finally:
         try:saved.unlink(missing_ok=True)
         except OSError:pass
-    return redirect(url_for("index"))
+    return redirect(url_for("kiosk_tutorial_page"))
+
+def _console_context():
+    """Overview (dashboard.html) only -- trimmed to exactly what that
+    template uses (task section 51: don't pay for release_summary/
+    qa_release_summary/deployment_platform/target_agents lookups on a page
+    that never renders them; those now live only in their own tab context
+    builders). Previously this computed the full Release & Deploy page's
+    entire dataset on every Overview load too."""
+    st=load_state()
+    return dict(mes=mes_status(),qa=qa_status(),history=st.get("history",[]),
+        server_role=SERVER_ROLE,csrf=session.get("csrf",""),agent_version=AGENT_VERSION)
 
 @app.get("/")
 def index():
+    return render_template("dashboard.html",page_key="overview",**_console_context())
+
+def _release_deploy_tab_context():
+    """Release Deploy tab: current release + pipeline + next action only --
+    never the full deployment history (that is its own tab, loaded lazily
+    client-side) and never Agent Update's target list (also its own tab)."""
     st=load_state();j=st.get("job")
-    if j and j.get("log_file"):j=dict(j);j["log_tail"]=tail(j["log_file"],160)
-    qj=st.get("qa_job")
-    if qj and qj.get("log_file"): qj=dict(qj); qj["log_tail"]=tail(qj["log_file"],160)
-    tj=st.get("tutorial_job")
-    if tj and tj.get("log_file"): tj=dict(tj); tj["log_tail"]=tail(tj["log_file"],180)
+    # Release page must stay cheap. Do not tail deployment/build log files on
+    # every page render; long-running jobs are monitored through the lightweight
+    # live-status endpoint below, and logs are read only when the operator
+    # explicitly opens a log viewer. The job may still contain a persisted
+    # log_tail captured at completion, which is safe to render without I/O.
+    qldj=st.get("qa_local_deploy_job")
+    ptj=st.get("promote_test_job"); qptj=st.get("qa_promote_test_job")
     host=(request.host or "localhost").split(":",1)[0]
-    ptj=st.get("promote_test_job")
-    return render_template("index.html",releases=list_releases(),mes=mes_status(),target_home=str(TARGET_HOME),job=j,history=st.get("history",[]),qa=qa_status(),qa_releases=list_qa_releases(),qa_home=str(QA_HOME),qa_job=qj,qa_history=st.get("qa_history",[]),tutorial_job=tj,tutorial_history=tj and st.get("tutorial_history",[]) or [],esp_tutorial=esp_tutorial_status(),esp_tutorial_job=st.get("esp_tutorial_job"),esp_builder_job=st.get("esp_builder_job"),esp_build_enabled=ESP_BUILD_ENABLED,esp_kiosk_source=str(ESP_KIOSK_SOURCE_DIR),release_build_job=st.get("release_build_job"),promote_test_job=ptj,agent_update_job=st.get("agent_update_job"),target_agents=load_json(CONFIG_DIR/"target-agents.json",{}),release_summary=_release_summary(),mes_build_enabled=MESFLOW_BUILD_ENABLED,server_role=SERVER_ROLE,release_targets=_release_targets(),esp_tutorial_view_url=(os.environ.get("WORKSHOP_MES_PUBLIC_URL") or "").rstrip("/")+"/app?guide=esp-kiosk" if os.environ.get("WORKSHOP_MES_PUBLIC_URL") else "/app?guide=esp-kiosk",qa_open_url=f"http://{host}:{QA_PORT}/",csrf=session.get("csrf",""),agent_log=tail(AGENT_LOG,80),qa_log=tail(QA_LOG,100),agent_version=AGENT_VERSION)
+    # Release Tab Performance Fix follow-up (reports/
+    # DEPLOY_AGENT_REFRESH_PERFORMANCE_FIX.md): compute each of these
+    # exactly ONCE per page load and pass them into
+    # _deployment_platform_summary() -- it used to silently recompute all
+    # four itself (a second Docker inspect round for MESFlow/QA, a second
+    # QA network probe, and a second SHA256 hash of both release ZIPs,
+    # which are real 70-500+MB artifacts), doubling the cost of every
+    # single Release & Deploy page load for no reason.
+    mes=mes_status();qa=qa_status()
+    release_summary=_release_summary();qa_release_summary=_qa_release_summary()
+    # ESP Firmware Builder / ESP Tutorial moved to their own pages under
+    # /kiosk/* (task: ESP_KIOSK_UI_SEPARATION) -- this tab must never again
+    # pay for esp_tutorial_status()'s file I/O (manifest.json/VERSION.txt
+    # reads + a backups directory scan) just to render the Release page.
+    return dict(job=j,qa_local_deploy_job=qldj,promote_test_job=ptj,qa_promote_test_job=qptj,
+        release_build_job=st.get("release_build_job"),version_bump=st.get("version_bump"),
+        qa_release_build_job=st.get("qa_release_build_job"),
+        release_summary=release_summary,qa_release_summary=qa_release_summary,
+        deployment_platform=_deployment_platform_summary(mes=mes,qa=qa,mes_release=release_summary,qa_release=qa_release_summary),
+        mes=mes,qa=qa,
+        qa_open_url=f"http://{host}:{QA_PORT}/",qa_log="",
+        mes_build_enabled=MESFLOW_BUILD_ENABLED)
+
+def _deployment_history_tab_context():
+    """Deployment History tab: no server-rendered data at all -- the table
+    is populated by the client from /api/release-manager/history (paginated,
+    filterable), so opening this tab never pays for release_summary/
+    deployment_platform/target_agents lookups it doesn't need."""
+    return dict()
+
+def _agent_update_tab_context():
+    """Agent Update tab: target Agents + this tab's own job/history only."""
+    return dict(target_agents=load_json(CONFIG_DIR/"target-agents.json",{}),
+        agent_update_job=load_state().get("agent_update_job"),mes_build_enabled=MESFLOW_BUILD_ENABLED,
+        latest_agent_release=_latest_agent_release(),
+        agent_package_build_job=load_state().get("agent_package_build_job"))
+
+# ---------------- ESP Kiosk (task: ESP_KIOSK_UI_SEPARATION) ----------------
+# Firmware Builder and Tutorial used to live inside the Release & Deploy
+# page as collapsed <details> cards. They are their own module now, mirroring
+# the RELEASE_TABS pattern above -- each tab's context builder reuses the
+# existing esp_tutorial_status()/ESP_BUILD_ENABLED/ota.* backend helpers
+# (nothing duplicated), and none of them touch MESFlow/QA release data.
+def _kiosk_overview_context():
+    """Overview tab: cheap summary only. Device counts are fetched
+    client-side from the existing /api/esp-ota/devices endpoint (which
+    already reaches out to MESFlow) -- never computed here on page load."""
+    return dict(esp_tutorial=esp_tutorial_status(),esp_builder_job=load_state().get("esp_builder_job"),
+        esp_build_enabled=ESP_BUILD_ENABLED)
+
+def _kiosk_ota_context():
+    """OTA tab: device fleet + jobs are loaded client-side via the existing
+    /api/esp-ota/* endpoints (unchanged) -- no server-rendered data here."""
+    return dict()
+
+def _kiosk_firmware_context():
+    """Firmware tab: build job + recently registered artifacts only -- never
+    MESFlow/QA release summaries, deployment_platform, or promotion checks
+    (those stay on the Release & Deploy page)."""
+    items=ota.list_firmware(limit=10)
+    for item in items:
+        try:item["created_at_display"]=datetime.fromtimestamp(float(item.get("created_at") or 0)).strftime("%d/%m/%Y %H:%M")
+        except (TypeError,ValueError,OSError):item["created_at_display"]=""
+    return dict(esp_builder_job=load_state().get("esp_builder_job"),esp_build_enabled=ESP_BUILD_ENABLED,
+        esp_kiosk_source=str(ESP_KIOSK_SOURCE_DIR),firmware_items=items)
+
+def _kiosk_tutorial_context():
+    """Tutorial tab: ESP Kiosk tutorial package status + upload job only --
+    no MESFlow release data, no release polling, no Docker/log reads."""
+    st=load_state()
+    return dict(esp_tutorial=esp_tutorial_status(),esp_tutorial_job=st.get("esp_tutorial_job"),
+        tutorial_job=st.get("tutorial_job"),tutorial_history=(st.get("tutorial_history") or [])[:5],
+        esp_tutorial_view_url=(os.environ.get("WORKSHOP_MES_PUBLIC_URL") or "").rstrip("/")+"/app?guide=esp-kiosk" if os.environ.get("WORKSHOP_MES_PUBLIC_URL") else "/app?guide=esp-kiosk")
+
+KIOSK_TABS={"overview":("kiosk/_overview_tab.html",_kiosk_overview_context),
+            "ota":("kiosk/_ota_tab.html",_kiosk_ota_context),
+            "firmware":("kiosk/_firmware_tab.html",_kiosk_firmware_context),
+            "tutorial":("kiosk/_tutorial_tab.html",_kiosk_tutorial_context)}
+
+def _kiosk_render(tab):
+    partial,build_ctx=KIOSK_TABS[tab]
+    return render_template("kiosk/index.html",page_key="kiosk",active_tab=tab,tab_partial=partial,
+        csrf=session.get("csrf",""),agent_version=AGENT_VERSION,server_role=SERVER_ROLE,**build_ctx())
+
+@app.get("/kiosk")
+def kiosk_overview_page():
+    return _kiosk_render("overview")
+
+@app.get("/kiosk/ota")
+def kiosk_ota_page():
+    # Same auth convention as the old /ota page it replaces: a normal login
+    # session OR the OTA admin bearer token (automated dashboards), not a
+    # plain redirect-to-login -- see _ota_admin_required().
+    gate=_ota_admin_required()
+    if gate:return gate
+    return _kiosk_render("ota")
+
+@app.get("/kiosk/firmware")
+def kiosk_firmware_page():
+    return _kiosk_render("firmware")
+
+@app.get("/kiosk/tutorial")
+def kiosk_tutorial_page():
+    return _kiosk_render("tutorial")
+
+RELEASE_TABS={"deploy":("release/_deploy_tab.html",_release_deploy_tab_context),
+              "history":("release/_history_tab.html",_deployment_history_tab_context),
+              "agent-update":("release/_agent_update_tab.html",_agent_update_tab_context)}
+
+@app.get("/releases")
+def release_manager_page():
+    tab=request.args.get("tab","deploy")
+    # Back-compat: the old ESP Kiosk sidebar links ("ESP Kiosk · Firmware" /
+    # "· Hướng dẫn") used to point here with tab=deploy plus a `section=`
+    # param that pre-opened a <details> card on this same page. Both cards
+    # moved to their own pages (task: ESP_KIOSK_UI_SEPARATION) -- redirect
+    # any old bookmark/link there instead of rendering a page that no
+    # longer has that section.
+    section=request.args.get("section")
+    if tab=="deploy" and section=="esp-builder": return redirect(url_for("kiosk_firmware_page"))
+    if tab=="deploy" and section=="esp-tutorial": return redirect(url_for("kiosk_tutorial_page"))
+    if tab not in RELEASE_TABS: tab="deploy"
+    partial,build_ctx=RELEASE_TABS[tab]
+    return render_template("release/index.html",page_key="releases",active_tab=tab,tab_partial=partial,
+        csrf=session.get("csrf",""),agent_version=AGENT_VERSION,server_role=SERVER_ROLE,**build_ctx())
+def _release_live_status_payload():
+    """Cheap Release tab polling payload.
+
+    Deliberately reads only the small persisted state file. It must not call
+    release summaries, Docker/health probes, deployment-platform scans, or
+    tail any log file. This keeps the Release tab responsive while a job runs.
+    """
+    st=load_state()
+    keys=(
+        "job", "qa_local_deploy_job", "promote_test_job",
+        "qa_promote_test_job", "release_build_job", "qa_release_build_job",
+        "esp_builder_job", "esp_tutorial_job", "tutorial_job",
+        # Agent Update tab follow-up (reports/
+        # DEPLOY_AGENT_REFRESH_PERFORMANCE_FIX.md): tracked here too so
+        # that tab can reuse this SAME lightweight endpoint instead of its
+        # previous unconditional full-page-reload-every-3-seconds loop.
+        "agent_update_job",
+        # Build Agent Package (task: AGENT_PACKAGE_BUILD_PUSH): same
+        # lightweight endpoint, same convention -- no second poller.
+        "agent_package_build_job",
+    )
+    jobs={}
+    for key in keys:
+        raw=st.get(key) or {}
+        jobs[key]={
+            "status":raw.get("status",""),
+            "message":raw.get("message",""),
+            "updated_at":raw.get("updated_at",raw.get("finished_at","")),
+        } if raw else {}
+    active_statuses={"queued","uploading","validating","building","deploying","verifying","QUEUED","UPLOADING","VALIDATING","BUILDING","DEPLOYING","VERIFYING",
+        # Agent Update's own status vocabulary (see release_manager_update_agent).
+        "UPDATING","PUSHING"}
+    active=any((job.get("status") in active_statuses) for job in jobs.values() if job)
+    return {"ok":True,"active":active,"jobs":jobs,"server_time":now_text()}
+
+@app.get("/api/release-manager/live-status")
+def release_manager_live_status():
+    if not logged_in(): return jsonify(ok=False,error="AUTH_REQUIRED"),401
+    return jsonify(_release_live_status_payload())
+
 @app.get("/api/status")
-def api_status():return jsonify({"agent_version":AGENT_VERSION,"api_protocol_version":API_PROTOCOL_VERSION,"capabilities":AGENT_CAPABILITIES,"runtime_mode":RUNTIME_MODE,"server_role":SERVER_ROLE,"build_enabled":MESFLOW_BUILD_ENABLED,"source_dir":str(MESFLOW_SOURCE_DIR),"deploy_enabled":DEPLOY_ENABLED,"host_ops_enabled":HOST_OPS_ENABLED,"mes":mes_status(),"qa":qa_status(),"job":load_state().get("job"),"qa_job":load_state().get("qa_job"),"tutorial_job":load_state().get("tutorial_job"),"esp_tutorial":esp_tutorial_status(),"esp_tutorial_job":load_state().get("esp_tutorial_job"),"release_build":load_state().get("release_build_job"),"promote_test_job":load_state().get("promote_test_job"),"agent_update_job":load_state().get("agent_update_job"),"release_summary":_release_summary()})
+def api_status():return jsonify({"agent_id":_agent_instance_id(),"agent_version":AGENT_VERSION,"frontend_build_id":FRONTEND_BUILD_ID,"api_protocol_version":API_PROTOCOL_VERSION,"capabilities":AGENT_CAPABILITIES,"runtime_mode":RUNTIME_MODE,"server_role":SERVER_ROLE,"build_enabled":MESFLOW_BUILD_ENABLED,"source_dir":str(MESFLOW_SOURCE_DIR),"deploy_enabled":DEPLOY_ENABLED,"host_ops_enabled":HOST_OPS_ENABLED,"mes":mes_status(),"qa":qa_status(),"job":load_state().get("job"),"qa_job":load_state().get("qa_job"),"qa_image_deploy_job":load_state().get("qa_image_deploy_job"),"tutorial_job":load_state().get("tutorial_job"),"esp_tutorial":esp_tutorial_status(),"esp_tutorial_job":load_state().get("esp_tutorial_job"),"release_build":load_state().get("release_build_job"),"promote_test_job":load_state().get("promote_test_job"),"qa_release_build_job":load_state().get("qa_release_build_job"),"qa_local_deploy_job":load_state().get("qa_local_deploy_job"),"qa_promote_test_job":load_state().get("qa_promote_test_job"),"agent_update_job":load_state().get("agent_update_job"),"release_summary":_release_summary()})
 
 @app.get("/api/release-manager")
 def release_manager():
     if not logged_in(): return jsonify(ok=False,error="AUTH_REQUIRED"),401
     return jsonify(ok=True,enabled=MESFLOW_BUILD_ENABLED,summary=_release_summary(),job=load_state().get("release_build_job"))
 
+@app.get("/api/deployment-platform")
+def deployment_platform_api():
+    if not logged_in():return jsonify(ok=False,error="AUTH_REQUIRED"),401
+    return jsonify(ok=True,**_deployment_platform_summary())
+
+@app.get("/api/deployment-platform/deployments")
+def deployment_platform_history_api():
+    if not logged_in():return jsonify(ok=False,error="AUTH_REQUIRED"),401
+    return jsonify(ok=True,items=_deployment_platform_store().list(request.args.get("limit",100,type=int)))
+
+@app.post("/api/deployment-platform/retention/preview")
+def deployment_platform_retention_preview_api():
+    if not logged_in():return jsonify(ok=False,error="AUTH_REQUIRED"),401
+    verify_csrf();payload=request.get_json(silent=True) or {}
+    try:return jsonify(ok=True,component=str(payload.get("component") or ""),preview=_platform_retention_preview(str(payload.get("component") or "")))
+    except (ValueError,OSError) as exc:return jsonify(ok=False,error=str(exc)),400
+
+@app.get("/api/release-manager/evidence/<version>")
+def release_manager_evidence(version):
+    if not logged_in():return jsonify(ok=False,error="AUTH_REQUIRED"),401
+    try:return jsonify(ok=True,evidence=_gate_evidence(norm(version),write=False))
+    except (ValueError,FileNotFoundError) as exc:return jsonify(ok=False,error=str(exc)),404
+
+@app.post("/api/release-manager/evidence/<version>/runs")
+def release_manager_record_gate_run(version):
+    """Structured QA callback/import. Never accepts a manual boolean PASS:
+    the run must contain identity, profile, counts and required checks."""
+    if not logged_in():return jsonify(ok=False,error="AUTH_REQUIRED"),401
+    verify_csrf();payload=request.get_json(force=True) or {}
+    try:return jsonify(ok=True,evidence=_record_gate_run(norm(version),payload)),201
+    except FileExistsError as exc:return jsonify(ok=False,error=str(exc)),409
+    except ValueError as exc:return jsonify(ok=False,error=str(exc)),409
+
+@app.get("/api/release-manager/cleanup-releases")
+def release_manager_cleanup_status():
+    if not logged_in(): return jsonify(ok=False,error="AUTH_REQUIRED"),401
+    return jsonify(ok=True,retention=MESFLOW_RELEASE_RETENTION,last_report=load_state().get("release_cleanup_report"))
+
+@app.post("/api/release-manager/cleanup-releases")
+def release_manager_cleanup_run():
+    """Manual trigger (e.g. to re-run after lowering MESFLOW_RELEASE_RETENTION,
+    or to inspect what the automatic policy would do right now). The
+    automatic path -- the one the policy actually relies on -- fires only
+    after a verified LOCAL_PASS or TEST_PASS; see _cleanup_old_releases()."""
+    if not logged_in(): return jsonify(ok=False,error="AUTH_REQUIRED"),401
+    verify_csrf()
+    try: return jsonify(ok=True,report=_cleanup_old_releases("MANUAL"))
+    except Exception as exc: return jsonify(ok=False,error=str(exc)),500
+
 @app.post("/api/release-manager/build")
 def release_manager_build():
     if not logged_in(): return jsonify(ok=False,error="AUTH_REQUIRED"),401
     try: start_release_build(); return jsonify(ok=True,job=load_state().get("release_build_job")),202
     except RuntimeError as exc: return jsonify(ok=False,error=str(exc)),409
+
+@app.get("/api/release-manager/bump-version")
+def release_manager_bump_version_status():
+    if not logged_in(): return jsonify(ok=False,error="AUTH_REQUIRED"),401
+    return jsonify(ok=True,enabled=MESFLOW_BUILD_ENABLED,current_version=_release_summary().get("source_version",""),last=load_state().get("version_bump"))
+
+@app.post("/api/release-manager/bump-version")
+def release_manager_bump_version():
+    """Runs scripts/bump-version.sh -- updates VERSION.txt/__init__.py/
+    release.json/compose.yml consistently. Fast, synchronous, source-only;
+    never builds. Optional {"target_version":"X.Y.Z.W"}; omitted/blank
+    increments the last segment by 1."""
+    if not logged_in(): return jsonify(ok=False,error="AUTH_REQUIRED"),401
+    verify_csrf()
+    body=request.get_json(silent=True) or {}
+    try: return jsonify(ok=True,**_run_version_bump(body.get("target_version") or ""))
+    except (ValueError,RuntimeError) as exc: return jsonify(ok=False,error=str(exc)),409
+    except Exception as exc: return jsonify(ok=False,error=str(exc)),500
 
 @app.post("/api/release-manager/deploy-local")
 def release_manager_deploy_local():
@@ -2592,6 +4262,32 @@ def release_manager_promote_test():
     try: start_promote_test(version); return jsonify(ok=True,version=version),202
     except RuntimeError as exc: return jsonify(ok=False,error=str(exc)),409
 
+@app.get("/api/release-manager/history")
+def release_manager_history():
+    """Unified Deployment History (task: Deployment History tab) --
+    component/environment/result/date/version-search filters, bounded page
+    size, newest first (deployment_history is already stored newest-first)."""
+    if not logged_in(): return jsonify(ok=False,error="AUTH_REQUIRED"),401
+    args=request.args
+    result=_deployment_history_query(component=args.get("component") or None,environment=args.get("environment") or None,
+        result=args.get("result") or None,q=args.get("q") or None,page=args.get("page",1),page_size=args.get("page_size",20))
+    return jsonify(ok=True,**result)
+
+@app.get("/api/release-manager/history/<entry_id>")
+def release_manager_history_detail(entry_id):
+    if not logged_in(): return jsonify(ok=False,error="AUTH_REQUIRED"),401
+    items=load_state().get("deployment_history") or []
+    entry=next((e for e in items if e.get("id")==entry_id),None)
+    if not entry: return jsonify(ok=False,error="NOT_FOUND"),404
+    d=dict(entry); d["result"]=_deployment_history_result(entry.get("status"),entry.get("rolled_back_to"))
+    log_tail=""
+    lf=entry.get("log_file")
+    if lf:
+        try: log_tail=tail(Path(lf),200)
+        except Exception: log_tail=""
+    d["log_tail"]=log_tail
+    return jsonify(ok=True,item=d)
+
 @app.post("/api/release-manager/production-preflight")
 def release_manager_production_preflight():
     """Read-only: logs in and issues GET requests only (/api/status,
@@ -2621,10 +4317,41 @@ def release_manager_target_agents_get():
     if not logged_in(): return jsonify(ok=False,error="AUTH_REQUIRED"),401
     return jsonify(ok=True,**load_json(CONFIG_DIR/"target-agents.json",{"checked_at":None,"rows":[]}))
 
+@app.post("/api/release-manager/build-agent-package")
+def release_manager_build_agent_package():
+    """Builds the Deploy Agent's own immutable update artifact from the
+    current workspace source (scripts/build-agent-release.sh): source
+    preflight, version validation, this Agent's own test suite, Docker
+    image build, SHA256, manifest, BUILD_REPORT.md -- the exact package
+    format Bootstrap's /updater/update already knows how to install. Does
+    not push anywhere; see /api/release-manager/update-agent for that."""
+    if not logged_in(): return jsonify(ok=False,error="AUTH_REQUIRED"),401
+    verify_csrf()
+    if not MESFLOW_BUILD_ENABLED:
+        return jsonify(ok=False,error="BUILD_DISABLED",detail="This Agent has MESFLOW_BUILD_ENABLED=0 (not a DEV host)."),403
+    try: start_agent_package_build(); return jsonify(ok=True,job=load_state().get("agent_package_build_job")),202
+    except RuntimeError as exc: return jsonify(ok=False,error=str(exc)),409
+
+@app.get("/api/release-manager/agent-package/download")
+def release_manager_agent_package_download():
+    if not logged_in(): return jsonify(ok=False,error="AUTH_REQUIRED"),401
+    release=_latest_agent_release()
+    if not release.get("package_exists"):
+        return jsonify(ok=False,error="AGENT_ARTIFACT_NOT_FOUND"),404
+    return send_file(release["package"],as_attachment=True,download_name=Path(release["package"]).name)
+
 @app.post("/api/release-manager/update-agent")
 def release_manager_update_agent():
     """Pushes the latest built Agent update artifact (scripts/build-agent-release.sh)
-    to the target's host-side updater over HTTP -- no SSH. Production
+    to the target's host-side updater over HTTP -- no SSH. The target is
+    whatever MESFLOW_{PRODUCTION_TEST,PRODUCTION}_AGENT_UPDATER_URL/TOKEN
+    point at -- historically deploy-agent/updater/ on :8099, now migrating to
+    bootstrap/ on :8098, which vendors that same updater's tested
+    verification/update/rollback logic and serves an identical
+    POST /updater/update contract (see
+    reports/BOOTSTRAP_AGENT_UPDATER_CONSOLIDATION.md). Only the configured
+    URL's port changes for that cutover; nothing here or in those env var
+    names does. Production
     requires MESFLOW_PRODUCTION_PROMOTE_ENABLED=1 on this Agent AND an
     explicit {"confirm": true} in the request body."""
     if not logged_in(): return jsonify(ok=False,error="AUTH_REQUIRED"),401
@@ -2672,6 +4399,102 @@ def release_manager_promote_production():
     return jsonify(ok=False,error="PRODUCTION_DEPLOY_NOT_IMPLEMENTED",
                     detail=f"Gate passed for {version} and explicitly approved, but this Agent build does not execute production deploys yet."),501
 
+# ---------------- QA Center Release Manager (Build Once / Promote Same Artifact) ----------------
+# Mirrors every /api/release-manager/* route above 1:1 for the second
+# application. Independent state/promotion/locks throughout -- see the
+# "QA Center: Build Once / Promote Same Artifact" section above agent.py.
+
+@app.get("/api/qa-release-manager")
+def qa_release_manager():
+    if not logged_in(): return jsonify(ok=False,error="AUTH_REQUIRED"),401
+    return jsonify(ok=True,enabled=MESFLOW_BUILD_ENABLED,summary=_qa_release_summary(),job=load_state().get("qa_release_build_job"))
+
+@app.get("/api/qa-release-manager/cleanup-releases")
+def qa_release_manager_cleanup_status():
+    if not logged_in(): return jsonify(ok=False,error="AUTH_REQUIRED"),401
+    return jsonify(ok=True,retention=QA_RELEASE_RETENTION,last_report=load_state().get("qa_release_cleanup_report"))
+
+@app.post("/api/qa-release-manager/cleanup-releases")
+def qa_release_manager_cleanup_run():
+    if not logged_in(): return jsonify(ok=False,error="AUTH_REQUIRED"),401
+    verify_csrf()
+    try: return jsonify(ok=True,report=_qa_cleanup_old_releases("MANUAL"))
+    except Exception as exc: return jsonify(ok=False,error=str(exc)),500
+
+@app.post("/api/qa-release-manager/build")
+def qa_release_manager_build():
+    if not logged_in(): return jsonify(ok=False,error="AUTH_REQUIRED"),401
+    try: start_qa_release_build(); return jsonify(ok=True,job=load_state().get("qa_release_build_job")),202
+    except RuntimeError as exc: return jsonify(ok=False,error=str(exc)),409
+
+@app.post("/api/qa-release-manager/deploy-local")
+def qa_release_manager_deploy_local():
+    if not logged_in(): return jsonify(ok=False,error="AUTH_REQUIRED"),401
+    requested=(request.get_json(silent=True) or {}).get("version") or request.form.get("version")
+    if requested:
+        try: artifact=_qa_artifact_for_release(norm(str(requested)))
+        except Exception: artifact={}
+    else:
+        latest=_qa_release_summary().get("latest") or {}
+        artifact=_qa_artifact_for_release(str(latest["version"])) if latest.get("version") else {}
+    version=str(artifact.get("version") or "")
+    if not version or not artifact.get("package_sha256"):
+        return jsonify(ok=False,error="QA_LOCAL_BUILD_REQUIRED"),409
+    contamination=_qa_release_contamination(version)
+    if contamination.get("contaminated"):
+        return jsonify(ok=False,error=f"RELEASE_CONTAMINATED: {contamination.get('reason')}"),409
+    try: start_qa_local_deploy(version); return jsonify(ok=True,version=version),202
+    except Exception as exc: return jsonify(ok=False,error=str(exc)),409
+
+@app.get("/api/qa-release-manager/promote-test")
+def qa_release_manager_promote_test_status():
+    if not logged_in(): return jsonify(ok=False,error="AUTH_REQUIRED"),401
+    return jsonify(ok=True,job=load_state().get("qa_promote_test_job"),summary=_qa_release_summary())
+
+@app.post("/api/qa-release-manager/promote-test")
+def qa_release_manager_promote_test():
+    """LOCAL_PASS -> select the exact frozen QA release -> verify ZIP SHA ->
+    upload the SAME zip to the configured PRODUCTION_TEST Agent -> remote
+    verifies checksums+digest -> deploy --no-build -> health/version ->
+    TEST_PASS. Never rebuilds anything. Reuses the SAME
+    MESFLOW_PRODUCTION_TEST_AGENT_URL/_USER/_PASSWORD target as MESFlow
+    promotion -- it is the same physical Deploy Agent on that host."""
+    if not logged_in(): return jsonify(ok=False,error="AUTH_REQUIRED"),401
+    verify_csrf()
+    summary=_qa_release_summary()
+    latest=summary.get("latest") or {}
+    requested=(request.get_json(silent=True) or {}).get("version") or request.form.get("version")
+    version=str(requested or latest.get("version") or "")
+    if not version: return jsonify(ok=False,error="NO_RELEASE_TO_PROMOTE"),409
+    promotion=_qa_load_promotion_state()
+    if promotion.get("version")!=version or not promotion.get("local_pass"):
+        return jsonify(ok=False,error="LOCAL_PASS_REQUIRED"),409
+    contamination=_qa_release_contamination(version)
+    if contamination.get("contaminated"):
+        return jsonify(ok=False,error=f"RELEASE_CONTAMINATED: {contamination.get('reason')}"),409
+    url,user,password=_production_test_target()
+    if not url or not password:
+        return jsonify(ok=False,error="PRODUCTION_TEST_AGENT_NOT_CONFIGURED"),409
+    try: start_qa_promote_test(version); return jsonify(ok=True,version=version),202
+    except RuntimeError as exc: return jsonify(ok=False,error=str(exc)),409
+
+@app.post("/api/qa-release-manager/promote-production")
+def qa_release_manager_promote_production():
+    """Same wired-but-never-executes gate as MESFlow's promote-production."""
+    if not logged_in(): return jsonify(ok=False,error="AUTH_REQUIRED"),401
+    verify_csrf()
+    summary=_qa_release_summary()
+    promotion=summary.get("promotion") or {}
+    version=str((summary.get("latest") or {}).get("version") or "")
+    if not promotion.get("production_gate"):
+        return jsonify(ok=False,error="GATE_NOT_PASSED",blocked=summary.get("blocked",{}).get("production")),409
+    enabled=os.environ.get("MESFLOW_PRODUCTION_PROMOTE_ENABLED","").strip().lower() in {"1","true","yes","on"}
+    confirmed=bool((request.get_json(silent=True) or {}).get("confirm"))
+    if not (enabled and confirmed):
+        return jsonify(ok=False,error="PRODUCTION_PROMOTE_NOT_APPROVED",
+                        detail="Requires MESFLOW_PRODUCTION_PROMOTE_ENABLED=1 on this Agent AND {\"confirm\":true} in the request body."),403
+    return jsonify(ok=False,error="PRODUCTION_DEPLOY_NOT_IMPLEMENTED",
+                    detail=f"Gate passed for QA {version} and explicitly approved, but this Agent build does not execute production deploys yet."),501
 
 # ---------------- Minimal Deploy Agent ESP OTA ----------------
 def _ota_admin_token_valid():
@@ -2732,9 +4555,13 @@ def _device_token_valid(kiosk_id, token):
 
 @app.get("/ota")
 def ota_console():
-    gate=_ota_admin_required()
-    if gate:return gate
-    return render_template("ota.html",agent_version=AGENT_VERSION)
+    # Back-compat only: this page now lives at /kiosk/ota (task:
+    # ESP_KIOSK_UI_SEPARATION). Stays exempt from protect()'s generic
+    # redirect-to-login below so an OTA-admin-token client hitting the old
+    # bare URL still lands on a page it can authenticate against, exactly
+    # as before -- kiosk_ota_page() re-applies the same _ota_admin_required()
+    # gate itself.
+    return redirect(url_for("kiosk_ota_page"))
 
 @app.post("/api/esp-builder/start")
 def esp_builder_start():
@@ -2873,53 +4700,621 @@ def ota_device_event():
 
 
 # ---------------- Server Operations Console ----------------
-def _run_capture(cmd, timeout=12, shell=False):
-    try:
-        r=subprocess.run(cmd, shell=shell, capture_output=True, text=True, errors="replace", timeout=timeout,
-                         executable="/bin/bash" if shell and os.name!="nt" else None)
-        return {"ok":r.returncode==0,"exit_code":r.returncode,"stdout":r.stdout[-200000:],"stderr":r.stderr[-50000:]}
-    except subprocess.TimeoutExpired as ex:
-        return {"ok":False,"exit_code":124,"stdout":str(ex.stdout or "")[-200000:],"stderr":"Command timed out"}
-    except Exception as ex:
-        return {"ok":False,"exit_code":-1,"stdout":"","stderr":str(ex)}
-
-def _bytes(n):
-    n=float(n or 0)
-    for unit in ("B","KB","MB","GB","TB"):
-        if n < 1024 or unit=="TB": return f"{n:.1f} {unit}"
-        n/=1024
-
 def ops_summary():
-    vm=psutil.virtual_memory(); sw=psutil.swap_memory(); root=psutil.disk_usage('/') if os.name!='nt' else psutil.disk_usage(Path.cwd().anchor)
-    loads=os.getloadavg() if hasattr(os,'getloadavg') else (0,0,0)
-    boot=datetime.fromtimestamp(psutil.boot_time())
-    failed=[]
-    if os.name!='nt':
-        x=_run_capture(["systemctl","--failed","--no-legend","--plain"],8)
-        failed=[ln for ln in x.get("stdout","").splitlines() if ln.strip()]
-    docker=_run_capture(["docker","ps","-q"],8) if shutil.which("docker") else {"ok":False,"stdout":""}
-    unhealthy=_run_capture(["docker","ps","--filter","health=unhealthy","-q"],8) if shutil.which("docker") else {"ok":False,"stdout":""}
-    score=100; alerts=[]
-    cpu=psutil.cpu_percent(interval=0.15)
-    if cpu>=90: score-=20; alerts.append(f"CPU cao {cpu:.0f}%")
-    elif cpu>=75: score-=8; alerts.append(f"CPU {cpu:.0f}%")
-    if vm.percent>=90: score-=20; alerts.append(f"RAM cao {vm.percent:.0f}%")
-    elif vm.percent>=80: score-=8; alerts.append(f"RAM {vm.percent:.0f}%")
-    if root.percent>=95: score-=30; alerts.append(f"Disk gần đầy {root.percent:.0f}%")
-    elif root.percent>=85: score-=12; alerts.append(f"Disk {root.percent:.0f}%")
-    if failed: score-=min(25,5*len(failed)); alerts.append(f"{len(failed)} systemd service failed")
-    uh=len([x for x in unhealthy.get("stdout","").splitlines() if x.strip()])
-    if uh: score-=min(25,8*uh); alerts.append(f"{uh} Docker container unhealthy")
-    mes=mes_status(); qa=qa_status()
-    if not mes.get("online"): score-=20; alerts.append("MESFlow offline")
-    return {"score":max(0,score),"alerts":alerts,"hostname":socket.gethostname(),"os":platform.platform(),
-            "uptime_seconds":int(time.time()-psutil.boot_time()),"boot_time":boot.strftime('%Y-%m-%d %H:%M:%S'),
-            "cpu_percent":cpu,"cpu_count":psutil.cpu_count(),"load":[round(x,2) for x in loads],
-            "ram":{"percent":vm.percent,"used":_bytes(vm.used),"total":_bytes(vm.total)},
-            "swap":{"percent":sw.percent,"used":_bytes(sw.used),"total":_bytes(sw.total)},
-            "disk":{"percent":root.percent,"used":_bytes(root.used),"total":_bytes(root.total),"free":_bytes(root.free)},
-            "failed_services":len(failed),"docker_running":len([x for x in docker.get("stdout","").splitlines() if x.strip()]),
-            "docker_unhealthy":uh,"mes":mes,"qa":qa}
+    return collect_system_health_summary(mes_status, qa_status)
+
+# ---------------- Operations Center: Incident model ----------------
+# Deploy Agent owns SYSTEM/INFRASTRUCTURE incidents (see
+# reports/SYSTEM_LOG_AUDIT_SEPARATION.md). Persisted as JSON, matching this
+# Agent's existing state-file convention (no database driver here) --
+# fingerprint-keyed so a condition that keeps being true stays ONE row
+# (occurrence_count increments), never a new incident per poll.
+INCIDENTS_FILE=CONFIG_DIR/"incidents.json"
+INCIDENT_POLL_SECONDS=int(os.environ.get("MESFLOW_INCIDENT_POLL_SECONDS","30"))
+PREDICTIVE_SAMPLE_SECONDS=max(60,int(os.environ.get("MESFLOW_PREDICTIVE_SAMPLE_SECONDS","300")))
+PREDICTIVE_RAW_DAYS=max(7,int(os.environ.get("MESFLOW_PREDICTIVE_RAW_DAYS","14")))
+PREDICTIVE_HOURLY_DAYS=max(PREDICTIVE_RAW_DAYS,int(os.environ.get("MESFLOW_PREDICTIVE_HOURLY_DAYS","90")))
+PREDICTIVE_DAILY_DAYS=max(PREDICTIVE_HOURLY_DAYS,int(os.environ.get("MESFLOW_PREDICTIVE_DAILY_DAYS","365")))
+PREDICTIVE_MIN_SAMPLES=max(5,int(os.environ.get("MESFLOW_PREDICTIVE_MIN_SAMPLES","12")))
+PREDICTIVE_MIN_HOURS=max(1,float(os.environ.get("MESFLOW_PREDICTIVE_MIN_HOURS","48")))
+PREDICTIVE_DISK_HIGH_DAYS=max(1,float(os.environ.get("MESFLOW_PREDICTIVE_DISK_HIGH_DAYS","7")))
+PREDICTIVE_DISK_MEDIUM_DAYS=max(PREDICTIVE_DISK_HIGH_DAYS,float(os.environ.get("MESFLOW_PREDICTIVE_DISK_MEDIUM_DAYS","14")))
+METRICS_FILE=DATA_DIR/"predictive_metrics.json"
+AI_ANALYSIS_FILE=DATA_DIR/"incident_ai_analysis.json"
+_metric_store=MetricStore(METRICS_FILE,PREDICTIVE_RAW_DAYS,PREDICTIVE_HOURLY_DAYS,PREDICTIVE_DAILY_DAYS)
+_ai_provider=(HTTPJSONAIProvider(os.environ.get("MESFLOW_AI_PROVIDER_URL",""),os.environ.get("MESFLOW_AI_MODEL",""),float(os.environ.get("MESFLOW_AI_TIMEOUT_SECONDS","12")))
+              if os.environ.get("MESFLOW_AI_ENABLED","0").lower() in {"1","true","yes","on"} and os.environ.get("MESFLOW_AI_PROVIDER_URL") else DisabledAIProvider())
+_incident_ai=IncidentAIService(AI_ANALYSIS_FILE,_ai_provider,int(os.environ.get("MESFLOW_AI_MAX_CONTEXT_BYTES","48000")))
+# Containers this Agent is responsible for alerting on. A container NOT in
+# this set that happens to be stopped is not this system's incident --
+# never assume every historical/unrelated container should be running.
+EXPECTED_CONTAINERS=set(x.strip() for x in os.environ.get(
+    "MESFLOW_EXPECTED_CONTAINERS","mesflow-app,mesflow-postgres,mesflow-deploy-agent,mesflow-qa-center,mesflow-nginx").split(",") if x.strip())
+_incident_lock=threading.Lock()
+
+# P3 Notification: critical incident -> notification -> recovery (section
+# 33: no Redis/RabbitMQ needed at this scale -- the same JSON-file store
+# convention as incidents.json, reconciled from the existing incident
+# monitor loop below). WEB always available; Telegram/Email report
+# NOT_CONFIGURED rather than failing when unset (section 6).
+NOTIFICATIONS_FILE=CONFIG_DIR/"notifications.json"
+_notification_channels={
+    "WEB":WebChannel(),
+    "TELEGRAM":TelegramChannel(os.environ.get("MESFLOW_TELEGRAM_BOT_TOKEN",""),os.environ.get("MESFLOW_TELEGRAM_CHAT_ID","")),
+    "EMAIL":EmailChannel(os.environ.get("MESFLOW_SMTP_HOST",""),int(os.environ.get("MESFLOW_SMTP_PORT","587") or 587),
+        os.environ.get("MESFLOW_SMTP_USER",""),os.environ.get("MESFLOW_SMTP_PASSWORD",""),
+        str(os.environ.get("MESFLOW_SMTP_USE_TLS","1")).lower() in {"1","true","yes","on"},
+        os.environ.get("MESFLOW_SMTP_FROM",""),os.environ.get("MESFLOW_SMTP_TO","")),
+}
+_notification_dispatcher=NotificationDispatcher(_notification_channels,NOTIFICATIONS_FILE,environment_label(SERVER_ROLE),
+    min_severity={"TELEGRAM":os.environ.get("MESFLOW_NOTIFY_TELEGRAM_MIN_SEVERITY","HIGH").upper(),
+                  "EMAIL":os.environ.get("MESFLOW_NOTIFY_EMAIL_MIN_SEVERITY","CRITICAL").upper()})
+
+def _load_incidents():
+    with _incident_lock:
+        return load_json(INCIDENTS_FILE,{"items":{}})
+
+def _save_incidents(store):
+    with _incident_lock:
+        save_json(INCIDENTS_FILE,store)
+
+def _incident_conditions():
+    """Read-only evidence gathering only -- never a mutation (section 14)."""
+    conditions=[]
+    try:
+        mes=mes_status()
+        if not mes.get("online"):
+            conditions.append(("MESFLOW_DOWN","SERVICE_DOWN","CRITICAL","health-monitor","mesflow","mesflow",
+                "MESFlow application unreachable","api_online=False, docker_running=%s"%mes.get("docker",{}).get("running"),{"mes_status":mes}))
+    except Exception as e:
+        conditions.append(("MESFLOW_CHECK_FAILED","DIAGNOSTIC_FAILURE","MEDIUM","health-monitor","mesflow","mesflow",
+            "MESFlow health check itself failed","%s: %s"%(type(e).__name__,e),{}))
+    try:
+        if QA_URL:
+            qa=qa_status()
+            if not qa.get("online"):
+                conditions.append(("QA_DOWN","SERVICE_DOWN","HIGH","health-monitor","qa-center","qa-center",
+                    "QA Center unreachable","online=False",{"qa_status":qa}))
+    except Exception:
+        pass
+    try:
+        for c in ops_docker():
+            name=(c.get("Names") or "").lstrip("/")
+            if name not in EXPECTED_CONTAINERS:continue
+            state=str(c.get("State") or "").lower();status_text=str(c.get("Status") or "")
+            if state and state!="running":
+                conditions.append((f"CONTAINER_DOWN:{name}","CONTAINER_DOWN","HIGH","docker",socket.gethostname(),name,
+                    f"Container {name} is not running","state=%s status=%s"%(state,status_text),{"container":c}))
+            elif "unhealthy" in status_text.lower():
+                conditions.append((f"CONTAINER_UNHEALTHY:{name}","CONTAINER_UNHEALTHY","HIGH","docker",socket.gethostname(),name,
+                    f"Container {name} reports unhealthy","status=%s"%status_text,{"container":c}))
+    except Exception:
+        pass
+    try:
+        vm=psutil.virtual_memory();root=psutil.disk_usage('/') if os.name!='nt' else psutil.disk_usage(Path.cwd().anchor)
+        if root.percent>=90:
+            conditions.append(("DISK_CRITICAL","CAPACITY","CRITICAL","host",socket.gethostname(),"disk",
+                f"Disk usage at {root.percent:.0f}%","percent=%.1f"%root.percent,{"percent":root.percent,"free":_bytes(root.free)}))
+        if vm.percent>=90:
+            conditions.append(("RAM_CRITICAL","CAPACITY","CRITICAL","host",socket.gethostname(),"ram",
+                f"RAM usage at {vm.percent:.0f}%","percent=%.1f"%vm.percent,{"percent":vm.percent}))
+    except Exception:
+        pass
+    return conditions
+
+def sync_incidents(conditions):
+    """Fingerprint dedup + ACTIVE/AUTO_RESOLVED lifecycle (section 7/8).
+    A condition still present on this poll: update last_seen_at/
+    occurrence_count on the SAME row, never a new one. A condition that
+    was ACTIVE and is no longer observed: AUTO_RESOLVED. An
+    already-ACKNOWLEDGED incident that recurs re-activates (reopen)."""
+    store=_load_incidents();items=store.setdefault("items",{})
+    now_iso=now_text();seen=set()
+    for fp,itype,severity,source,server,service,summary,reason,evidence in conditions:
+        seen.add(fp)
+        existing=items.get(fp)
+        if existing and existing.get("status") in ("ACTIVE","ACKNOWLEDGED"):
+            existing["last_seen_at"]=now_iso;existing["occurrence_count"]=int(existing.get("occurrence_count",1))+1
+            existing["summary"]=summary;existing["technical_reason"]=reason;existing["evidence"]=evidence
+            if existing.get("status")=="ACKNOWLEDGED" and existing.get("_reopen_on_recur",True):
+                pass  # stays ACKNOWLEDGED until a human/auto-resolve changes it -- recurrence alone doesn't spam
+        else:
+            cycles=list((existing or {}).get("cycles") or [])
+            cycles.append({"started_at":now_iso,"resolved_at":None})
+            items[fp]={"incident_id":(existing or {}).get("incident_id") or uuid.uuid4().hex,
+                "fingerprint":fp,"incident_type":itype,"severity":severity,"source":source,"server":server,"service":service,
+                "started_at":(existing or {}).get("started_at") or now_iso,"last_seen_at":now_iso,"resolved_at":None,
+                "status":"ACTIVE","summary":summary,"technical_reason":reason,"impact":"","evidence":evidence,
+                "diagnostic_summary":"","acknowledged_by":"","resolution_reason":"",
+                "occurrence_count":int((existing or {}).get("occurrence_count",0))+1,"cycles":cycles[-200:]}
+    for fp,inc in list(items.items()):
+        if inc.get("status") in ("ACTIVE","ACKNOWLEDGED") and fp not in seen:
+            inc["status"]="AUTO_RESOLVED";inc["resolved_at"]=now_iso
+            if inc.get("cycles") and not inc["cycles"][-1].get("resolved_at"):inc["cycles"][-1]["resolved_at"]=now_iso
+    _save_incidents(store)
+    return items
+
+_notification_health={"last_run_at":None,"last_success_at":None,"last_error":""}
+
+def _incident_monitor_loop():
+    while True:
+        try:
+            items=sync_incidents(_incident_conditions())
+            _notification_health["last_run_at"]=now_text()
+            try:
+                # Reconciled every cycle, not just on the open/close edge --
+                # this is what makes a mid-dispatch crash self-heal on the
+                # very next poll instead of needing a separate retry queue
+                # (section 34/47).
+                _notification_dispatcher.reconcile(items)
+                _notification_health["last_success_at"]=now_text();_notification_health["last_error"]=""
+            except Exception as e:
+                _notification_health["last_error"]=f"{type(e).__name__}: {e}"
+                try:append_log(f"Notification dispatch error: {type(e).__name__}: {e}")
+                except Exception:pass
+        except Exception as e:
+            try:append_log(f"Incident monitor error: {type(e).__name__}: {e}")
+            except Exception:pass
+        time.sleep(max(10,INCIDENT_POLL_SECONDS))
+
+def start_incident_monitor():
+    threading.Thread(target=_incident_monitor_loop,daemon=True).start()
+
+def _postgres_database_size():
+    """Best-effort read-only DB sizing; credentials never leave the container.
+
+    `docker exec` defaults to the container's root user, not the `postgres`
+    role -- a bare `psql` with no -U/-d then fails closed with "role root
+    does not exist" (confirmed against a real Postgres container while
+    building P4). Connect explicitly as the app's own configured role/DB,
+    using the credentials already present in the target container's own
+    environment (POSTGRES_USER/POSTGRES_PASSWORD/POSTGRES_DB) -- never typed
+    or stored by this Agent."""
+    if not shutil.which("docker"):return None
+    sql="SELECT pg_database_size(current_database());"
+    command=["docker","exec","mesflow-postgres","sh","-lc",
+             f'PGPASSWORD="$POSTGRES_PASSWORD" psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Atqc "{sql}" 2>/dev/null']
+    result=_run_capture(command,12)
+    try:return int(str(result.get("stdout") or "").strip().splitlines()[-1]) if result.get("ok") else None
+    except (ValueError,IndexError):return None
+
+def _postgres_table_sizes(limit=10):
+    """Infrequent, read-only top-table snapshot; never runs on page load."""
+    if not shutil.which("docker"):return []
+    sql=("SELECT n.nspname||'.'||c.relname||'|'||pg_total_relation_size(c.oid) "
+         "FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace "
+         "WHERE c.relkind IN ('r','m') AND n.nspname NOT IN ('pg_catalog','information_schema') "
+         f"ORDER BY pg_total_relation_size(c.oid) DESC LIMIT {int(limit)};")
+    result=_run_capture(["docker","exec","mesflow-postgres","sh","-lc",
+        f'PGPASSWORD="$POSTGRES_PASSWORD" psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Atqc "{sql}" 2>/dev/null'],20)
+    rows=[]
+    if result.get("ok"):
+        for line in str(result.get("stdout") or "").splitlines():
+            try:name,size=line.rsplit("|",1);rows.append((name,int(size)))
+            except (ValueError,TypeError):continue
+    return rows
+
+# P4 Backup / DB / Storage Center. Deliberately separate storage from the
+# existing MESFlow source-code rollback snapshots (DATA_DIR/mes_backups,
+# see the comment near MESFLOW_RELEASE_RETENTION above) -- these are real
+# PostgreSQL database backups (pg_dump), a different concern entirely
+# (section 38: "keep them distinct").
+DB_BACKUPS_DIR=DATA_DIR/"db_backups"
+DB_BACKUPS_FILE=CONFIG_DIR/"db_backups.json"
+RESTORE_DRILLS_FILE=CONFIG_DIR/"restore_drills.json"
+DB_AUDIT_FILE=CONFIG_DIR/"db_audit.json"
+_pg_target=db_backup.PostgresTarget(container=os.environ.get("MESFLOW_POSTGRES_CONTAINER","mesflow-postgres"))
+_db_audit_lock=threading.Lock()
+
+def _db_audit(action,data):
+    """Structured audit trail for every P4 mutation (section 38/58), on top
+    of the existing human-readable AGENT_LOG -- every backup/verify/pin/
+    retention-delete/restore-drill action is recorded here with actor,
+    reason and timestamp, never silently."""
+    entry={"action":action,"at":now_text(),**{k:v for k,v in data.items()}}
+    with _db_audit_lock:
+        store=load_json(DB_AUDIT_FILE,{"items":[]})
+        items=store.setdefault("items",[]);items.append(entry)
+        store["items"]=items[-1000:]
+        save_json(DB_AUDIT_FILE,store)
+    try:append_log(f"[db-audit] {action}: "+", ".join(f"{k}={v}" for k,v in data.items() if k not in ("evidence",)))
+    except Exception:pass
+
+_db_backup_service=db_backup.BackupService(_pg_target,DB_BACKUPS_DIR,DB_BACKUPS_FILE,
+    app_version_provider=lambda:mes_status().get("version",""),audit=_db_audit)
+_db_retention_service=db_backup.RetentionService(_db_backup_service,audit=_db_audit)
+_db_restore_drill_service=db_backup.RestoreDrillService(_pg_target,RESTORE_DRILLS_FILE,audit=_db_audit)
+_db_storage_service=db_backup.StorageService(categories={
+    "backups":DB_BACKUPS_DIR,"postgresql_release_backups":DATA_DIR/"mes_backups",
+    "releases":RELEASES_DIR,"logs":LOG_DIR,"uploads":UPLOAD_DIR,
+})
+
+def _active_restore_drill_source():
+    """Backup id currently referenced by the most recent RUNNING restore
+    drill, if any -- retention must never delete it out from under an
+    in-flight drill (section 63)."""
+    items=_db_restore_drill_service.list()
+    running=next((d for d in items if d.get("status")=="RUNNING"),None)
+    return running.get("backup_id") if running else None
+
+# ---------------------------------------------------------------------
+# Server Incident Recovery Console -- managed MESFlow stack allowlist,
+# dependency-aware recovery, port-conflict-aware diagnosis. Own audit
+# trail, separate from the P4 DB-domain audit above. Container names are
+# env-overridable (matching the existing MESFLOW_POSTGRES_CONTAINER
+# convention _pg_target already uses) SPECIFICALLY so tests can point
+# every managed name at something that provably does not exist -- never
+# reuse the real container names against a real Docker daemon in a test
+# (see AGENTS.md/docs: a spawned "throwaway" test agent hitting real
+# containers is a documented past incident, not a hypothetical).
+# ---------------------------------------------------------------------
+RECOVERY_AUDIT_FILE=CONFIG_DIR/"recovery_audit.json"
+_recovery_audit_lock=threading.Lock()
+
+def _recovery_audit(action,data):
+    entry={"action":action,"at":now_text(),**{k:v for k,v in data.items()}}
+    with _recovery_audit_lock:
+        store=load_json(RECOVERY_AUDIT_FILE,{"items":[]})
+        items=store.setdefault("items",[]);items.append(entry)
+        store["items"]=items[-1000:]
+        save_json(RECOVERY_AUDIT_FILE,store)
+    try:append_log(f"[recovery-audit] {action}: "+", ".join(f"{k}={v}" for k,v in data.items() if k not in ("detail",)))
+    except Exception:pass
+
+MANAGED_SERVICES=[
+    {"id":"postgres","label":"PostgreSQL","container":_pg_target.container,"depends_on":[]},
+    {"id":"mesflow","label":"MESFlow","container":os.environ.get("MESFLOW_APP_CONTAINER","mesflow-app"),"depends_on":["postgres"]},
+    {"id":"nginx","label":"Gateway / Nginx","container":os.environ.get("MESFLOW_NGINX_CONTAINER","mesflow-nginx"),"depends_on":["mesflow"]},
+    {"id":"qa","label":"QA Center","container":os.environ.get("MESFLOW_QA_CONTAINER","mesflow-qa-center"),"depends_on":["mesflow"]},
+]
+
+def _docker_pid_owner_map():
+    """Best-effort PID->container-name map for currently RUNNING
+    containers, used only to label a port conflict's owner in the UI --
+    never to decide whether to kill anything (section 7: never blindly
+    kill a port owner)."""
+    ids_result=_run_capture(["docker","ps","-q"],10)
+    ids=[x for x in ids_result.get("stdout","").splitlines() if x.strip()]
+    if not ids:return {}
+    fmt="{{.Id}}\t{{.Name}}\t{{.State.Pid}}"
+    r=_run_capture(["docker","inspect","--format",fmt,*ids],10)
+    out={}
+    for line in r.get("stdout","").splitlines():
+        parts=line.split("\t")
+        if len(parts)==3 and parts[2].strip().isdigit():
+            pid=int(parts[2].strip())
+            if pid:out[pid]=parts[1].lstrip("/")
+    return out
+
+_recovery_service=recovery.RecoveryOrchestrator(
+    MANAGED_SERVICES,_run_capture,
+    mes_status_fn=mes_status,qa_status_fn=qa_status,
+    server_role_provider=lambda:SERVER_ROLE,
+    hostname_provider=socket.gethostname,
+    audit=_recovery_audit,
+    listeners_fn=lambda:ops_ports(),  # ops_ports() is defined later in this file; resolve lazily at call time.
+    container_pid_lookup_fn=_docker_pid_owner_map,
+    allow_production_test_start=str(os.environ.get("MESFLOW_RECOVERY_ALLOW_TEST_START","1")).lower() in {"1","true","yes","on"},
+)
+
+def _incident_recovery_recommendation(incident):
+    """Attaches the safe recovery action(s) for a known incident type
+    (section 6) -- computed fresh at read time from live container
+    state, never persisted into incidents.json. Returns None for
+    incident types this console has no managed-service mapping for
+    (e.g. DISK_CRITICAL) so the UI simply shows no recovery block."""
+    try:
+        return _recovery_service.recommend_for_incident(incident.get("incident_type",""))
+    except recovery.NotManagedError:
+        return None
+
+# ---------------------------------------------------------------------
+# P5 Multi-server: Server Registry / Fleet Health / Remote Agent client
+# ---------------------------------------------------------------------
+# Communication reuses the existing, already-tested session+CSRF client
+# (_remote_agent_client/_remote_agent_get_json, in production use by
+# scripts/promote-test.sh long before this task) rather than a new
+# protocol -- see agent_backend/fleet.py's module docstring.
+SERVERS_FILE=CONFIG_DIR/"servers.json"
+LOCAL_SERVER_ID="local"
+_server_registry=fleet.ServerRegistryService(SERVERS_FILE,audit=_db_audit)
+
+def _p5_environment_from_server_role(role):
+    """P5's registry vocabulary is deliberately DEV/TEST/PRODUCTION/OTHER
+    (section 4) -- NOT the same as P3's environment_label(), which maps
+    SERVER_ROLE=DEV to the notification-facing label "LOCAL". Conflating
+    the two would make a DEV control-plane node register itself under an
+    environment value ("LOCAL") the registry doesn't even accept."""
+    role=(role or "").strip().upper()
+    if role=="DEV":return "DEV"
+    if role in ("TEST","PRODUCTION_TEST"):return "TEST"
+    if role=="PRODUCTION":return "PRODUCTION"
+    return "OTHER"
+
+def _register_local_server():
+    """Section 70: the current host is a first-class server in its own
+    registry, using the SAME model remote nodes use -- never a special
+    case. Never overwrites an already-registered local record (idempotent
+    across restarts)."""
+    if _server_registry.get(LOCAL_SERVER_ID):return
+    env=_p5_environment_from_server_role(SERVER_ROLE)
+    roles=["CONTROL"] if env=="DEV" else ["MESFLOW","POSTGRESQL","DEPLOY_AGENT"]+(["QA"] if QA_URL else [])
+    _server_registry.register(server_id=LOCAL_SERVER_ID,name=socket.gethostname() or "local",environment=env,
+        roles=roles,agent_url="local",hostname=socket.gethostname(),production_confirmed=(env=="PRODUCTION"),actor="system")
+    _server_registry.record_handshake(LOCAL_SERVER_ID,{"agent_id":_agent_instance_id(),
+        "agent_version":AGENT_VERSION,"capabilities":AGENT_CAPABILITIES,"hostname":socket.gethostname()},actor="system")
+
+def _normalize_remote_error(exc):
+    """Section 65: every remote failure collapses to one of a small,
+    UI-meaningful set of codes -- never a raw traceback as the primary
+    signal."""
+    if isinstance(exc,_RemoteAgentError):
+        text=str(exc)
+        return (fleet.ERROR_AUTH_FAILED if "LOGIN_FAILED" in text else fleet.ERROR_OPERATION_FAILED),text
+    if isinstance(exc,TimeoutError) or isinstance(exc,socket.timeout):
+        return fleet.ERROR_TIMEOUT,f"{type(exc).__name__}: {exc}"
+    if isinstance(exc,urllib.error.URLError):
+        reason=getattr(exc,"reason",exc)
+        if isinstance(reason,(TimeoutError,socket.timeout)):return fleet.ERROR_TIMEOUT,f"timeout: {exc}"
+        return fleet.ERROR_UNREACHABLE,f"{type(exc).__name__}: {exc}"
+    return fleet.ERROR_OPERATION_FAILED,f"{type(exc).__name__}: {exc}"
+
+def _local_fleet_identity():
+    return {"agent_id":_agent_instance_id(),"agent_version":AGENT_VERSION,
+            "capabilities":AGENT_CAPABILITIES,"hostname":socket.gethostname(),
+            "api_protocol_version":API_PROTOCOL_VERSION,"server_role":SERVER_ROLE,
+            "mes":mes_status(),"qa":(qa_status() if QA_URL else {"configured":False})}
+
+def _remote_session(server_raw,timeout=25):
+    """Returns an authenticated (opener,base) for a non-local registered
+    server -- raises _RemoteAgentError/URLError on failure, never silently
+    swallowed. `server_raw` must come from ServerRegistryService.get_raw()
+    (needs the real credential); never pass a redacted record here."""
+    url=server_raw.get("agent_url") or ""
+    if not url:raise _RemoteAgentError("REMOTE_AGENT_NOT_CONFIGURED: no agent_url on this server record")
+    opener,base,csrf=_remote_agent_client(url,server_raw.get("agent_user") or "admin",server_raw.get("agent_password") or "",timeout=timeout)
+    return opener,base,csrf
+
+def _query_remote_agent(server):
+    """FleetHealthService.poll_fn -- one bounded-timeout call per server,
+    normalized into a RemoteCallResult. `server` here is a REDACTED record
+    (from registry.list()); the raw credential is fetched fresh so a stale
+    closure never outlives a credential rotation."""
+    sid=server["server_id"];t0=time.time()
+    if server.get("agent_url")=="local":
+        return fleet.RemoteCallResult(ok=True,server_id=sid,operation="health",data=_local_fleet_identity(),duration_ms=int((time.time()-t0)*1000))
+    raw=_server_registry.get_raw(sid)
+    try:
+        opener,base,_csrf=_remote_session(raw,timeout=60)
+        status=_remote_agent_get_json(opener,base,"/api/status",timeout=60)
+        return fleet.RemoteCallResult(ok=True,server_id=sid,operation="health",data=status,duration_ms=int((time.time()-t0)*1000))
+    except Exception as exc:
+        code,msg=_normalize_remote_error(exc)
+        return fleet.RemoteCallResult(ok=False,server_id=sid,operation="health",error=msg,error_code=code,duration_ms=int((time.time()-t0)*1000))
+
+_fleet_health_service=fleet.FleetHealthService(_server_registry,_query_remote_agent)
+FLEET_POLL_SECONDS=max(15,int(os.environ.get("MESFLOW_FLEET_POLL_SECONDS","45")))
+_fleet_health_status={"last_run_at":None,"last_success_at":None,"last_error":""}
+
+def _fleet_health_loop():
+    while True:
+        try:
+            _fleet_health_service.poll_once()
+            _fleet_health_status["last_run_at"]=now_text();_fleet_health_status["last_success_at"]=now_text();_fleet_health_status["last_error"]=""
+        except Exception as e:
+            _fleet_health_status["last_run_at"]=now_text();_fleet_health_status["last_error"]=f"{type(e).__name__}: {e}"
+            try:append_log(f"Fleet health poll error: {type(e).__name__}: {e}")
+            except Exception:pass
+        time.sleep(FLEET_POLL_SECONDS)
+
+def start_fleet_health_monitor():
+    _register_local_server()
+    threading.Thread(target=_fleet_health_loop,daemon=True).start()
+
+_server_deploy_locks={}
+_server_deploy_locks_guard=threading.Lock()
+
+def _server_deploy_lock_for(server_id,component):
+    # Lock per (server, component) -- section 23: a QA deploy on another
+    # server, or a different component on the same server, must not be
+    # blocked by an in-flight deploy elsewhere.
+    key=f"{server_id}:{component}"
+    with _server_deploy_locks_guard:
+        lock=_server_deploy_locks.get(key)
+        if lock is None:
+            lock=threading.Lock();_server_deploy_locks[key]=lock
+        return lock
+
+def _deploy_release_to_server(server_id,version,component="mesflow",actor="",confirm=False):
+    """Section 20/21: routes a deploy through a REGISTERED server reference
+    -- never a raw host/IP taken from the request. Reuses the exact
+    upload/status HTTP contract _run_promote_test already uses (same local
+    artifact, no remote rebuild); this is the server_id-addressed
+    generalization of that same mechanism (section 69: the original
+    PRODUCTION_TEST/PRODUCTION env-var-configured promotion buttons keep
+    working completely unmodified alongside this new path).
+
+    Stops at "stage + verify digest" (returns digest_match evidence) --
+    the remote's own /upload handler queues its own local deploy job
+    asynchronously (existing, tested behavior, unchanged here); this
+    function does not block waiting for that remote job.
+
+    SAFETY (found the hard way while building this task -- see
+    reports/P5_MULTI_SERVER.md "Safety incident"): the remote's /upload
+    handler ALWAYS auto-triggers a real local deploy, which runs real
+    docker-compose operations against container names fixed by the
+    release's own compose.yml (e.g. "mesflow-app"). Docker container names
+    are global on a given daemon -- a "remote" Agent that happens to share
+    THIS HOST's Docker daemon (a loopback/same-host target) can therefore
+    stop/replace the REAL production container of the same name, even
+    though it is a different Agent process on a different port. A
+    same-host target is refused outright unless the operator explicitly
+    opts in, acknowledging the risk, via MESFLOW_ALLOW_LOOPBACK_DEPLOY=1."""
+    if component!="mesflow":raise _RemoteAgentError(f"UNSUPPORTED_COMPONENT: {component}")
+    record=_server_registry.get(server_id)
+    if not record:raise _RemoteAgentError("SERVER_NOT_FOUND")
+    if not record.get("enabled") or record.get("registration_status") not in ("ACTIVE","UNREACHABLE"):
+        raise _RemoteAgentError(f"SERVER_NOT_DEPLOYABLE: registration_status={record.get('registration_status')}")
+    if record.get("environment")=="PRODUCTION":
+        # Section 22/72: explicit approval, resolved from the REGISTRY's
+        # own environment classification -- never from a request field.
+        if os.environ.get("MESFLOW_PRODUCTION_PROMOTE_ENABLED","").strip().lower() not in {"1","true","yes","on"} or not confirm:
+            raise _RemoteAgentError("PRODUCTION_DEPLOY_NOT_APPROVED: set MESFLOW_PRODUCTION_PROMOTE_ENABLED=1 on this Agent AND pass confirm=true")
+    elif record.get("environment")!="TEST":
+        raise _RemoteAgentError(f"UNSUPPORTED_TARGET_ENVIRONMENT: {record.get('environment')} (only TEST/PRODUCTION servers accept deploys)")
+    # Authorization is settled above; this is the last gate before any
+    # credential resolution or remote call is attempted.
+    target_host=urlparse(record.get("agent_url") or "").hostname or ""
+    if target_host in ("127.0.0.1","localhost","::1") and os.environ.get("MESFLOW_ALLOW_LOOPBACK_DEPLOY","").strip().lower() not in {"1","true","yes","on"}:
+        raise _RemoteAgentError(
+            "LOOPBACK_DEPLOY_REFUSED: this server's agent_url resolves to this same host. Deploying to a "
+            "same-host target can mutate a REAL container of the same name (container names are global on "
+            "a Docker daemon, not isolated per Agent). Set MESFLOW_ALLOW_LOOPBACK_DEPLOY=1 to override, only "
+            "in a fully isolated environment with no same-named production container present.")
+    lock=_server_deploy_lock_for(server_id,component)
+    if not lock.acquire(False):raise _RemoteAgentError("DEPLOY_ALREADY_RUNNING_FOR_THIS_SERVER_COMPONENT")
+    try:
+        artifact=_artifact_for_release(version)
+        if not artifact.get("package") or not Path(artifact["package"]).is_file():
+            raise _RemoteAgentError("PACKAGE_NOT_FOUND")
+        zip_path=Path(artifact["package"]);local_sha=sha(zip_path)
+        if artifact.get("package_sha256") and artifact["package_sha256"]!=local_sha:
+            raise _RemoteAgentError("PACKAGE_SHA_SELF_CHECK_FAILED")
+        raw=_server_registry.get_raw(server_id)
+        opener,base,csrf=_remote_agent_client(raw["agent_url"],raw.get("agent_user") or "admin",raw.get("agent_password") or "",timeout=30)
+        target_status=_remote_agent_get_json(opener,base,"/api/status")
+        compat=_agent_compatibility(target_status)
+        if compat["status"]=="INCOMPATIBLE":raise _RemoteAgentError(f"TARGET_AGENT_INCOMPATIBLE: {compat['reason']}")
+        _db_audit("REMOTE_DEPLOY_STARTED",{"server_id":server_id,"version":version,"component":component,"actor":actor,"local_sha256":local_sha[:16]})
+        _remote_agent_upload(opener,base,csrf,zip_path,timeout=600)
+        # Digest evidence (section 84): read back the remote's OWN manifest
+        # for this version and compare -- proves byte-identical transfer,
+        # never a remote rebuild.
+        remote_releases=_remote_agent_get_json(opener,base,"/api/releases")
+        remote_entry=next((r for r in remote_releases.get("items",[]) if canonical_version(r.get("version",""))==canonical_version(version)),None)
+        digest_match=bool(remote_entry and remote_entry.get("sha256")==local_sha)
+        result={"server_id":server_id,"version":version,"component":component,"local_sha256":local_sha,
+                "remote_sha256":(remote_entry or {}).get("sha256",""),"digest_match":digest_match}
+        _db_audit("REMOTE_DEPLOY_ARTIFACT_TRANSFERRED",{"server_id":server_id,"version":version,"digest_match":digest_match,"actor":actor})
+        return result
+    except Exception as exc:
+        code=str(exc) if isinstance(exc,_RemoteAgentError) else f"{type(exc).__name__}: {exc}"
+        _db_audit("REMOTE_DEPLOY_FAILED",{"server_id":server_id,"version":version,"error":code,"actor":actor})
+        raise
+    finally:
+        lock.release()
+
+def _remote_get_json_for_server(server_id,path,timeout=60):
+    """Routes a read-only GET to a REMOTE (never 'local') target resolved
+    strictly from the trusted registry -- never a caller-supplied URL
+    (section 36/37). Callers must handle the local-server case themselves
+    by calling the equivalent in-process function directly (no HTTP
+    loopback to self). Returns (ok,data_or_None,error_code,error_message)."""
+    record=_server_registry.get(server_id)
+    if not record:return False,None,"NOT_FOUND","unknown server_id"
+    if not record.get("enabled") or record.get("registration_status") in ("DISABLED","REVOKED"):
+        return False,None,"SERVER_DISABLED",f"server is {record.get('registration_status')}"
+    raw=_server_registry.get_raw(server_id)
+    try:
+        opener,base,_csrf=_remote_session(raw,timeout=timeout)
+        data=_remote_agent_get_json(opener,base,path,timeout=timeout)
+        return True,data,"",""
+    except Exception as exc:
+        code,msg=_normalize_remote_error(exc)
+        return False,None,code,msg
+
+def _remote_post_json_for_server(server_id,path,payload=None,timeout=60):
+    """POST-JSON sibling of _remote_get_json_for_server -- same registry-
+    resolved-target contract (section 36/37/71)."""
+    record=_server_registry.get(server_id)
+    if not record:return False,None,"NOT_FOUND","unknown server_id"
+    if not record.get("enabled") or record.get("registration_status") in ("DISABLED","REVOKED"):
+        return False,None,"SERVER_DISABLED",f"server is {record.get('registration_status')}"
+    raw=_server_registry.get_raw(server_id)
+    try:
+        opener,base,csrf=_remote_session(raw,timeout=timeout)
+        data=_remote_agent_post_json(opener,base,path,csrf,payload,timeout=timeout)
+        return True,data,"",""
+    except Exception as exc:
+        code,msg=_normalize_remote_error(exc)
+        return False,None,code,msg
+
+def _production_mutation_approved(payload):
+    return (os.environ.get("MESFLOW_PRODUCTION_PROMOTE_ENABLED","").strip().lower() in {"1","true","yes","on"}
+            and bool(payload.get("confirm")))
+
+def collect_predictive_samples(sampled_at=None):
+    """Bounded, read-only sampler. Never runs during an HTTP request."""
+    timestamp=sampled_at or datetime.now().astimezone().isoformat()
+    root=psutil.disk_usage('/') if os.name!='nt' else psutil.disk_usage(Path.cwd().anchor)
+    vm=psutil.virtual_memory()
+    rows=[_metric_store.add("disk_used_bytes",root.used,"bytes","root",{"total_bytes":root.total},timestamp),
+          _metric_store.add("cpu_percent",psutil.cpu_percent(interval=None),"percent","host",{},timestamp),
+          _metric_store.add("ram_percent",vm.percent,"percent","host",{},timestamp)]
+    db_size=_postgres_database_size()
+    if db_size is not None:
+        rows.append(_metric_store.add("db_size_bytes",db_size,"bytes","postgresql",{},timestamp))
+        table_rows=_metric_store.samples("db_table_size_bytes",None)
+        last_table=max((datetime.fromisoformat(str(x["sampled_at"]).replace("Z","+00:00")).timestamp() for x in table_rows),default=0)
+        current_epoch=datetime.fromisoformat(timestamp.replace("Z","+00:00")).timestamp()
+        if current_epoch-last_table>=3600:
+            for table,size in _postgres_table_sizes():rows.append(_metric_store.add("db_table_size_bytes",size,"bytes",table,{},timestamp))
+    return rows
+
+def predictive_summary():
+    disk_samples=_metric_store.samples("disk_used_bytes","root")
+    disk_capacity=None
+    if disk_samples:disk_capacity=(disk_samples[-1].get("metadata") or {}).get("total_bytes")
+    disk=linear_forecast(disk_samples,disk_capacity,min_samples=PREDICTIVE_MIN_SAMPLES,min_hours=PREDICTIVE_MIN_HOURS)
+    db_samples=_metric_store.samples("db_size_bytes","postgresql")
+    db=linear_forecast(db_samples,None,thresholds=(),min_samples=PREDICTIVE_MIN_SAMPLES,min_hours=PREDICTIVE_MIN_HOURS)
+    db_anomaly=robust_anomaly(db_samples,min_samples=PREDICTIVE_MIN_SAMPLES)
+    disk_anomaly=robust_anomaly(disk_samples,min_samples=PREDICTIVE_MIN_SAMPLES)
+    cpu_anomaly=robust_anomaly(_metric_store.samples("cpu_percent","host"),min_samples=PREDICTIVE_MIN_SAMPLES)
+    ram_anomaly=robust_anomaly(_metric_store.samples("ram_percent","host"),min_samples=PREDICTIVE_MIN_SAMPLES)
+    table_samples=_metric_store.samples("db_table_size_bytes",None);table_names=sorted({x.get("component_id","") for x in table_samples})
+    table_growth=[]
+    for table in table_names:
+        forecast=linear_forecast([x for x in table_samples if x.get("component_id")==table],None,thresholds=(),min_samples=max(5,min(PREDICTIVE_MIN_SAMPLES,8)),min_hours=24)
+        latest=max((float(x["value"]) for x in table_samples if x.get("component_id")==table),default=0)
+        table_growth.append({"table":table,"current_bytes":latest,"growth_per_day":forecast.growth_per_day,"confidence":forecast.confidence})
+    table_growth.sort(key=lambda x:(x["growth_per_day"] or 0,x["current_bytes"]),reverse=True)
+    incidents=list(_load_incidents().get("items",{}).values())
+    recurring=recurring_failures(incidents)
+    insights=[]
+    days90=disk.thresholds.get("90") if disk.thresholds else None
+    if days90 is not None:
+        risk="HIGH" if days90<PREDICTIVE_DISK_HIGH_DAYS else "MEDIUM" if days90<PREDICTIVE_DISK_MEDIUM_DAYS else "LOW" if days90<30 else "INFO"
+        insight={"id":"disk-capacity-root","type":"DISK_CAPACITY_RISK","risk":risk,"status":"ACTIVE","predicted":True,
+                 "title":f"Disk có thể đạt 90% trong khoảng {max(1,round(days90))} ngày","confidence":disk.confidence,"evidence":{"forecast":asdict(disk)}}
+        insight["suggested_checks"]=deterministic_suggestions(insight);insights.append(insight)
+    if db_anomaly.get("status")=="ANOMALOUS":
+        insight={"id":"db-growth-anomaly","type":"DB_GROWTH_ANOMALY","risk":"MEDIUM","status":"ACTIVE","predicted":True,
+                 "title":"Tốc độ tăng PostgreSQL lệch khỏi baseline","confidence":db_anomaly.get("confidence"),"evidence":{"anomaly":db_anomaly,"forecast":asdict(db)}}
+        insight["suggested_checks"]=deterministic_suggestions(insight);insights.append(insight)
+    for name,anomaly in (("CPU",cpu_anomaly),("RAM",ram_anomaly),("DISK_USAGE",disk_anomaly)):
+        if anomaly.get("status")=="ANOMALOUS":insights.append({"id":"anomaly-"+name.lower(),"type":"METRIC_ANOMALY","risk":"LOW","status":"ACTIVE","predicted":True,
+            "title":f"{name} khác baseline lịch sử","confidence":anomaly.get("confidence"),"evidence":{"anomaly":anomaly},"suggested_checks":[]})
+    for row in recurring[:10]:
+        insight={"id":"recurring-"+hashlib.sha256(row["fingerprint"].encode()).hexdigest()[:12],"type":"RECURRING_FAILURE","risk":row["risk"],"status":"ACTIVE","predicted":True,
+                 "title":f'{row["fingerprint"]} lặp lại {row["incidents"]} lần',"confidence":"HIGH" if row["incidents"]>=5 else "MEDIUM","evidence":{"recurrence":row}}
+        insight["suggested_checks"]=deterministic_suggestions(insight);insights.append(insight)
+    risk_order={"HIGH":4,"MEDIUM":3,"LOW":2,"INFO":1};insights.sort(key=lambda x:risk_order.get(x["risk"],0),reverse=True)
+    return {"ok":True,"generated_at":now_text(),"learning_baseline":disk.status=="INSUFFICIENT_DATA" and db.status=="INSUFFICIENT_DATA",
+            "disk":asdict(disk),"database":{**asdict(db),"fastest_growing_tables":table_growth[:10]},"anomalies":{"database_size":db_anomaly,"disk_usage":disk_anomaly,"cpu":cpu_anomaly,"ram":ram_anomaly},"recurring":recurring,"insights":insights[:20],
+            "policy":{"sample_seconds":PREDICTIVE_SAMPLE_SECONDS,"raw_days":PREDICTIVE_RAW_DAYS,"hourly_days":PREDICTIVE_HOURLY_DAYS,"daily_days":PREDICTIVE_DAILY_DAYS,
+                      "minimum_samples":PREDICTIVE_MIN_SAMPLES,"minimum_hours":PREDICTIVE_MIN_HOURS}}
+
+def _predictive_monitor_loop():
+    while True:
+        try:collect_predictive_samples()
+        except Exception as error:
+            try:append_log(f"Predictive sampler degraded: {type(error).__name__}: {error}")
+            except Exception:pass
+        time.sleep(PREDICTIVE_SAMPLE_SECONDS)
+
+def start_predictive_monitor():
+    threading.Thread(target=_predictive_monitor_loop,daemon=True).start()
 
 def ops_backups():
     """Read-only rollback/backup readiness: what _create_linux_backup() has
@@ -3003,25 +5398,548 @@ def _ssh_exec(host,port,user,command,password=None,key_path=None,timeout=12):
 
 @app.get('/ops')
 def ops_page():
-    return render_template('ops.html',csrf=session.get('csrf',''),agent_version=AGENT_VERSION)
+    view=request.args.get('view','overview')
+    # Real bug found+fixed (reports/SERVICES_DIAGNOSTICS_AUDIT_FIX.md):
+    # 'diagnostics' used to have no view/section of its own -- the sidebar's
+    # "Chẩn đoán" link pointed at ?view=services (the generic host/systemd
+    # units list, HỆ THỐNG group), and this page_keys dict force-mapped that
+    # SAME view to page_key='diagnostics' so that one link would highlight
+    # correctly. But the HỆ THỐNG group has its own, separate "Services"
+    # link to that identical ?view=services URL expecting page_key='services'
+    # -- so clicking THAT link always ended up highlighting "Chẩn đoán"
+    # instead, and neither link ever showed anything resembling diagnosis.
+    # Diagnostics is now a real, distinct view/section (see ops.html) with
+    # its own URL, so no special-case remap is needed for it any more.
+    allowed={'overview','fleet','alerts','incidents','services','diagnostics','docker','ports','backup','logs','terminal','recovery'}
+    if view not in allowed:view='overview'
+    # 'overview' still needs remapping: this page's own ?view=overview (Sức
+    # khoẻ hệ thống) must not collide with the dashboard route's
+    # page_key='overview' (Tổng quan, a different sidebar group entirely).
+    page_keys={'overview':'health'}
+    return render_template('ops.html',csrf=session.get('csrf',''),agent_version=AGENT_VERSION,
+                           server_role=SERVER_ROLE,initial_view=view,page_key=page_keys.get(view,view),
+                           initial_target=request.args.get('target',''))
 
+def _internal_allowed():
+    # Same shared secret/pattern MESFlow itself uses for the reverse direction
+    # (mesflow.web.internal_ota._internal_allowed): a constant-time compare
+    # against MESFLOW_INTERNAL_API_TOKEN, already provisioned on both sides.
+    expected=str(os.environ.get("MESFLOW_INTERNAL_API_TOKEN") or "").strip()
+    supplied=str(request.headers.get("X-MESFlow-Internal-Token") or "").strip()
+    return bool(expected and supplied and hmac.compare_digest(expected,supplied))
+
+@app.get('/api/ops/summary', endpoint='ops_summary')
 @app.get('/api/ops/summary')
-def api_ops_summary(): return jsonify(ops_summary())
+def api_ops_summary():
+    # Exempted from the blanket before_request login-redirect (see protect())
+    # so MESFlow's System Health provider can read CPU/RAM/Disk/Docker
+    # without a browser session -- but still requires either a real login
+    # session (existing Ops Console UI) or the shared internal token.
+    if not (logged_in() or _internal_allowed()): return jsonify({"ok":False,"error":"AUTH_REQUIRED"}),401
+    summary=ops_summary()
+    # section 35: if the notification/incident monitor loop stops running,
+    # System Health must eventually show this subsystem as degraded rather
+    # than silently losing alerts.
+    summary["notifications"]={**_notification_health,"channels":_notification_dispatcher.channel_status()}
+    return jsonify(summary)
 
 @app.get('/api/ops/backups')
 def api_ops_backups(): return jsonify(ops_backups())
+
+@app.get('/api/incidents')
+def api_incidents():
+    # Same availability contract as /api/ops/summary: usable via this
+    # Agent's own login OR the shared internal token, deliberately NOT
+    # coupled to MESFlow's own session (section 5 -- must stay reachable
+    # when MESFlow itself is down).
+    if not (logged_in() or _internal_allowed()): return jsonify({"ok":False,"error":"AUTH_REQUIRED"}),401
+    status=request.args.get('status','').strip().upper()
+    items=list(_load_incidents().get('items',{}).values())
+    if status:items=[i for i in items if i.get('status')==status]
+    items.sort(key=lambda i:i.get('last_seen_at',''),reverse=True)
+    return jsonify({"ok":True,"items":items})
+
+@app.get('/api/incidents/<incident_id>')
+def api_incident_detail(incident_id):
+    if not (logged_in() or _internal_allowed()): return jsonify({"ok":False,"error":"AUTH_REQUIRED"}),401
+    item=next((i for i in _load_incidents().get('items',{}).values() if i.get('incident_id')==incident_id),None)
+    if not item:return jsonify({"ok":False,"error":"NOT_FOUND"}),404
+    item=dict(item);item["recovery"]=_incident_recovery_recommendation(item)
+    return jsonify({"ok":True,"item":item})
+
+@app.get('/api/ops/predictions')
+def api_ops_predictions():
+    if not (logged_in() or _internal_allowed()): return jsonify({"ok":False,"error":"AUTH_REQUIRED"}),401
+    return jsonify(predictive_summary())
+
+@app.get('/api/ops/metrics/<metric>/trend')
+def api_ops_metric_trend(metric):
+    if not (logged_in() or _internal_allowed()): return jsonify({"ok":False,"error":"AUTH_REQUIRED"}),401
+    if metric not in {"disk_used_bytes","db_size_bytes","cpu_percent","ram_percent"}:return jsonify({"ok":False,"error":"UNKNOWN_METRIC"}),404
+    component={"disk_used_bytes":"root","db_size_bytes":"postgresql","cpu_percent":"host","ram_percent":"host"}[metric]
+    rows=_metric_store.samples(metric,component)
+    return jsonify({"ok":True,"metric":metric,"component_id":component,"items":rows[-1000:]})
+
+def _incident_by_id(incident_id):
+    return next((i for i in _load_incidents().get('items',{}).values() if i.get('incident_id')==incident_id),None)
+
+@app.get('/api/incidents/<incident_id>/ai-analysis')
+def api_incident_ai_analysis(incident_id):
+    if not (logged_in() or _internal_allowed()): return jsonify({"ok":False,"error":"AUTH_REQUIRED"}),401
+    incident=_incident_by_id(incident_id)
+    if not incident:return jsonify({"ok":False,"error":"NOT_FOUND"}),404
+    summary=predictive_summary()
+    return jsonify({"ok":True,"analysis":_incident_ai.analyze(incident,{"disk":summary["disk"],"database":summary["database"],"anomalies":summary["anomalies"]},summary["recurring"])})
+
+@app.post('/api/incidents/<incident_id>/ai-analysis/regenerate')
+def api_incident_ai_regenerate(incident_id):
+    if not logged_in(): return jsonify({"ok":False,"error":"AUTH_REQUIRED"}),401
+    verify_csrf();incident=_incident_by_id(incident_id)
+    if not incident:return jsonify({"ok":False,"error":"NOT_FOUND"}),404
+    summary=predictive_summary()
+    analysis=_incident_ai.analyze(incident,{"disk":summary["disk"],"database":summary["database"],"anomalies":summary["anomalies"]},summary["recurring"],force=True)
+    analysis["requested_by"]=session.get("username","")
+    return jsonify({"ok":True,"analysis":analysis})
+
+@app.post('/api/incidents/<incident_id>/acknowledge')
+def api_incident_acknowledge(incident_id):
+    # Acknowledging is a human decision, not a monitoring signal --
+    # requires a real login session (never the internal token) and CSRF,
+    # same as every other state-changing route in this Agent.
+    if not logged_in(): return jsonify({"ok":False,"error":"AUTH_REQUIRED"}),401
+    verify_csrf()
+    store=_load_incidents()
+    for inc in store.get('items',{}).values():
+        if inc.get('incident_id')==incident_id:
+            inc['status']='ACKNOWLEDGED';inc['acknowledged_by']=session.get('username','')
+            _save_incidents(store)
+            return jsonify({"ok":True,"item":inc})
+    return jsonify({"ok":False,"error":"NOT_FOUND"}),404
+
+@app.post('/api/incidents/<incident_id>/resolve')
+def api_incident_resolve(incident_id):
+    # Manual resolve, e.g. a known false positive or a fix already applied
+    # out of band -- still just a status/text update, never triggers any
+    # infrastructure action (section 14).
+    if not logged_in(): return jsonify({"ok":False,"error":"AUTH_REQUIRED"}),401
+    verify_csrf()
+    reason=str((request.get_json(silent=True) or {}).get('reason','')).strip()
+    store=_load_incidents()
+    for inc in store.get('items',{}).values():
+        if inc.get('incident_id')==incident_id:
+            inc['status']='RESOLVED';inc['resolved_at']=now_text();inc['resolution_reason']=reason
+            if inc.get('cycles') and not inc['cycles'][-1].get('resolved_at'):inc['cycles'][-1]['resolved_at']=inc['resolved_at']
+            _save_incidents(store)
+            return jsonify({"ok":True,"item":inc})
+    return jsonify({"ok":False,"error":"NOT_FOUND"}),404
+
+@app.get('/api/incidents/<incident_id>/notifications')
+def api_incident_notifications(incident_id):
+    # section 37 (Incident Drawer "Notifications" section) -- same
+    # availability contract as the incident routes themselves.
+    if not (logged_in() or _internal_allowed()): return jsonify({"ok":False,"error":"AUTH_REQUIRED"}),401
+    incident=_incident_by_id(incident_id)
+    if not incident:return jsonify({"ok":False,"error":"NOT_FOUND"}),404
+    return jsonify({"ok":True,"items":_notification_dispatcher.deliveries_for(incident_id)})
+
+@app.get('/api/notification-channels')
+def api_notification_channels():
+    if not (logged_in() or _internal_allowed()): return jsonify({"ok":False,"error":"AUTH_REQUIRED"}),401
+    return jsonify({"ok":True,"channels":_notification_dispatcher.channel_status(),
+        "min_severity":_notification_dispatcher.min_severity,"environment":_notification_dispatcher.environment})
+
+@app.post('/api/notification-channels/<channel>/test')
+def api_notification_channel_test(channel):
+    # section 31: explicit admin-only test send, never a fabricated incident.
+    if not logged_in(): return jsonify({"ok":False,"error":"AUTH_REQUIRED"}),401
+    verify_csrf()
+    if channel.upper() not in ('WEB','TELEGRAM','EMAIL'):return jsonify({"ok":False,"error":"UNKNOWN_CHANNEL"}),400
+    return jsonify(_notification_dispatcher.test_send(channel.upper()))
+
+# ---------------------------------------------------------------------
+# P4 Backup / DB / Storage Center
+# ---------------------------------------------------------------------
+
+@app.get('/api/ops/db/summary')
+def api_ops_db_summary():
+    # Same availability contract as /api/ops/predictions -- a read-only
+    # diagnostic view, usable via this Agent's own login or the internal
+    # token, never coupled to MESFlow's own session.
+    if not (logged_in() or _internal_allowed()): return jsonify({"ok":False,"error":"AUTH_REQUIRED"}),401
+    summary=db_backup.postgres_summary(_pg_target)
+    fastest_growing=predictive_summary()["database"].get("fastest_growing_tables",[])
+    summary["fastest_growing_tables"]=fastest_growing
+    return jsonify({"ok":True,**summary})
+
+@app.get('/api/ops/db-backups')
+def api_ops_db_backups():
+    if not (logged_in() or _internal_allowed()): return jsonify({"ok":False,"error":"AUTH_REQUIRED"}),401
+    return jsonify({"ok":True,"items":_db_backup_service.list()})
+
+@app.post('/api/ops/db-backups')
+def api_ops_db_backups_create():
+    # Manual PostgreSQL backup (P4 vertical slice 1) -- a real login
+    # session and CSRF, same bar as every other state-changing route in
+    # this Agent. Never runs automatically from this route.
+    if not logged_in(): return jsonify({"ok":False,"error":"AUTH_REQUIRED"}),401
+    verify_csrf()
+    payload=request.get_json(silent=True) or {}
+    retention_class=str(payload.get('retention_class') or 'manual').strip()
+    reason=str(payload.get('reason') or '').strip()
+    try:
+        record=_db_backup_service.create(retention_class=retention_class,triggered_by=session.get('username',''),reason=reason)
+    except ValueError as e:
+        return jsonify({"ok":False,"error":"INVALID_RETENTION_CLASS","detail":str(e)}),400
+    except db_backup.ConflictError as e:
+        return jsonify({"ok":False,"error":"BACKUP_ALREADY_RUNNING","detail":str(e)}),409
+    status=200 if record.get('status')=='SUCCESS' else 502
+    return jsonify({"ok":record.get('status')=='SUCCESS',"item":record}),status
+
+@app.get('/api/ops/db-backups/<backup_id>')
+def api_ops_db_backup_detail(backup_id):
+    if not (logged_in() or _internal_allowed()): return jsonify({"ok":False,"error":"AUTH_REQUIRED"}),401
+    record=_db_backup_service.get(backup_id)
+    if not record:return jsonify({"ok":False,"error":"NOT_FOUND"}),404
+    return jsonify({"ok":True,"item":record})
+
+@app.post('/api/ops/db-backups/<backup_id>/verify')
+def api_ops_db_backup_verify(backup_id):
+    if not logged_in(): return jsonify({"ok":False,"error":"AUTH_REQUIRED"}),401
+    verify_csrf()
+    if not _db_backup_service.get(backup_id):return jsonify({"ok":False,"error":"NOT_FOUND"}),404
+    try:
+        record=_db_backup_service.verify(backup_id)
+    except ValueError as e:
+        return jsonify({"ok":False,"error":"CANNOT_VERIFY","detail":str(e)}),400
+    return jsonify({"ok":record.get('verification_status')=='VERIFIED',"item":record})
+
+@app.post('/api/ops/db-backups/<backup_id>/pin')
+def api_ops_db_backup_pin(backup_id):
+    if not logged_in(): return jsonify({"ok":False,"error":"AUTH_REQUIRED"}),401
+    verify_csrf()
+    if not _db_backup_service.get(backup_id):return jsonify({"ok":False,"error":"NOT_FOUND"}),404
+    return jsonify({"ok":True,"item":_db_backup_service.pin(backup_id,actor=session.get('username',''))})
+
+@app.post('/api/ops/db-backups/<backup_id>/unpin')
+def api_ops_db_backup_unpin(backup_id):
+    if not logged_in(): return jsonify({"ok":False,"error":"AUTH_REQUIRED"}),401
+    verify_csrf()
+    if not _db_backup_service.get(backup_id):return jsonify({"ok":False,"error":"NOT_FOUND"}),404
+    return jsonify({"ok":True,"item":_db_backup_service.unpin(backup_id,actor=session.get('username',''))})
+
+@app.post('/api/ops/db-backups/<backup_id>/restore-test')
+def api_ops_db_backup_restore_test(backup_id):
+    # Restore Drill (P4 vertical slice 3): LOCAL/TEST only, isolated
+    # generated temp DB, never Production -- section 21/55. An explicit
+    # confirm flag is required in addition to login+CSRF because this is a
+    # "controlled IT action" against a real Postgres server, even though
+    # the target database itself is always a disposable throwaway.
+    if not logged_in(): return jsonify({"ok":False,"error":"AUTH_REQUIRED"}),401
+    verify_csrf()
+    if environment_label(SERVER_ROLE)=='PRODUCTION':
+        return jsonify({"ok":False,"error":"RESTORE_DRILL_BLOCKED_IN_PRODUCTION",
+            "detail":"Restore drills are only permitted in LOCAL/TEST environments (SERVER_ROLE=%s)"%SERVER_ROLE}),403
+    payload=request.get_json(silent=True) or {}
+    if not payload.get('confirm'):
+        return jsonify({"ok":False,"error":"CONFIRMATION_REQUIRED","detail":"POST {\"confirm\": true} to run a restore drill"}),400
+    record=_db_backup_service.get(backup_id)
+    if not record:return jsonify({"ok":False,"error":"NOT_FOUND"}),404
+    try:
+        drill=_db_restore_drill_service.run(record)
+    except db_backup.RestoreDrillError as e:
+        return jsonify({"ok":False,"error":"RESTORE_DRILL_REJECTED","detail":str(e)}),400
+    if drill.get('status')=='SUCCESS':
+        _db_backup_service.mark_restore_tested(backup_id)
+    return jsonify({"ok":drill.get('status')=='SUCCESS',"item":drill})
+
+@app.get('/api/ops/restore-drills')
+def api_ops_restore_drills():
+    if not (logged_in() or _internal_allowed()): return jsonify({"ok":False,"error":"AUTH_REQUIRED"}),401
+    return jsonify({"ok":True,"items":_db_restore_drill_service.list()})
+
+@app.get('/api/ops/storage')
+def api_ops_storage():
+    if not (logged_in() or _internal_allowed()): return jsonify({"ok":False,"error":"AUTH_REQUIRED"}),401
+    return jsonify({"ok":True,"filesystem":_db_storage_service.filesystem_summary(str(DATA_DIR)),
+        "categories":_db_storage_service.category_sizes(),"docker":_db_storage_service.docker_storage()})
+
+@app.get('/api/ops/storage/retention/preview')
+def api_ops_storage_retention_preview():
+    if not (logged_in() or _internal_allowed()): return jsonify({"ok":False,"error":"AUTH_REQUIRED"}),401
+    return jsonify({"ok":True,**_db_retention_service.preview(active_restore_source=_active_restore_drill_source())})
+
+@app.post('/api/ops/storage/retention/apply')
+def api_ops_storage_retention_apply():
+    # Backup Retention (P4 vertical slice 2): deletes real backup files on
+    # disk -- explicit confirm required in addition to login+CSRF (section
+    # 61: destructive/high-risk actions must never run automatically).
+    if not logged_in(): return jsonify({"ok":False,"error":"AUTH_REQUIRED"}),401
+    verify_csrf()
+    payload=request.get_json(silent=True) or {}
+    if not payload.get('confirm'):
+        return jsonify({"ok":False,"error":"CONFIRMATION_REQUIRED","detail":"POST {\"confirm\": true} to apply retention"}),400
+    reason=str(payload.get('reason') or '').strip()
+    result=_db_retention_service.apply(actor=session.get('username',''),reason=reason,active_restore_source=_active_restore_drill_source())
+    return jsonify({"ok":True,**result})
+
+@app.get('/api/ops/db-audit')
+def api_ops_db_audit():
+    if not (logged_in() or _internal_allowed()): return jsonify({"ok":False,"error":"AUTH_REQUIRED"}),401
+    items=list(reversed(load_json(DB_AUDIT_FILE,{"items":[]}).get('items',[])))
+    return jsonify({"ok":True,"items":items[:500]})
+
+# ---------------------------------------------------------------------
+# P5 Multi-server: Server Registry / Fleet Health API
+# ---------------------------------------------------------------------
+
+def _server_with_cache(record):
+    cached=_fleet_health_service.cached().get(record["server_id"])
+    out=dict(record)
+    if cached:out["last_poll"]={"ok":cached.ok,"error_code":cached.error_code,"duration_ms":cached.duration_ms,"correlation_id":cached.correlation_id}
+    return out
+
+@app.get('/api/servers')
+def api_servers_list():
+    if not (logged_in() or _internal_allowed()): return jsonify({"ok":False,"error":"AUTH_REQUIRED"}),401
+    environment=request.args.get('environment','').strip().upper() or None
+    items=[_server_with_cache(s) for s in _server_registry.list(environment=environment)]
+    return jsonify({"ok":True,"items":items,"summary":_fleet_health_service.fleet_summary()})
+
+@app.post('/api/servers')
+def api_servers_register():
+    # Registering a server is a privileged, audited action (section 8/61) --
+    # never available via the internal token, always a real login+CSRF.
+    if not logged_in(): return jsonify({"ok":False,"error":"AUTH_REQUIRED"}),401
+    verify_csrf()
+    payload=request.get_json(silent=True) or {}
+    name=str(payload.get('name') or '').strip()
+    environment=str(payload.get('environment') or '').strip().upper()
+    if not name:return jsonify({"ok":False,"error":"NAME_REQUIRED"}),400
+    try:
+        record=_server_registry.register(name=name,environment=environment,roles=payload.get('roles') or [],
+            agent_url=str(payload.get('agent_url') or '').strip(),agent_user=str(payload.get('agent_user') or 'admin').strip(),
+            agent_password=str(payload.get('agent_password') or ''),tags=payload.get('tags') or [],
+            hostname=str(payload.get('hostname') or '').strip(),
+            production_confirmed=bool(payload.get('production_confirmed')),actor=session.get('username',''))
+    except ValueError as e:
+        return jsonify({"ok":False,"error":"INVALID_ENVIRONMENT","detail":str(e)}),400
+    except fleet.ProductionConfirmationRequired as e:
+        return jsonify({"ok":False,"error":"PRODUCTION_CONFIRMATION_REQUIRED","detail":str(e)}),403
+    return jsonify({"ok":True,"item":record})
+
+@app.get('/api/servers/<server_id>')
+def api_server_detail(server_id):
+    if not (logged_in() or _internal_allowed()): return jsonify({"ok":False,"error":"AUTH_REQUIRED"}),401
+    record=_server_registry.get(server_id)
+    if not record:return jsonify({"ok":False,"error":"NOT_FOUND"}),404
+    return jsonify({"ok":True,"item":_server_with_cache(record)})
+
+@app.post('/api/servers/<server_id>/test-connection')
+def api_server_test_connection(server_id):
+    # Section 60: a live handshake NOW (never the cache) -- reachable,
+    # authenticated, agent_id/version/hostname/capabilities, all shown
+    # before the server is trusted with anything else.
+    if not logged_in(): return jsonify({"ok":False,"error":"AUTH_REQUIRED"}),401
+    verify_csrf()
+    record=_server_registry.get(server_id)
+    if not record:return jsonify({"ok":False,"error":"NOT_FOUND"}),404
+    result=_query_remote_agent(record)
+    if not result.ok:
+        _server_registry.record_handshake_failure(server_id,result.error,actor=session.get('username',''))
+        return jsonify({"ok":False,"error":result.error_code,"detail":result.error}),502
+    try:
+        updated=_server_registry.record_handshake(server_id,result.data,actor=session.get('username',''))
+    except fleet.DuplicateAgentIdentity as e:
+        return jsonify({"ok":False,"error":"DUPLICATE_AGENT_IDENTITY","detail":str(e)}),409
+    compatibility=_agent_compatibility(result.data)
+    return jsonify({"ok":True,"item":updated,"identity":result.data,"compatibility":compatibility})
+
+@app.post('/api/servers/<server_id>/disable')
+def api_server_disable(server_id):
+    if not logged_in(): return jsonify({"ok":False,"error":"AUTH_REQUIRED"}),401
+    verify_csrf()
+    if not _server_registry.get(server_id):return jsonify({"ok":False,"error":"NOT_FOUND"}),404
+    return jsonify({"ok":True,"item":_server_registry.disable(server_id,actor=session.get('username',''))})
+
+@app.post('/api/servers/<server_id>/enable')
+def api_server_enable(server_id):
+    if not logged_in(): return jsonify({"ok":False,"error":"AUTH_REQUIRED"}),401
+    verify_csrf()
+    if not _server_registry.get(server_id):return jsonify({"ok":False,"error":"NOT_FOUND"}),404
+    return jsonify({"ok":True,"item":_server_registry.enable(server_id,actor=session.get('username',''))})
+
+@app.get('/api/servers/<server_id>/health')
+def api_server_health(server_id):
+    if not (logged_in() or _internal_allowed()): return jsonify({"ok":False,"error":"AUTH_REQUIRED"}),401
+    record=_server_registry.get(server_id)
+    if not record:return jsonify({"ok":False,"error":"NOT_FOUND"}),404
+    return jsonify({"ok":True,"item":_server_with_cache(record)})
+
+@app.post('/api/servers/<server_id>/diagnostics')
+def api_server_diagnostics(server_id):
+    # Section 36: an allowlisted diagnostic, resolved strictly from the
+    # registry -- an immediate live health/status refresh, never an
+    # arbitrary remote command. This is the entire allowlist for now.
+    if not logged_in(): return jsonify({"ok":False,"error":"AUTH_REQUIRED"}),401
+    verify_csrf()
+    record=_server_registry.get(server_id)
+    if not record:return jsonify({"ok":False,"error":"NOT_FOUND"}),404
+    if not record.get("enabled"):return jsonify({"ok":False,"error":"SERVER_DISABLED"}),409
+    result=_query_remote_agent(record)
+    if result.ok:_server_registry.update_health_cache(server_id,fleet.classify_health(now_text()),result.data,last_seen=now_text())
+    else:_server_registry.record_handshake_failure(server_id,result.error)
+    return jsonify({"ok":result.ok,"error_code":result.error_code,"error":result.error,
+        "correlation_id":result.correlation_id,"duration_ms":result.duration_ms,"data":result.data})
+
+@app.get('/api/servers/<server_id>/storage')
+def api_server_storage(server_id):
+    if not (logged_in() or _internal_allowed()): return jsonify({"ok":False,"error":"AUTH_REQUIRED"}),401
+    record=_server_registry.get(server_id)
+    if not record:return jsonify({"ok":False,"error":"NOT_FOUND"}),404
+    if record.get("agent_url")=="local":
+        return jsonify({"ok":True,"server_id":server_id,"filesystem":_db_storage_service.filesystem_summary(str(DATA_DIR)),
+            "categories":_db_storage_service.category_sizes(),"docker":_db_storage_service.docker_storage()})
+    ok,data,code,msg=_remote_get_json_for_server(server_id,"/api/ops/storage")
+    if not ok:return jsonify({"ok":False,"error":code,"detail":msg}),502
+    return jsonify({"ok":True,"server_id":server_id,**{k:v for k,v in data.items() if k!="ok"}})
+
+@app.get('/api/servers/<server_id>/backups')
+def api_server_backups(server_id):
+    if not (logged_in() or _internal_allowed()): return jsonify({"ok":False,"error":"AUTH_REQUIRED"}),401
+    record=_server_registry.get(server_id)
+    if not record:return jsonify({"ok":False,"error":"NOT_FOUND"}),404
+    if record.get("agent_url")=="local":
+        return jsonify({"ok":True,"server_id":server_id,"items":_db_backup_service.list()})
+    ok,data,code,msg=_remote_get_json_for_server(server_id,"/api/ops/db-backups")
+    if not ok:return jsonify({"ok":False,"error":code,"detail":msg}),502
+    return jsonify({"ok":True,"server_id":server_id,"items":data.get("items",[])})
+
+@app.post('/api/servers/<server_id>/backups')
+def api_server_backup_create(server_id):
+    # Vertical slice 3 (section 92): DEV requests a REAL backup ON the
+    # target server -- the backup itself always executes locally on that
+    # server (never centrally), matching section 28's flow exactly. A
+    # PRODUCTION-registered target needs the same explicit approval as a
+    # PRODUCTION deploy (section 72) -- never just because environment
+    # happens to say "test" in the request body.
+    if not logged_in(): return jsonify({"ok":False,"error":"AUTH_REQUIRED"}),401
+    verify_csrf()
+    record=_server_registry.get(server_id)
+    if not record:return jsonify({"ok":False,"error":"NOT_FOUND"}),404
+    payload=request.get_json(silent=True) or {}
+    if record.get("environment")=="PRODUCTION" and not _production_mutation_approved(payload):
+        return jsonify({"ok":False,"error":"PRODUCTION_BACKUP_NOT_APPROVED",
+            "detail":"set MESFLOW_PRODUCTION_PROMOTE_ENABLED=1 on this Agent AND pass confirm=true"}),403
+    # Defense-in-depth (same root cause as the deploy loopback guard, see
+    # _deploy_release_to_server's docstring): a same-host "remote" target
+    # is where a misconfigured/defaulted container name (e.g. an unset
+    # MESFLOW_POSTGRES_CONTAINER falling back to the real "mesflow-postgres")
+    # could reach real infrastructure instead of the intended throwaway one.
+    _backup_target_host=urlparse(record.get("agent_url") or "").hostname or ""
+    if record.get("agent_url")!="local" and _backup_target_host in ("127.0.0.1","localhost","::1") and os.environ.get("MESFLOW_ALLOW_LOOPBACK_BACKUP","").strip().lower() not in {"1","true","yes","on"}:
+        return jsonify({"ok":False,"error":"LOOPBACK_BACKUP_REFUSED",
+            "detail":"this server's agent_url resolves to this same host; set MESFLOW_ALLOW_LOOPBACK_BACKUP=1 to override"}),403
+    reason=str(payload.get('reason') or '').strip() or f"remote backup via fleet (actor={session.get('username','')})"
+    actor=session.get('username','')
+    _db_audit("REMOTE_BACKUP_STARTED",{"server_id":server_id,"actor":actor})
+    if record.get("agent_url")=="local":
+        try:
+            item=_db_backup_service.create(retention_class="manual",triggered_by=actor,reason=reason)
+        except db_backup.ConflictError as e:
+            return jsonify({"ok":False,"error":"BACKUP_ALREADY_RUNNING","detail":str(e)}),409
+        _db_audit("REMOTE_BACKUP_COMPLETED",{"server_id":server_id,"backup_id":item.get('backup_id'),"status":item.get('status')})
+        return jsonify({"ok":item.get('status')=='SUCCESS',"server_id":server_id,"item":item})
+    # A real pg_dump + upload/login round trip can legitimately take longer
+    # than a simple JSON call under host load -- generous timeout here on
+    # purpose (this is a rare, explicit, human-triggered action, not a
+    # polled one).
+    ok,data,code,msg=_remote_post_json_for_server(server_id,"/api/ops/db-backups",{"retention_class":"manual","reason":reason},timeout=180)
+    if not ok:
+        _db_audit("REMOTE_BACKUP_FAILED",{"server_id":server_id,"error":msg})
+        return jsonify({"ok":False,"error":code,"detail":msg}),502
+    item=data.get("item") or {}
+    _db_audit("REMOTE_BACKUP_COMPLETED",{"server_id":server_id,"backup_id":item.get('backup_id'),"status":item.get('status')})
+    return jsonify({"ok":data.get("ok",False),"server_id":server_id,"item":item})
+
+@app.get('/api/servers/<server_id>/incidents')
+def api_server_incidents(server_id):
+    if not (logged_in() or _internal_allowed()): return jsonify({"ok":False,"error":"AUTH_REQUIRED"}),401
+    record=_server_registry.get(server_id)
+    if not record:return jsonify({"ok":False,"error":"NOT_FOUND"}),404
+    if record.get("agent_url")=="local":
+        return jsonify({"ok":True,"server_id":server_id,"items":list(_load_incidents().get('items',{}).values())})
+    ok,data,code,msg=_remote_get_json_for_server(server_id,"/api/incidents")
+    if not ok:return jsonify({"ok":False,"error":code,"detail":msg}),502
+    return jsonify({"ok":True,"server_id":server_id,"items":data.get("items",[])})
+
+@app.get('/api/fleet/summary')
+def api_fleet_summary():
+    if not (logged_in() or _internal_allowed()): return jsonify({"ok":False,"error":"AUTH_REQUIRED"}),401
+    counts=_fleet_health_service.fleet_summary()
+    active_incidents=[]
+    for server in _server_registry.list(enabled=True):
+        sid=server["server_id"]
+        if server.get("agent_url")=="local":
+            items=list(_load_incidents().get('items',{}).values())
+        else:
+            ok,data,_code,_msg=_remote_get_json_for_server(sid,"/api/incidents?status=ACTIVE")
+            items=(data or {}).get("items",[]) if ok else []
+        for inc in items:
+            if inc.get("status") in ("ACTIVE","ACKNOWLEDGED"):
+                active_incidents.append({"server_id":sid,"server_name":server.get("name"),"environment":server.get("environment"),
+                    "incident_type":inc.get("incident_type"),"severity":inc.get("severity"),"summary":inc.get("summary")})
+    counts["active_incidents"]=len(active_incidents)
+    return jsonify({"ok":True,"counts":counts,"active_incidents":active_incidents[:50]})
+
+@app.post('/api/servers/<server_id>/deploy')
+def api_server_deploy(server_id):
+    # Vertical slice 2 (section 91): server_id-routed deploy, reusing the
+    # exact same artifact-upload/digest contract as the existing
+    # PRODUCTION_TEST/PRODUCTION promotion buttons -- never a raw URL from
+    # the request, never a rebuild on the remote.
+    if not logged_in(): return jsonify({"ok":False,"error":"AUTH_REQUIRED"}),401
+    verify_csrf()
+    payload=request.get_json(silent=True) or {}
+    version=str(payload.get('version') or '').strip()
+    component=str(payload.get('component') or 'mesflow').strip()
+    if not version:return jsonify({"ok":False,"error":"VERSION_REQUIRED"}),400
+    try:
+        result=_deploy_release_to_server(server_id,version,component=component,
+            actor=session.get('username',''),confirm=bool(payload.get('confirm')))
+    except _RemoteAgentError as e:
+        code=str(e)
+        # Authorization/safety refusals (never even attempted a remote call)
+        # are client errors -- 403, not 502. 502 is reserved for an actual
+        # remote-communication failure.
+        if "ALREADY_RUNNING" in code:return jsonify({"ok":False,"error":code}),409
+        if "NOT_FOUND" in code:return jsonify({"ok":False,"error":code}),404
+        if any(k in code for k in ("NOT_APPROVED","REFUSED","NOT_DEPLOYABLE","UNSUPPORTED_")):
+            return jsonify({"ok":False,"error":code}),403
+        return jsonify({"ok":False,"error":code}),502
+    return jsonify({"ok":result.get("digest_match",False),"item":result})
+
+@app.get('/api/releases')
+def api_releases():
+    # Read-only, session-or-internal-token gated like every other ops
+    # route -- used both by the Fleet deploy-digest-verification flow
+    # above and by the multi-server release-status comparison (section 24).
+    if not (logged_in() or _internal_allowed()): return jsonify({"ok":False,"error":"AUTH_REQUIRED"}),401
+    return jsonify({"ok":True,"items":list_releases()})
 
 @app.get('/api/ops/services')
 def api_ops_services(): return jsonify({"items":ops_services()})
 
 @app.get('/api/ops/docker')
-def api_ops_docker(): return jsonify({"items":ops_docker()})
+def api_ops_docker():
+    if not (logged_in() or _internal_allowed()): return jsonify({"ok":False,"error":"AUTH_REQUIRED"}),401
+    return jsonify({"items":ops_docker()})
 
 @app.get('/api/ops/ports')
 def api_ops_ports(): return jsonify({"items":ops_ports()})
 
 @app.get('/api/ops/logs')
 def api_ops_logs():
+    if not (logged_in() or _internal_allowed()): return jsonify({"ok":False,"error":"AUTH_REQUIRED"}),401
     source=request.args.get('source','agent'); lines=max(20,min(1000,int(request.args.get('lines','200'))))
     allowed={
         'agent': ['journalctl','-u','mesflow-deploy-agent.service','-n',str(lines),'--no-pager'],
@@ -3073,6 +5991,109 @@ def api_ops_docker_action():
     if not re.fullmatch(r'[A-Za-z0-9_.-]+',name) or action not in {'start','stop','restart'}: return jsonify({"ok":False,"error":"Invalid container/action"}),400
     append_log(f"OPS docker {action} {name}")
     return jsonify(_run_capture(['docker',action,name],60))
+
+# ---------------------------------------------------------------------
+# Server Incident Recovery Console -- managed-allowlist-only routes.
+# Every route below rejects a `sid` outside MANAGED_SERVICES with a 404
+# NOT_MANAGED before touching Docker at all -- this is what makes
+# "unrelated containers stay read-only" a server-enforced guarantee, not
+# just something the UI happens to not offer (task section 1/13).
+# ---------------------------------------------------------------------
+
+@app.get('/api/ops/recovery/services')
+def api_recovery_services():
+    if not (logged_in() or _internal_allowed()): return jsonify({"ok":False,"error":"AUTH_REQUIRED"}),401
+    return jsonify({"ok":True,"items":_recovery_service.list_service_views()})
+
+@app.get('/api/ops/recovery/services/<sid>')
+def api_recovery_service_detail(sid):
+    if not (logged_in() or _internal_allowed()): return jsonify({"ok":False,"error":"AUTH_REQUIRED"}),401
+    try:return jsonify({"ok":True,"item":_recovery_service.service_view(sid)})
+    except recovery.NotManagedError:return jsonify({"ok":False,"error":"NOT_MANAGED"}),404
+
+@app.get('/api/ops/recovery/services/<sid>/logs')
+def api_recovery_service_logs(sid):
+    if not (logged_in() or _internal_allowed()): return jsonify({"ok":False,"error":"AUTH_REQUIRED"}),401
+    lines=max(20,min(2000,int(request.args.get('lines','200') or 200)))
+    try:return jsonify(_recovery_service.logs(sid,lines=lines))
+    except recovery.NotManagedError:return jsonify({"ok":False,"error":"NOT_MANAGED"}),404
+
+@app.get('/api/ops/recovery/services/<sid>/ports')
+def api_recovery_service_ports(sid):
+    if not (logged_in() or _internal_allowed()): return jsonify({"ok":False,"error":"AUTH_REQUIRED"}),401
+    try:return jsonify({"ok":True,"items":_recovery_service.ports(sid)})
+    except recovery.NotManagedError:return jsonify({"ok":False,"error":"NOT_MANAGED"}),404
+
+@app.post('/api/ops/recovery/services/<sid>/start')
+def api_recovery_service_start(sid):
+    if not logged_in(): return jsonify({"ok":False,"error":"AUTH_REQUIRED"}),401
+    verify_csrf();d=request.get_json(silent=True) or {}
+    try:
+        step=_recovery_service.start_service(sid,actor=session.get('username',''),
+            production_approved=bool(d.get('confirm_production')),incident_id=str(d.get('incident_id') or ''))
+    except recovery.NotManagedError:return jsonify({"ok":False,"error":"NOT_MANAGED"}),404
+    return jsonify({"ok":step.action in ("STARTED","SKIPPED_ALREADY_HEALTHY"),"item":asdict(step)})
+
+@app.post('/api/ops/recovery/services/<sid>/restart')
+def api_recovery_service_restart(sid):
+    # Advanced/never-primary action (task section 2) -- still allowlist-only.
+    if not logged_in(): return jsonify({"ok":False,"error":"AUTH_REQUIRED"}),401
+    verify_csrf();d=request.get_json(silent=True) or {}
+    try:
+        step=_recovery_service.restart_service(sid,actor=session.get('username',''),
+            production_approved=bool(d.get('confirm_production')),incident_id=str(d.get('incident_id') or ''))
+    except recovery.NotManagedError:return jsonify({"ok":False,"error":"NOT_MANAGED"}),404
+    return jsonify({"ok":step.action=="RESTARTED","item":asdict(step)})
+
+@app.post('/api/ops/recovery/services/<sid>/stop')
+def api_recovery_service_stop(sid):
+    if not logged_in(): return jsonify({"ok":False,"error":"AUTH_REQUIRED"}),401
+    verify_csrf();d=request.get_json(silent=True) or {}
+    try:
+        step=_recovery_service.stop_service(sid,actor=session.get('username',''),
+            production_approved=bool(d.get('confirm_production')),incident_id=str(d.get('incident_id') or ''))
+    except recovery.NotManagedError:return jsonify({"ok":False,"error":"NOT_MANAGED"}),404
+    return jsonify({"ok":step.action=="STOPPED","item":asdict(step)})
+
+@app.get('/api/ops/recovery/preflight')
+def api_recovery_preflight():
+    if not (logged_in() or _internal_allowed()): return jsonify({"ok":False,"error":"AUTH_REQUIRED"}),401
+    return jsonify(_recovery_service.preflight())
+
+@app.post('/api/ops/recovery/stack')
+def api_recovery_stack():
+    if not logged_in(): return jsonify({"ok":False,"error":"AUTH_REQUIRED"}),401
+    verify_csrf();d=request.get_json(silent=True) or {}
+    try:
+        run=_recovery_service.recover_stack(actor=session.get('username',''),
+            production_approved=bool(d.get('confirm_production')),incident_id=str(d.get('incident_id') or ''))
+    except recovery.RecoveryAlreadyRunning:
+        return jsonify({"ok":False,"error":"RECOVERY_ALREADY_RUNNING"}),409
+    return jsonify({"ok":run.status=="COMPLETED","item":asdict(run)})
+
+@app.get('/api/ops/recovery/system-check')
+def api_recovery_system_check():
+    if not (logged_in() or _internal_allowed()): return jsonify({"ok":False,"error":"AUTH_REQUIRED"}),401
+    docker_available=_recovery_service.preflight().get("docker_available",False)
+    result=recovery.system_check(ops_summary(),_recovery_service.list_service_views(),docker_available=docker_available)
+    return jsonify({"ok":True,**result})
+
+@app.get('/api/ops/recovery/diagnose/<kind>')
+def api_recovery_diagnose(kind):
+    if not (logged_in() or _internal_allowed()): return jsonify({"ok":False,"error":"AUTH_REQUIRED"}),401
+    if kind not in recovery.DIAGNOSIS_KINDS: return jsonify({"ok":False,"error":"UNKNOWN_DIAGNOSIS_KIND"}),404
+    try:
+        result=_recovery_service.run_diagnosis(kind,service_id=request.args.get('service',''),host_summary=ops_summary())
+    except recovery.NotManagedError:
+        return jsonify({"ok":False,"error":"NOT_MANAGED"}),404
+    return jsonify({"ok":True,**result})
+
+@app.get('/api/ops/recovery/audit')
+def api_recovery_audit():
+    if not (logged_in() or _internal_allowed()): return jsonify({"ok":False,"error":"AUTH_REQUIRED"}),401
+    items=list(reversed(load_json(RECOVERY_AUDIT_FILE,{"items":[]}).get('items',[])))
+    return jsonify({"ok":True,"items":items[:200]})
+
 @app.post("/upload")
 def upload_release():
     verify_csrf();u=request.files.get("release_zip")
@@ -3093,7 +6114,12 @@ def upload_release():
         append_log("MES upload extracting")
         e.mkdir();safe_extract_zip(z,e);r=locate_root(e)
         append_log(f"MES upload root detected: {r.name}")
-        v,meta=validate_image_release_contract(r) if (r/"release.json").is_file() and load_json(r/"release.json",{}).get("type")==IMAGE_RELEASE_TYPE else validate_mes_release_contract(r)
+        # /upload is now strictly the image-release (Build Once artifact) contract --
+        # the legacy manual-upload UI that could send a non-image-release ZIP has
+        # been removed (see reports/RELEASE_DEPLOY_UX_CLEANUP.md); the only caller
+        # left is _remote_agent_upload(), which always transfers image-release-type
+        # artifacts produced by Deploy Local.
+        v,meta=validate_image_release_contract(r)
         append_log(f"MES upload version detected: {v}")
         append_log(f"MES upload validated: version={v}, root={r.name}, protocol={meta.get('deployment_protocol',1)}")
         t=RELEASES_DIR/v
@@ -3116,7 +6142,7 @@ def upload_release():
         append_log(f"MES deploy job started: {v}")
         start_deploy(v)
         flash(f"Đã upload và bắt đầu deploy MESFlow {v}","success")
-        response={"ok":True,"stage":"queued","version":v,"message":f"Đã nhận ZIP {v}; đang xếp hàng deploy.","redirect_url":url_for("index")}
+        response={"ok":True,"stage":"queued","version":v,"message":f"Đã nhận ZIP {v}; đang xếp hàng deploy.","redirect_url":url_for("release_manager_page")}
     except Exception as ex:
         append_log(f"MES upload/deploy failed before redirect: stage=upload_or_validation exception={type(ex).__name__} error={ex}")
         flash(f"Upload / deploy MESFlow thất bại: {ex}","error")
@@ -3126,6 +6152,14 @@ def upload_release():
     if request.headers.get("X-Requested-With")=="XMLHttpRequest":
         return jsonify(response), (200 if response["ok"] else 400)
     return redirect(url_for("index"))
+
+# KEEP -- this is NOT the legacy manual-upload flow. _remote_agent_deploy()
+# (default path_fmt="/deploy/{}") is called explicitly by _run_promote_test()
+# right after _remote_agent_upload(), i.e. this route is the REAL trigger the
+# current MESFlow TEST-promotion machine-to-machine flow depends on. Found
+# via a real audit mistake during this task: an earlier pass deleted this
+# route on the (wrong) assumption that /upload's own auto-deploy was the only
+# trigger in play; _run_promote_test's explicit second call proves otherwise.
 @app.post("/deploy/<version>")
 def deploy(version):
     verify_csrf()
@@ -3134,64 +6168,66 @@ def deploy(version):
     except Exception as ex:
         flash(str(ex),"error")
     return redirect(url_for("index"))
-@app.post("/dry-run/<version>")
-def dry_run_deploy(version):
-    verify_csrf()
-    try:
-        version=norm(version);start_deploy(version,dry_run=True);flash(f"Đã bắt đầu dry-run {version}; production không bị dừng","success")
-    except Exception as ex: flash(str(ex),"error")
-    return redirect(url_for("index"))
-@app.post("/delete/<version>")
-def delete(version):
-    verify_csrf()
-    try:v=norm(version)
-    except ValueError as ex:
-        flash(str(ex),"error");return redirect(url_for("index"))
-    if job_running():
-        flash("Không thể xóa release khi deployment đang chạy","error")
-        return redirect(url_for("index"))
-    target=RELEASES_DIR/v
-    if not target.is_dir():
-        flash(f"Không tìm thấy release {v}","error")
-        return redirect(url_for("index"))
-    active=current_file_version().lstrip("Vv")
-    if active==v.lstrip("Vv"):
-        flash(f"Không thể xóa version đang chạy {v}","error")
-        return redirect(url_for("index"))
-    try:
-        shutil.rmtree(target)
-        append_log(f"Deleted release {v}")
-        flash(f"Đã xóa {v}","success")
-    except OSError as ex:
-        append_log(f"Delete release {v} failed: {ex}")
-        flash(f"Xóa {v} thất bại: {ex}","error")
-    return redirect(url_for("index"))
-@app.post("/qa/upload")
-def qa_upload_release():
+
+# --- QA Center image-release receive (target side: PRODUCTION_TEST/PRODUCTION) ---
+# Distinct routes from the legacy /qa/upload (full-source ZIP, auto-deploys,
+# bind-mounted at runtime -- kept working unmodified). These only ever
+# receive an immutable QA image-release artifact (image + compose.yml +
+# metadata, never application source) and deploy it --no-build. Store-only
+# on upload; /qa-release/deploy/<version> is the sole deploy trigger (no
+# redundant double-deploy-call ambiguity).
+@app.post("/qa-release/upload")
+def qa_release_upload():
     verify_csrf(); u=request.files.get("qa_release_zip")
-    if qa_job_running(): flash("QA Center đang deploy","error"); return redirect(url_for("index"))
-    if not u or not u.filename or not u.filename.lower().endswith('.zip'): flash("Chọn file QA ZIP","error"); return redirect(url_for("index"))
-    z=QA_UPLOAD_DIR/f"{int(time.time())}_{secure_filename(u.filename)}"; e=QA_UPLOAD_DIR/f"extract_{secrets.token_hex(8)}"
+    append_log(f"QA image-release upload received: filename={getattr(u,'filename','')!r}")
+    if not u or not u.filename or not u.filename.lower().endswith('.zip'):
+        return jsonify(ok=False,error="Chọn file ZIP QA hợp lệ"),400
+    z=QA_UPLOAD_DIR/f"qa_release_{int(time.time())}_{secure_filename(u.filename)}"
+    e=QA_UPLOAD_DIR/f"extract_{secrets.token_hex(8)}"
     try:
-        u.save(z); e.mkdir(); safe_extract_zip(z,e); r=locate_qa_root(e); v=norm((r/"VERSION").read_text(encoding="utf-8-sig")); t=QA_RELEASES_DIR/v
-        if t.exists(): shutil.rmtree(t)
-        shutil.copytree(r,t); save_json(t/"agent_manifest.json",{"version":v,"uploaded_at":now_text(),"source_name":u.filename,"sha256":sha(z),"package_type":"mesflow_qa_center"})
-        start_qa_deploy(v)
-        flash(f"Đã upload và bắt đầu deploy QA Center {v}","success")
-    except Exception as ex: flash(f"Upload / deploy QA thất bại: {ex}","error")
-    finally: z.unlink(missing_ok=True); shutil.rmtree(e,ignore_errors=True)
-    return redirect(url_for("index"))
+        u.save(z)
+        if not zipfile.is_zipfile(z): raise ValueError("Uploaded file is not a valid ZIP")
+        e.mkdir(); safe_extract_zip(z,e); r=locate_qa_image_release_root(e)
+        v,meta=validate_qa_image_release_contract(r)
+        append_log(f"QA image-release validated: version={v}")
+        t=QA_IMAGE_RELEASES_DIR/v
+        replacement=QA_IMAGE_RELEASES_DIR/f".{v}.replacement-{secrets.token_hex(6)}"
+        shutil.copytree(r,replacement)
+        save_json(replacement/"agent_manifest.json",{"version":v,"uploaded_at":now_text(),"source_name":u.filename,"sha256":sha(z)})
+        if t.exists():
+            old=QA_IMAGE_RELEASES_DIR/f".{v}.previous-{secrets.token_hex(6)}"
+            t.replace(old)
+            try: replacement.replace(t)
+            except Exception:
+                old.replace(t); raise
+            shutil.rmtree(old,ignore_errors=True)
+        else:
+            replacement.replace(t)
+        append_log(f"QA image-release stored: {v}")
+        return jsonify(ok=True,version=v,message=f"Đã nhận QA release {v}")
+    except Exception as ex:
+        append_log(f"QA image-release upload failed: {type(ex).__name__}: {ex}")
+        return jsonify(ok=False,error=str(ex)),400
+    finally:
+        z.unlink(missing_ok=True); shutil.rmtree(e,ignore_errors=True)
 
-@app.post("/qa/deploy/<version>")
-def qa_deploy(version):
+@app.post("/qa-release/deploy/<version>")
+def qa_release_deploy(version):
     verify_csrf()
-    try: version=norm(version); start_qa_deploy(version); flash(f"Đã bắt đầu deploy QA {version}","success")
-    except Exception as ex: flash(str(ex),"error")
-    return redirect(url_for("index"))
-
+    try:
+        version=norm(version)
+        root=QA_IMAGE_RELEASES_DIR/version
+        if not (root/"release.json").is_file(): raise ValueError(f"QA release {version} not uploaded to this Agent yet")
+        start_qa_target_deploy(version)
+        return jsonify(ok=True,version=version,message=f"Đã bắt đầu deploy QA {version}")
+    except Exception as ex:
+        return jsonify(ok=False,error=str(ex)),400
 @app.post("/qa/restart")
 def qa_restart():
-    if not HOST_OPS_ENABLED: flash("QA host restart is disabled in this container runtime","error"); return redirect(url_for("index"))
+    # Task section 40: an operation on a tab must not bounce the user back
+    # to a different page -- these controls now live on the Release Deploy
+    # tab's QA Center card.
+    if not HOST_OPS_ENABLED: flash("QA host restart is disabled in this container runtime","error"); return redirect(url_for("release_manager_page",tab="deploy"))
     verify_csrf()
     try:
         if qa_job_running(): raise RuntimeError("QA Center đang deploy")
@@ -3199,30 +6235,17 @@ def qa_restart():
         _stop_qa()
         pid=_start_qa(); _wait_qa(qa_current_version(),pid=pid); flash("Đã restart QA Center","success")
     except Exception as ex: flash(f"Restart QA thất bại: {ex}","error")
-    return redirect(url_for("index"))
+    return redirect(url_for("release_manager_page",tab="deploy"))
 
 @app.post("/qa/stop")
 def qa_stop():
-    if not HOST_OPS_ENABLED: flash("QA host stop is disabled in this container runtime","error"); return redirect(url_for("index"))
+    if not HOST_OPS_ENABLED: flash("QA host stop is disabled in this container runtime","error"); return redirect(url_for("release_manager_page",tab="deploy"))
     verify_csrf()
     try:
         _stop_qa()
         flash("Đã dừng QA Center","success")
     except Exception as ex: flash(f"Dừng QA thất bại: {ex}","error")
-    return redirect(url_for("index"))
-
-@app.post("/qa/delete/<version>")
-def qa_delete(version):
-    verify_csrf()
-    try:
-        v=norm(version)
-        if qa_job_running(): raise RuntimeError("QA Center đang deploy")
-        if qa_current_version().lstrip("Vv")==v.lstrip("Vv"): raise RuntimeError("Không thể xóa QA version đang chạy")
-        t=QA_RELEASES_DIR/v
-        if not t.is_dir(): raise RuntimeError("Không tìm thấy QA release")
-        shutil.rmtree(t); flash(f"Đã xóa QA release {v}","success")
-    except Exception as ex: flash(str(ex),"error")
-    return redirect(url_for("index"))
+    return redirect(url_for("release_manager_page",tab="deploy"))
 
 @app.post("/change-password")
 def change_password():
@@ -3230,13 +6253,28 @@ def change_password():
     if not check_password_hash(c["password_hash"],old):flash("Mật khẩu hiện tại không đúng","error")
     elif len(new)<10:flash("Mật khẩu mới tối thiểu 10 ký tự","error")
     else:c["password_hash"]=generate_password_hash(new);save_json(CONFIG_FILE,c);(CONFIG_DIR/"FIRST_LOGIN.txt").unlink(missing_ok=True);flash("Đã đổi mật khẩu","success")
-    return redirect(url_for("index"))
+    # Task section 40: an operation on a specific tab must not bounce the
+    # user back to a different page -- this form now lives on Agent Update.
+    return redirect(url_for("release_manager_page",tab="agent-update")+"#securitySettings")
 @app.get("/live")
-def live():return {"ok":True,"agent_version":AGENT_VERSION,"runtime_mode":RUNTIME_MODE}
+def live():return {"ok":True,"agent_version":AGENT_VERSION,"frontend_build_id":FRONTEND_BUILD_ID,"runtime_mode":RUNTIME_MODE}
 @app.get("/health")
 def health():return {"ok":True,"agent_version":AGENT_VERSION,"api_protocol_version":API_PROTOCOL_VERSION,"capabilities":AGENT_CAPABILITIES,"runtime_mode":RUNTIME_MODE,"server_role":SERVER_ROLE,"build_enabled":MESFLOW_BUILD_ENABLED,"source_dir":str(MESFLOW_SOURCE_DIR),"deploy_enabled":DEPLOY_ENABLED,"host_ops_enabled":HOST_OPS_ENABLED,"mes":mes_status(),"qa":qa_status(),"job_running":job_running(),"qa_job_running":qa_job_running(),"tutorial_job_running":tutorial_job_running(),"esp_tutorial_job_running":_esp_tutorial_job_lock.locked(),"esp_tutorial":esp_tutorial_status()}
 def main():
     recover_interrupted_deploy(); job_running()
+    reconcile_orphaned_jobs_on_startup()
+    # Operations Center incident monitoring must keep running independently
+    # of whether anyone has the UI open, and independently of MESFlow's own
+    # availability (section 5) -- a background daemon thread, not tied to
+    # any HTTP request.
+    start_incident_monitor()
+    start_predictive_monitor()
+    start_fleet_health_monitor()
     append_log(f"Agent {AGENT_VERSION} start {HOST}:{PORT}, MES={MES_URL}, QA={QA_URL}")
-    serve(app,host=HOST,port=PORT,threads=8)
+    # Configurable (never below 8, the long-established default): a fleet
+    # of Remote Agents now also serves Agent-to-Agent calls on top of the
+    # human UI, and a fixed small pool can be exhausted by many concurrent/
+    # retried connections (observed while load-testing P5's multi-server
+    # test harness -- see reports/P5_MULTI_SERVER.md).
+    serve(app,host=HOST,port=PORT,threads=max(8,int(os.environ.get("WORKSHOP_AGENT_THREADS","8") or 8)))
 if __name__=="__main__":main()

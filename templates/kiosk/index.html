@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="vi"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ESP Kiosk · MESFlow Operations</title>
+<link rel="stylesheet" href="{{static_url('css/agent.css')}}">
+<style>
+.device-list{display:grid;grid-template-columns:repeat(auto-fit,minmax(270px,1fr));gap:9px}
+.device{display:flex;gap:10px;align-items:center;padding:11px;border:1px solid var(--ops-line);border-radius:8px}
+.device small{display:block;color:var(--ops-muted)}
+.device.offline{opacity:.6}
+.ota-job{padding:11px 0;border-bottom:1px solid var(--ops-line)}
+.ota-device{margin-top:7px;padding:8px;background:#f5f8fb;border-radius:6px}
+input[type=file]{width:100%;padding:10px;border:1px solid var(--ops-line)}
+.kiosk-card{background:var(--ops-surface,#fff);border:1px solid var(--ops-line);border-radius:var(--radius-md,10px);padding:18px;margin-bottom:16px}
+.kiosk-card h3{margin:0 0 4px;font-size:16px}
+.kiosk-card .sub{color:var(--ops-muted);font-size:12px;margin:0 0 14px}
+</style></head><body>
+{# Sidebar (ESP KIOSK nav group) is the single navigation source between
+   the 4 kiosk pages -- no duplicate in-page tab bar, same convention as
+   release/index.html. #}
+{% set tab_title={'overview':'Tổng quan','ota':'OTA','firmware':'Firmware','tutorial':'Hướng dẫn'}.get(active_tab,'Tổng quan') %}
+{% set page_title='ESP Kiosk' %}{% include '_operations_shell_start.html' %}
+<div class="wrap">
+<header class="ops-page-head"><div><h2>ESP Kiosk · {{tab_title}}</h2><p>Fleet, OTA, firmware builder và tutorial cho thiết bị ESP Kiosk -- tách riêng khỏi Release &amp; Deploy.</p></div></header>
+{% with messages=get_flashed_messages(with_categories=true) %}{% for c,m in messages %}<div class="{{c}} kiosk-card">{{m}}</div>{% endfor %}{% endwith %}
+
+<script>
+const CSRF={{csrf|tojson}},SCRIPT_ROOT={{request.script_root|tojson}};
+function esc(v){return String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
+// Backend error codes translated to Vietnamese -- never show a raw
+// enum/code directly in the UI (same convention as the old kiosk.html).
+const ERROR_MESSAGES={MESFLOW_UNAVAILABLE:'Không thể kết nối MESFlow để tải danh sách thiết bị. Kiểm tra lại MESFlow rồi thử lại.',AUTH_REQUIRED:'Phiên đăng nhập đã hết hạn. Vui lòng đăng nhập lại.'};
+function friendlyError(code){return ERROR_MESSAGES[code]||code||'Đã xảy ra lỗi không xác định.'}
+</script>
+
+{% include tab_partial %}
+
+</div>
+{% include '_operations_shell_end.html' %}
+</body></html>

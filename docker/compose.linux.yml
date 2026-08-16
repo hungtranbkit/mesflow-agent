@@ -3,7 +3,7 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile
-    image: ${AGENT_IMAGE:-mesflow-deploy-agent:2.19.0}
+    image: ${AGENT_IMAGE:-mesflow-deploy-agent:2.24.3}
     container_name: mesflow-deploy-agent
     restart: unless-stopped
     environment:
@@ -11,10 +11,13 @@ services:
       SERVER_ROLE: ${SERVER_ROLE:-PRODUCTION_TEST}
       MESFLOW_BUILD_ENABLED: ${MESFLOW_BUILD_ENABLED:-0}
       MESFLOW_SOURCE_DIR: ${MESFLOW_SOURCE_DIR:-/workspace/mesflow/mesflow}
+      QA_CENTER_SOURCE_DIR: ${QA_CENTER_SOURCE_DIR:-/workspace/mesflow/qa-center}
       MESFLOW_AGENT_DEPLOY_ENABLED: "1"
       MESFLOW_AGENT_HOST_OPS_ENABLED: "0"
       WORKSHOP_AGENT_HOME: /data
-      MESFLOW_AGENT_ADMIN_PASSWORD: ${MESFLOW_AGENT_ADMIN_PASSWORD:-1234567890}
+      # Empty means the Agent generates a one-time first-login credential;
+      # never ship a shared default password in source packages.
+      MESFLOW_AGENT_ADMIN_PASSWORD: ${MESFLOW_AGENT_ADMIN_PASSWORD:-}
       WORKSHOP_TARGET_HOME: /opt/mesflow
       WORKSHOP_MES_URL: http://mesflow-app:8080
       MESFLOW_INTERNAL_API_TOKEN: ${MESFLOW_INTERNAL_API_TOKEN:-}
@@ -36,7 +39,12 @@ services:
       MESFLOW_PRODUCTION_AGENT_USER: ${MESFLOW_PRODUCTION_AGENT_USER:-}
       MESFLOW_PRODUCTION_AGENT_PASSWORD: ${MESFLOW_PRODUCTION_AGENT_PASSWORD:-}
       # Host-side updater targets (safe, no-SSH Agent updates). Bearer
-      # token auth only, never a value committed here.
+      # token auth only, never a value committed here. URL historically
+      # pointed at deploy-agent/updater/ (:8099); migrating to bootstrap/
+      # (:8098), which serves the identical POST /updater/update contract --
+      # see reports/BOOTSTRAP_AGENT_UPDATER_CONSOLIDATION.md before changing
+      # these values on a real target. Only the port in the URL changes;
+      # the token value should be copied over unchanged, not rotated.
       MESFLOW_PRODUCTION_TEST_AGENT_UPDATER_URL: ${MESFLOW_PRODUCTION_TEST_AGENT_UPDATER_URL:-}
       MESFLOW_PRODUCTION_TEST_AGENT_UPDATER_TOKEN: ${MESFLOW_PRODUCTION_TEST_AGENT_UPDATER_TOKEN:-}
       MESFLOW_PRODUCTION_AGENT_UPDATER_URL: ${MESFLOW_PRODUCTION_AGENT_UPDATER_URL:-}

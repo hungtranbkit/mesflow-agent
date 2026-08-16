@@ -10,4 +10,22 @@ __pycache__/
 .pytest_cache/
 test-results/
 playwright-report/
+reports/generated/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+dist/
+build/
+tmp/
+temp/
+*.db
+*.sqlite
+*.sqlite3
 
+# Local secrets (Production Test/Production Agent URL/user/password) --
+# docker compose auto-loads docker/.env; never commit it.
+docker/.env
+.env
+.env.*
+!.env.example

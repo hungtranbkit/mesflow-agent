@@ -1,6 +1,6 @@
 # MESFlow Deploy Agent — Docker deployment
 
-Version: **2.15.4-docker-runtime**
+Version: **2.24.3-docker-runtime**
 
 ## Runtime model
 
@@ -81,6 +81,10 @@ curl -fsS http://127.0.0.1:8090/agent/health
 ```
 
 The production reverse proxy should route `agent.mesflow.net` to host port `8090`; the Agent container itself does not own/reload nginx.
+
+Release builds must use `./scripts/build-agent-release.sh` on DEV. Promotion
+targets consume that frozen image/ZIP and must use `--no-build`; they never
+rebuild the source independently.
 
 ## Linux — safe inspection/dry-run mode
 

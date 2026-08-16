@@ -1,52 +1,733 @@
 <!doctype html>
 <html lang="vi"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>MESFlow Server Operations</title>
+<title>MESFlow Operations Center</title>
 <style>
-:root{--bg:#f3f6fa;--card:#fff;--text:#172033;--muted:#6b7483;--blue:#1760aa;--green:#15803d;--red:#b91c1c;--amber:#b45309;--line:#e5e9ef;--term:#0d1722}
-*{box-sizing:border-box}body{font-family:Arial,sans-serif;margin:0;background:var(--bg);color:var(--text)}.top{background:#123f73;color:#fff;padding:14px 20px;display:flex;justify-content:space-between;align-items:center;gap:12px}.top a{color:white;text-decoration:none}.wrap{max-width:1500px;margin:18px auto;padding:0 14px}.nav{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px}.nav button{background:#fff}.nav button.active{background:var(--blue);color:#fff;border-color:var(--blue)}button,input,select,textarea{padding:9px 10px;border:1px solid #cbd3df;border-radius:7px;font:inherit}.primary{background:var(--blue);color:#fff;border:0}.danger{background:#a52626;color:#fff;border:0}.secondary{background:#eef2f7}.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}.card{background:#fff;border-radius:12px;padding:16px;box-shadow:0 3px 15px #0001;margin-bottom:14px}.metric .value{font-size:25px;font-weight:700;margin-top:5px}.label,.muted{font-size:12px;color:var(--muted)}.ok{color:var(--green)}.bad{color:var(--red)}.warn{color:var(--amber)}.full{grid-column:1/-1}.span2{grid-column:span 2}.tab{display:none}.tab.active{display:block}.toolbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:8px 0 12px}.toolbar input{min-width:260px}.tablewrap{overflow:auto;max-height:620px}table{border-collapse:collapse;width:100%;font-size:13px}th,td{padding:9px 8px;border-bottom:1px solid var(--line);text-align:left;white-space:nowrap}th{position:sticky;top:0;background:#fff;z-index:1}.status{font-weight:700}.terminal{background:var(--term);color:#dbe7f5;border-radius:10px;padding:12px;min-height:300px;max-height:560px;overflow:auto;white-space:pre-wrap;font-family:Consolas,monospace;font-size:13px}.cmdrow{display:grid;grid-template-columns:auto 1fr auto;gap:8px;align-items:center;margin-top:8px}.cmdrow input{min-width:0;width:100%;font-family:Consolas,monospace}.sshgrid{display:grid;grid-template-columns:2fr 1fr 1.3fr 1.5fr;gap:8px}.quick{display:flex;gap:7px;flex-wrap:wrap}.quick button{font-size:12px}.alert{padding:9px;border-radius:7px;background:#fff7ed;color:#9a3412;margin:5px 0}.score{font-size:42px;font-weight:800}.smallbtn{padding:5px 8px;font-size:12px}.logselect{min-width:160px}@media(max-width:900px){.grid{grid-template-columns:1fr 1fr}.span2{grid-column:span 2}.sshgrid{grid-template-columns:1fr 1fr}}@media(max-width:600px){.grid{grid-template-columns:1fr}.span2{grid-column:span 1}.sshgrid{grid-template-columns:1fr}.cmdrow{grid-template-columns:1fr}.toolbar input{min-width:0;width:100%}}
-</style></head><body>
-<div class="top"><div><b>MESFlow Server Operations</b><div class="muted" style="color:#d9e8fa">Agent {{agent_version}}</div></div><div><a href="{{url_for('index')}}">← Deploy Agent</a></div></div>
+:root{--bg:#eef2f8;--card:#fff;--text:#172033;--muted:#6b7483;--blue:#1760aa;--blue-dark:#123f73;--green:#15803d;--red:#b91c1c;--amber:#b45309;--line:#e3e8f0;--term:#0d1722}
+*{box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;-webkit-font-smoothing:antialiased;margin:0;background:var(--bg);color:var(--text);line-height:1.45}
+.top{background:linear-gradient(135deg,var(--blue-dark),#0d2d54);color:#fff;padding:16px 22px;display:flex;justify-content:space-between;align-items:center;gap:12px;box-shadow:0 2px 10px #0002}
+.top b{font-size:16px;letter-spacing:.2px}
+.top a{color:#dcebff;text-decoration:none;font-size:13px;padding:7px 12px;border-radius:7px;background:#ffffff1a;transition:background .15s}
+.top a:hover{background:#ffffff33}
+.wrap{max-width:1500px;margin:18px auto;padding:0 14px}
+button,input,select,textarea{padding:9px 12px;border:1px solid #cbd3df;border-radius:8px;font:inherit;color:var(--text);transition:border-color .15s,box-shadow .15s}
+button{cursor:pointer;background:#fff}
+button:hover{border-color:#a9b6c9}
+input:focus,select:focus,textarea:focus{outline:none;border-color:var(--blue);box-shadow:0 0 0 3px #1760aa22}
+.primary{background:var(--blue);color:#fff;border:0}
+.primary:hover{background:#144d87}
+.danger{background:#a52626;color:#fff;border:0}
+.danger:hover{background:#8c1f1f}
+.secondary{background:#eef2f7}
+.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:13px;padding:17px;box-shadow:0 1px 3px #0001;margin-bottom:14px;transition:box-shadow .15s}
+.card:hover{box-shadow:0 4px 14px #0000000f}
+.card h3{margin:0 0 10px;font-size:14px;letter-spacing:.2px}
+.metric .value{font-size:26px;font-weight:700;margin-top:6px;letter-spacing:-.3px}
+.label,.muted{font-size:12px;color:var(--muted)}
+.label{text-transform:uppercase;letter-spacing:.4px;font-weight:600}
+.ok{color:var(--green)}.bad{color:var(--red)}.warn{color:var(--amber)}
+.full{grid-column:1/-1}.span2{grid-column:span 2}
+.tab{display:none}.tab.active{display:block}
+.toolbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:8px 0 12px}
+.toolbar input{min-width:260px}
+.tablewrap{overflow:auto;max-height:620px;border-radius:10px}
+table{border-collapse:separate;border-spacing:0;width:100%;font-size:13px}
+th,td{padding:10px 9px;border-bottom:1px solid var(--line);text-align:left;white-space:nowrap}
+th{position:sticky;top:0;background:#f7f9fc;z-index:1;color:var(--muted);font-weight:600;text-transform:uppercase;font-size:11px;letter-spacing:.3px;box-shadow:0 1px 0 var(--line)}
+tbody tr{transition:background .12s}
+tbody tr:hover{background:#f5f8fc}
+.status{font-weight:700}
+.terminal{background:var(--term);color:#dbe7f5;border-radius:11px;padding:14px;min-height:300px;max-height:560px;overflow:auto;white-space:pre-wrap;font-family:'SFMono-Regular',Consolas,'Liberation Mono',monospace;font-size:13px;box-shadow:inset 0 0 0 1px #ffffff12}
+.cmdrow{display:grid;grid-template-columns:auto 1fr auto;gap:8px;align-items:center;margin-top:8px}
+.cmdrow input{min-width:0;width:100%;font-family:Consolas,monospace}
+.sshgrid{display:grid;grid-template-columns:2fr 1fr 1.3fr 1.5fr;gap:8px}
+.quick{display:flex;gap:7px;flex-wrap:wrap}
+.quick button{font-size:12px}
+.alert{padding:10px 12px;border-radius:9px;background:#fff7ed;color:#9a3412;margin:6px 0;border:1px solid #fde3c3}
+.score{font-size:44px;font-weight:800;letter-spacing:-1px}
+.smallbtn{padding:5px 9px;font-size:12px}
+.logselect{min-width:160px}
+.badge{display:inline-block;padding:3px 9px;border-radius:999px;font-size:11px;font-weight:800;letter-spacing:.2px}
+.badge.CRITICAL,.badge.HIGH{background:#fde8e8;color:#a52727}
+.badge.MEDIUM{background:#fff2d8;color:#96620d}
+.badge.LOW,.badge.INFO{background:#e9eef3;color:#52697c}
+.st{font-weight:700}
+.st.ACTIVE{color:var(--red)}.st.ACKNOWLEDGED{color:var(--amber)}.st.RESOLVED,.st.AUTO_RESOLVED{color:var(--green)}
+.incrow{display:grid;grid-template-columns:90px 1fr auto;gap:10px;align-items:start;background:#fff;border:1px solid var(--line);border-left:4px solid #8499a8;border-radius:0 9px 9px 0;padding:11px 13px;margin-bottom:7px;transition:box-shadow .15s}
+.incrow:hover{box-shadow:0 2px 8px #0000000d}
+.incrow.CRITICAL,.incrow.HIGH{border-left-color:#a52727}
+.incrow.MEDIUM{border-left-color:#b45309}
+.incrow-flat{display:flex;align-items:center;flex-wrap:wrap;gap:8px;background:#fff;border:1px solid var(--line);border-left:4px solid #8499a8;border-radius:0 9px 9px 0;padding:10px 13px;margin-bottom:7px;transition:box-shadow .15s}
+.incrow-flat:hover{box-shadow:0 2px 8px #0000000d}
+.incrow-flat.CRITICAL,.incrow-flat.HIGH{border-left-color:#a52727}
+.incrow-flat.MEDIUM{border-left-color:#b45309}
+.incrow-flat-text{flex:1 1 260px;min-width:0;color:var(--muted)}
+.drawer-shell{position:fixed;inset:0;z-index:2000}
+.drawer-back{position:absolute;inset:0;border:0;background:#07182770}
+.drawer{position:absolute;right:0;top:0;width:min(560px,94vw);height:100vh;background:#fff;box-shadow:-10px 0 30px #07182740;padding:22px;overflow:auto}
+.drawer h2{margin:0 0 4px}
+.drawer dl{display:grid;grid-template-columns:150px 1fr;gap:8px;font-size:13px}
+.drawer pre{background:#0d1722;color:#dbe7f5;padding:10px;border-radius:8px;font-size:11px;max-height:220px;overflow:auto;white-space:pre-wrap}
+.predictive-list{display:grid;gap:8px}.prediction{display:grid;grid-template-columns:86px minmax(0,1fr);gap:10px;padding:11px;border:1px solid var(--line);border-left:4px solid #67808f;background:#fff}.prediction.HIGH{border-left-color:var(--red)}.prediction.MEDIUM{border-left-color:var(--amber)}.prediction small{display:block;margin-top:4px;color:var(--muted)}.predicted{font-size:10px;font-weight:800;letter-spacing:.04em}.ai-section{margin-top:16px;padding:12px;border:1px solid var(--line);background:#f6f9fb}.ai-section h3{margin-top:0}.ai-evidence{display:grid;gap:6px}.suggestion{padding:9px;border-left:3px solid #267653;background:#edf8f2;margin-top:7px}.suggestion.HIGH_RISK_ACTION{border-color:var(--red);background:#fff3f2}
+/* P3 Notification badges (Active Alerts row + Incident Drawer) */
+.notify-badges{display:inline-flex;gap:3px;margin-left:6px;vertical-align:middle}
+.notify-badge{display:inline-flex;align-items:center;justify-content:center;width:18px;height:18px;border-radius:5px;font-size:10px;font-weight:800;line-height:1}
+.notify-badge.SENT{background:#e8f7f0;color:#13704f}
+.notify-badge.FAILED{background:#fff0ef;color:#9b2525}
+.notify-badge.SKIPPED{background:#edf2f5;color:#7c8a99}
+.notify-badge.PENDING{background:#fff4d1;color:#805400}
+.notify-group{margin-top:8px}
+.notify-group h4{margin:0 0 4px;font-size:11px;text-transform:uppercase;letter-spacing:.04em;color:var(--muted)}
+.notify-row{display:flex;gap:8px;align-items:center;padding:5px 0;border-bottom:1px solid var(--line);font-size:12.5px}
+.notify-row b{min-width:70px}
+.notify-row small{color:var(--muted);margin-left:auto}
+@media(max-width:900px){.grid{grid-template-columns:1fr 1fr}.span2{grid-column:span 2}.sshgrid{grid-template-columns:1fr 1fr}}
+@media(max-width:600px){.grid{grid-template-columns:1fr}.span2{grid-column:span 1}.sshgrid{grid-template-columns:1fr}.cmdrow{grid-template-columns:1fr}.toolbar input{min-width:0;width:100%}}
+</style><link rel="stylesheet" href="{{static_url('css/agent.css')}}"></head><body class="ops-integrated">
+{% set page_title='Vận hành hệ thống' %}{% include '_operations_shell_start.html' %}
 <div class="wrap">
-<div class="nav"><button class="active" data-tab="overview">Tổng quan</button><button data-tab="services">Services</button><button data-tab="docker">Docker</button><button data-tab="ports">Ports</button><button data-tab="logs">Logs</button><button data-tab="terminal">Command / SSH</button></div>
+<div class="ops-page-head"><div><h2>{{ {'overview':'Sức khỏe hệ thống','recovery':'Dịch vụ','fleet':'Servers / Fleet','alerts':'Cảnh báo','incidents':'Sự cố','services':'Chẩn đoán','docker':'Docker','ports':'Network & Ports','backup':'Backup / DB / Storage','logs':'Nhật ký hệ thống','terminal':'Terminal / SSH'}.get(initial_view,'Sức khỏe hệ thống') }}</h2><p>Thông tin vận hành read-only trước; hành động hệ thống yêu cầu xác nhận riêng.</p></div></div>
+{# The in-page tab bar that used to live here duplicated the sidebar's own
+   VẬN HÀNH/HỆ THỐNG links -- both pointed at the exact same 10 destinations
+   at once, which read as a confusing "tabs inside tabs" navigation (real
+   user report, see reports/RELEASE_DEPLOY_UX_CLEANUP.md). The sidebar is
+   now the single source of navigation for these pages; showOpsView() below
+   still runs once on load to show the correct section and fire its
+   view-specific data loader. #}
+<div id="opsFeedback" class="ops-feedback" aria-live="polite">Sẵn sàng.</div>
 
 <section id="overview" class="tab active"><div class="grid">
 <div class="card metric"><div class="label">Server health</div><div id="score" class="score">--</div><div id="healthText" class="muted">Đang đọc...</div></div>
-<div class="card metric"><div class="label">CPU</div><div id="cpu" class="value">--</div><div id="load" class="muted"></div></div>
-<div class="card metric"><div class="label">RAM</div><div id="ram" class="value">--</div><div id="ramDetail" class="muted"></div></div>
-<div class="card metric"><div class="label">Disk /</div><div id="disk" class="value">--</div><div id="diskDetail" class="muted"></div></div>
+<div class="card metric"><div class="label">CPU</div><div id="cpu" class="value">--</div><span class="ops-bar" id="cpuBar"><span style="width:0%"></span></span><div id="load" class="muted"></div></div>
+<div class="card metric"><div class="label">RAM</div><div id="ram" class="value">--</div><span class="ops-bar" id="ramBar"><span style="width:0%"></span></span><div id="ramDetail" class="muted"></div></div>
+<div class="card metric"><div class="label">Disk (/)</div><div id="disk" class="value">--</div><span class="ops-bar" id="diskBar"><span style="width:0%"></span></span><div id="diskDetail" class="muted"></div></div>
 <div class="card span2"><h3>Server</h3><div id="serverInfo" class="muted"></div></div>
 <div class="card span2"><h3>Dịch vụ chính</h3><div id="mainHealth"></div></div>
-<div class="card full"><h3>Cảnh báo</h3><div id="alerts" class="muted">Không có cảnh báo.</div></div>
+<div class="card full"><h3>Cảnh báo</h3><div id="healthAlerts" class="muted">Không có cảnh báo.</div></div>
+<div class="card full"><h3>Dự báo rủi ro (Predictive)</h3><p class="muted">Dự báo dựa trên lịch sử; không phải sự cố hiện tại và không tự thực thi remediation.</p><div id="predictiveInsights" class="predictive-list">Đang học baseline…</div></div>
+<div class="card span2"><h3>Dự báo dung lượng đĩa</h3><div id="diskForecast" class="muted">Đang tải…</div></div>
+<div class="card span2"><h3>Dự báo tăng trưởng PostgreSQL</h3><div id="dbForecast" class="muted">Đang tải…</div></div>
+<div class="card full"><h3>Sự cố lặp lại</h3><div id="recurringProblems" class="predictive-list">Đang tải…</div></div>
+<div class="card full"><h3>Đề xuất kiểm tra</h3><p class="muted">Chỉ là hướng kiểm tra an toàn; không có nút thực thi hạ tầng.</p><div id="suggestedRemediation">Đang tải…</div></div>
 </div></section>
 
+<section id="recovery" class="tab"><div class="grid">
+<div class="card full"><div class="toolbar" style="flex-wrap:wrap"><button class="primary" onclick="runRecoveryStack()">Khôi phục MESFlow Stack</button><button onclick="loadRecoveryServices()">Làm mới</button><span class="muted" id="recoveryBusy"></span></div>
+ <div id="systemCheckPanel" class="muted">Đang tải tổng quan…</div>
+</div>
+<div class="card full" id="recoveryRunPanel" style="display:none"><h3>Kết quả khôi phục MESFlow Stack</h3><p class="muted">Thứ tự: Docker → PostgreSQL → MESFlow → Gateway/nginx → QA Center. Chỉ khởi động dịch vụ đang dừng; dịch vụ đã healthy sẽ được bỏ qua.</p><div id="recoveryRunSteps"></div></div>
+<div class="card full" id="recoveryPortConflictPanel" style="display:none"><h3>Xung đột cổng (Port conflict)</h3><div class="muted" style="margin-bottom:6px">Không tự động dừng/kill tiến trình đang giữ cổng. Xử lý thủ công rồi bấm "Thử lại".</div><div class="tablewrap" id="recoveryPortConflictBody"></div></div>
+<div class="card full"><h3>Dịch vụ MESFlow</h3><p class="muted">Chỉ các dịch vụ trong danh sách cho phép (allowlist) mới có thể điều khiển tại đây. Container khác không liên quan luôn ở chế độ chỉ xem. Cần điều tra sâu hơn? <a href="{{url_for('ops_page')}}?view=diagnostics">Mở trang Chẩn đoán</a>.</p><div class="tablewrap"><table><thead><tr><th>Service</th><th>Container</th><th>Running</th><th>Health</th><th>Version</th><th>Uptime</th><th>Dependencies</th><th>Last error</th><th>Action</th></tr></thead><tbody id="recoveryServiceRows">Đang tải...</tbody></table></div></div>
+<div class="card full" id="recoveryViewPanel" style="display:none"><h3>Chi tiết dịch vụ</h3><div id="recoveryViewBody"></div></div>
+<div class="card full" id="recoveryLogPanel" style="display:none"><h3>Log: <span id="recoveryLogTitle"></span></h3><pre id="recoveryLogOutput" class="terminal"></pre></div>
+<div class="card full"><h3>Nhật ký kiểm toán (Audit) — Recovery</h3><div class="tablewrap"><table><thead><tr><th>Thời gian</th><th>Ai</th><th>Dịch vụ</th><th>Hành động</th><th>Trạng thái trước</th><th>Kết quả</th><th>Lý do</th><th>Incident</th></tr></thead><tbody id="recoveryAuditRows">Đang tải...</tbody></table></div></div>
+</div></section>
+{# Diagnostics (task: SERVICES_DIAGNOSTICS_AUDIT_FIX): a real, separate page
+   -- "why is this unhealthy", not a repeat of the Services table above.
+   Opening this page must not run anything by itself (task section 12): no
+   auto-run, no auto-refresh. The target dropdown may come preselected from
+   a deep link (?view=diagnostics&target=mesflow, e.g. from a Services row's
+   "Chẩn đoán" link or an Incident), but "Run diagnosis" is always an
+   explicit click. #}
+<section id="diagnostics" class="tab"><div class="grid">
+<div class="card full"><h3>Chẩn đoán</h3><p class="muted">Điều tra tại chỗ khi có sự cố. Không tự động chạy khi mở trang — bấm "Chạy chẩn đoán" để thực hiện.</p>
+ <div class="toolbar" style="flex-wrap:wrap">
+  <select id="diagTarget">
+   <option value="whole">Toàn hệ thống</option>
+   <option value="mesflow">MESFlow</option>
+   <option value="postgres">PostgreSQL</option>
+   <option value="nginx">Gateway / Nginx</option>
+   <option value="qa">QA Center</option>
+   <option value="docker">Docker</option>
+   <option value="disk">Disk</option>
+   <option value="ram">RAM</option>
+  </select>
+  <button class="primary" onclick="runOpsDiagnosis()">Chạy chẩn đoán</button>
+ </div>
+</div>
+<div class="card full"><div id="diagOutput" class="muted">Chọn mục tiêu rồi bấm "Chạy chẩn đoán".</div></div>
+</div></section>
+<section id="alerts" class="tab"><div class="card"><div class="toolbar"><button onclick="loadAlerts()">Làm mới</button><span class="muted">Sự cố đang mở (ACTIVE / ACKNOWLEDGED) — tự động phát hiện, không lặp lại cho mỗi lần poll.</span></div><div id="alertRows">Đang tải...</div></div></section>
+<section id="incidents" class="tab"><div class="card"><div class="toolbar"><select id="incidentStatus"><option value="">Tất cả trạng thái</option><option value="ACTIVE">ACTIVE</option><option value="ACKNOWLEDGED">ACKNOWLEDGED</option><option value="RESOLVED">RESOLVED</option><option value="AUTO_RESOLVED">AUTO_RESOLVED</option></select><button onclick="loadIncidents()">Làm mới</button></div><div class="tablewrap"><table><thead><tr><th>Loại</th><th>Mức độ</th><th>Dịch vụ</th><th>Trạng thái</th><th>Bắt đầu</th><th>Lần cuối</th><th>Số lần</th><th></th></tr></thead><tbody id="incidentRows"></tbody></table></div></div></section>
 <section id="services" class="tab"><div class="card"><div class="toolbar"><input id="serviceFilter" placeholder="Lọc service..."><button onclick="loadServices()">Làm mới</button></div><div class="tablewrap"><table><thead><tr><th>Service</th><th>Active</th><th>Sub</th><th>Mô tả</th><th>Điều khiển</th></tr></thead><tbody id="serviceRows"></tbody></table></div></div></section>
 <section id="docker" class="tab"><div class="card"><div class="toolbar"><input id="dockerFilter" placeholder="Lọc container..."><button onclick="loadDocker()">Làm mới</button></div><div class="tablewrap"><table><thead><tr><th>Name</th><th>Image</th><th>Status</th><th>Ports</th><th>Điều khiển</th></tr></thead><tbody id="dockerRows"></tbody></table></div></div></section>
 <section id="ports" class="tab"><div class="card"><div class="toolbar"><input id="portFilter" placeholder="Lọc port / PID / process..."><button onclick="loadPorts()">Làm mới</button></div><div class="tablewrap"><table><thead><tr><th>IP</th><th>Port</th><th>PID</th><th>Process</th></tr></thead><tbody id="portRows"></tbody></table></div></div></section>
+<section id="fleet" class="tab"><div class="grid">
+<div class="card full"><div class="toolbar" style="flex-wrap:wrap"><h3 style="margin:0">Fleet Summary</h3><button onclick="loadFleet()">Làm mới</button></div>
+ <div id="fleetSummaryCards" class="grid" style="grid-template-columns:repeat(6,1fr);gap:8px;margin-top:10px">
+ <div class="card metric"><div class="label">Servers</div><div id="fsTotal" class="value">--</div></div>
+ <div class="card metric"><div class="label">Online</div><div id="fsOnline" class="value">--</div></div>
+ <div class="card metric"><div class="label">Degraded</div><div id="fsDegraded" class="value">--</div></div>
+ <div class="card metric"><div class="label">Offline</div><div id="fsOffline" class="value">--</div></div>
+ <div class="card metric"><div class="label">Production</div><div id="fsProduction" class="value">--</div></div>
+ <div class="card metric"><div class="label">Active Incidents</div><div id="fsIncidents" class="value">--</div></div>
+ </div></div>
+<div class="card full"><h3>Active Incidents (toàn Fleet)</h3><div class="muted" style="margin-bottom:6px">Tổng hợp sự cố ACTIVE/ACKNOWLEDGED từ mọi server đã đăng ký — nguồn duy nhất để xem cảnh báo across toàn bộ hạ tầng.</div><div id="fleetIncidentRows">Đang tải…</div></div>
+<div class="card full"><div class="toolbar"><h3 style="margin:0">Đăng ký server mới</h3></div>
+ <div class="grid" style="grid-template-columns:repeat(3,1fr);gap:8px">
+ <input id="newSrvName" placeholder="Tên (vd: mesflow-test)">
+ <select id="newSrvEnv"><option value="TEST">TEST</option><option value="PRODUCTION">PRODUCTION</option><option value="DEV">DEV</option><option value="OTHER">OTHER</option></select>
+ <input id="newSrvRoles" placeholder="Roles (vd: MESFLOW,POSTGRESQL)">
+ <input id="newSrvUrl" placeholder="Agent URL (http://host:8090)">
+ <input id="newSrvUser" placeholder="Agent user" value="admin">
+ <input id="newSrvPassword" type="password" placeholder="Agent password">
+ </div>
+ <div class="toolbar" style="margin-top:8px"><label class="muted"><input type="checkbox" id="newSrvProdConfirm"> Xác nhận đây là server PRODUCTION</label><button onclick="registerServer()">Đăng ký server</button><span class="muted" id="registerBusy"></span></div>
+ <p class="muted">Đăng ký chỉ lưu thông tin (trạng thái PENDING); server chỉ chuyển ACTIVE sau khi "Test connection" thành công — không bao giờ đánh dấu khoẻ mạnh trước khi bắt tay thật.</p>
+</div>
+<div class="card full"><div class="tablewrap"><table><thead><tr><th>Tên</th><th>Môi trường</th><th>Đăng ký</th><th>Sức khỏe</th><th>Agent version</th><th>Roles</th><th>Điều khiển</th></tr></thead><tbody id="serverRows"></tbody></table></div></div>
+</div></section>
+<section id="backup" class="tab"><div class="grid">
+<div class="card span2"><h3>PostgreSQL Center</h3><div id="pgSummary" class="muted">Đang tải…</div></div>
+<div class="card span2"><h3>Storage</h3><div id="storageSummary" class="muted">Đang tải…</div><div class="tablewrap"><table><thead><tr><th>Danh mục</th><th>Dung lượng</th></tr></thead><tbody id="storageCategoryRows"></tbody></table></div></div>
+<div class="card full"><h3>Bảng lớn nhất</h3><div class="tablewrap"><table><thead><tr><th>Bảng</th><th>Kích thước</th></tr></thead><tbody id="pgTableRows"></tbody></table></div></div>
+<div class="card full"><div class="toolbar"><h3 style="margin:0">PostgreSQL Backups</h3><button onclick="createDbBackup()">Tạo backup thủ công</button><button onclick="loadBackupCenter()">Làm mới</button><span class="muted" id="backupBusy"></span></div>
+<div class="tablewrap"><table><thead><tr><th>Backup</th><th>Tạo lúc</th><th>Trạng thái</th><th>Xác minh</th><th>Restore test</th><th>Kích thước</th><th>Pin</th><th>Điều khiển</th></tr></thead><tbody id="dbBackupRows"></tbody></table></div></div>
+<div class="card full"><div class="toolbar"><h3 style="margin:0">Retention</h3><button onclick="previewRetention()">Xem trước</button><button id="applyRetentionBtn" onclick="applyRetention()" disabled>Áp dụng retention</button><span class="muted" id="retentionSummary"></span></div><div class="tablewrap"><table><thead><tr><th>Backup</th><th>Lý do hết hạn</th><th>Kích thước</th></tr></thead><tbody id="retentionRows"></tbody></table></div></div>
+<div class="card full"><h3>Restore Drill (LOCAL/TEST only)</h3><p class="muted">Khôi phục thử vào database tạm, tự sinh tên, không bao giờ chạy trên Production. Xem chi tiết trong bảng Backups ở trên (nút "Restore test").</p><div class="tablewrap"><table><thead><tr><th>Drill</th><th>Backup</th><th>Bắt đầu</th><th>Trạng thái</th><th>Kiểm tra</th><th>Dọn dẹp</th></tr></thead><tbody id="restoreDrillRows"></tbody></table></div></div>
+<div class="card full"><h3>Nhật ký kiểm toán (Audit)</h3><div class="tablewrap"><table><thead><tr><th>Thời gian</th><th>Hành động</th><th>Chi tiết</th></tr></thead><tbody id="dbAuditRows"></tbody></table></div></div>
+</div></section>
 <section id="logs" class="tab"><div class="card"><div class="toolbar"><select id="logSource" class="logselect"><option value="agent">Deploy Agent</option><option value="mesflow">MESFlow app</option><option value="postgres">PostgreSQL</option><option value="qa">QA Center</option><option value="nginx">Nginx</option><option value="errors">System errors</option><option value="kernel">Kernel warnings</option></select><select id="logLines"><option>100</option><option selected>200</option><option>500</option><option>1000</option></select><button onclick="loadLogs()">Đọc log</button></div><pre id="logOut" class="terminal">Chọn nguồn log rồi bấm Đọc log.</pre></div></section>
 <section id="terminal" class="tab">
+<div class="alert"><b>Quyền quản trị hệ thống.</b> Lệnh được audit và vẫn phải qua allowlist/xác nhận hiện hành. Không nhập credential vào command.</div>
 <div class="card"><h3>Local Command</h3><div class="quick"><button onclick="setLocal('docker ps')">docker ps</button><button onclick="setLocal('docker stats --no-stream')">docker stats</button><button onclick="setLocal('systemctl --failed')">failed services</button><button onclick="setLocal('df -h')">df -h</button><button onclick="setLocal('free -h')">free -h</button><button onclick="setLocal('ss -lntp')">ports</button><button onclick="setLocal('journalctl -p err -n 100 --no-pager')">system errors</button></div><div class="cmdrow"><b>$</b><input id="localCmd" value="docker ps" autocomplete="off"><button class="primary" onclick="runLocal(false)">Run</button></div><pre id="localOut" class="terminal">Ready.</pre></div>
 <div class="card"><h3>SSH Command</h3><div class="muted">Password chỉ dùng cho lần chạy hiện tại, không lưu. Nếu server đã cấu hình key, để trống Password và có thể nhập key path.</div><div class="sshgrid" style="margin-top:10px"><input id="sshHost" placeholder="Host / IP"><input id="sshPort" value="22" placeholder="Port"><input id="sshUser" value="root" placeholder="User"><input id="sshPassword" type="password" placeholder="Password (không lưu)"><input id="sshKey" placeholder="Key path, vd /root/.ssh/id_ed25519" style="grid-column:span 2"><input id="sshCmd" value="uname -a && uptime" placeholder="Command" style="grid-column:span 2"></div><div class="toolbar"><button class="primary" onclick="runSSH(false)">Gửi lệnh SSH</button><button onclick="document.getElementById('sshCmd').value='docker ps'">docker ps</button><button onclick="document.getElementById('sshCmd').value='systemctl --failed'">failed services</button><button onclick="document.getElementById('sshCmd').value='journalctl -p err -n 100 --no-pager'">errors</button></div><pre id="sshOut" class="terminal">Ready.</pre></div>
 </section>
 </div>
+{% include '_operations_shell_end.html' %}
 <script>
-const csrf={{csrf|tojson}}; let services=[],dockers=[],ports=[];
-async function api(url,opt={}){opt.headers={...(opt.headers||{}),'X-CSRF-Token':csrf}; if(opt.body&&!opt.headers['Content-Type'])opt.headers['Content-Type']='application/json'; const r=await fetch(url,opt); let d={};try{d=await r.json()}catch(e){d={ok:false,error:'HTTP '+r.status}} d._status=r.status; return d}
+const csrf={{csrf|tojson}}; const initialView={{initial_view|tojson}}; const initialTarget={{(initial_target or '')|tojson}}; const SERVER_ROLE={{(server_role or '')|tojson}}; let services=[],dockers=[],ports=[];
+function feedback(message,state='ready'){opsFeedback.textContent=message;opsFeedback.dataset.state=state}
+async function api(url,opt={}){if(url.startsWith('/api/'))url='{{request.script_root}}'+url;opt.headers={...(opt.headers||{}),'X-CSRF-Token':csrf}; if(opt.body&&!opt.headers['Content-Type'])opt.headers['Content-Type']='application/json'; const r=await fetch(url,opt); let d={};try{d=await r.json()}catch(e){d={ok:false,error:'HTTP '+r.status}} d._status=r.status; return d}
 function esc(s){return String(s??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]))}
+// Compact "dot + text" status indicator (task: "not giant status boxes" --
+// keep the original Docker/systemd status text, which carries real
+// information like "Up 3 hours", visible, and use color only as an
+// at-a-glance signal, never as the sole indicator of state).
+function dotStatus(text,tone){return `<span class="dotstatus ${tone}"><i></i>${esc(text)}</span>`}
+function dockerStatusDot(status){const s=String(status||'');const tone=/unhealthy|exited|dead/i.test(s)?'crit':/healthy|^up /i.test(s)?'ok':'warn';return dotStatus(s||'—',tone)}
+function serviceStatusDot(active){const tone=active==='active'?'ok':active==='failed'?'crit':'muted';return dotStatus(active||'—',tone)}
+// Truncated technical identifier + copy button (task section 12) -- the
+// full value always lives in data-full for the copy button; never shown
+// inline in full unless the user explicitly copies it.
+function hashChip(full,head=8,tail=6){full=String(full||'');if(!full)return '<span class="muted">—</span>';const short=full.length>head+tail+3?`${full.slice(0,head)}…${full.slice(-tail)}`:full;const id='h'+Math.random().toString(36).slice(2,9);return `<span class="ops-hash"><span id="${id}t">${esc(short)}</span><button type="button" onclick="copyHash(this,'${id}')" data-full="${esc(full)}">Copy</button></span>`}
+function copyHash(btn){const full=btn.getAttribute('data-full');navigator.clipboard?.writeText(full).then(()=>{const old=btn.textContent;btn.textContent='✓';btn.classList.add('copied');setTimeout(()=>{btn.textContent=old;btn.classList.remove('copied')},1200)}).catch(()=>{})}
+// Docker's IMAGE column often carries a full "name:tag@sha256:<64 hex>"
+// reference -- show the name:tag plainly and fold the digest into a
+// hash chip instead of printing the whole 90+ char string inline.
+function imageRef(img){img=String(img||'');const at=img.indexOf('@sha256:');if(at===-1)return esc(img);const namePart=img.slice(0,at),digest=img.slice(at+1);return `${esc(namePart)} ${hashChip(digest)}`}
 function uptime(sec){sec=Number(sec||0);let d=Math.floor(sec/86400),h=Math.floor((sec%86400)/3600),m=Math.floor((sec%3600)/60);return `${d}d ${h}h ${m}m`}
-document.querySelectorAll('.nav button').forEach(b=>b.onclick=()=>{document.querySelectorAll('.nav button').forEach(x=>x.classList.remove('active'));document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));b.classList.add('active');document.getElementById(b.dataset.tab).classList.add('active'); if(b.dataset.tab==='services')loadServices(); if(b.dataset.tab==='docker')loadDocker(); if(b.dataset.tab==='ports')loadPorts();});
-async function loadSummary(){let d=await api('{{url_for("api_ops_summary")}}'); let sc=d.score??0; score.textContent=sc+'/100';score.className='score '+(sc>=85?'ok':sc>=65?'warn':'bad');healthText.textContent=sc>=85?'HEALTHY':sc>=65?'WARNING':'CRITICAL';cpu.textContent=(d.cpu_percent??0).toFixed(0)+'%';load.textContent='Load '+(d.load||[]).join(' / ');ram.textContent=(d.ram?.percent??0).toFixed(0)+'%';ramDetail.textContent=`${d.ram?.used||'-'} / ${d.ram?.total||'-'}`;disk.textContent=(d.disk?.percent??0).toFixed(0)+'%';diskDetail.textContent=`${d.disk?.used||'-'} / ${d.disk?.total||'-'} · free ${d.disk?.free||'-'}`;serverInfo.innerHTML=`<b>${esc(d.hostname)}</b><br>${esc(d.os)}<br>Uptime ${uptime(d.uptime_seconds)} · boot ${esc(d.boot_time)}<br>Docker running: ${d.docker_running} · unhealthy: ${d.docker_unhealthy} · failed services: ${d.failed_services}`;mainHealth.innerHTML=`MESFlow: <b class="${d.mes?.online?'ok':'bad'}">${d.mes?.online?'ONLINE':'OFFLINE'}</b> · ${esc(d.mes?.version||'')}<br>QA Center: <b class="${d.qa?.online?'ok':'bad'}">${d.qa?.online?'ONLINE':'OFFLINE'}</b> · ${esc(d.qa?.version||'')}`;alerts.innerHTML=(d.alerts||[]).length?(d.alerts.map(x=>`<div class="alert">⚠ ${esc(x)}</div>`).join('')):'Không có cảnh báo.'}
-async function loadServices(){let d=await api('{{url_for("api_ops_services")}}');services=d.items||[];renderServices()}
-function renderServices(){let q=serviceFilter.value.toLowerCase();serviceRows.innerHTML=services.filter(x=>(x.unit+' '+x.description).toLowerCase().includes(q)).map(x=>`<tr><td><b>${esc(x.unit)}</b></td><td class="status ${x.active==='active'?'ok':x.active==='failed'?'bad':''}">${esc(x.active)}</td><td>${esc(x.sub)}</td><td>${esc(x.description)}</td><td><button class="smallbtn" onclick="serviceAction('${esc(x.unit)}','restart')">Restart</button> <button class="smallbtn danger" onclick="serviceAction('${esc(x.unit)}','stop')">Stop</button> <button class="smallbtn" onclick="serviceAction('${esc(x.unit)}','start')">Start</button></td></tr>`).join('')}
+const OPS_VIEW_LABELS={overview:'Tổng quan',recovery:'Dịch vụ',diagnostics:'Chẩn đoán',fleet:'Servers / Fleet',alerts:'Cảnh báo',incidents:'Sự cố',services:'Dịch vụ hệ thống (systemd)',docker:'Docker',ports:'Ports',backup:'Backup / DB / Storage',logs:'Nhật ký hệ thống',terminal:'Command / SSH'};
+function showOpsView(view){document.querySelectorAll('.tab').forEach(x=>x.classList.toggle('active',x.id===view));feedback('Đã mở: '+(OPS_VIEW_LABELS[view]||view));if(view==='services')loadServices();if(view==='docker')loadDocker();if(view==='ports')loadPorts();if(view==='alerts')loadAlerts();if(view==='incidents')loadIncidents();if(view==='backup')loadBackupCenter();if(view==='fleet')loadFleet();if(view==='recovery'){loadRecoveryServices();runSystemCheck();loadRecoveryAudit()}
+ // Diagnostics (task section 12): opening this view must NOT run any
+ // diagnosis by itself -- only preselect the target dropdown from a deep
+ // link (?target=), same as an Incident or the Services page's "Chẩn
+ // đoán" link would pass. Deep diagnosis only happens on an explicit
+ // "Chạy chẩn đoán" click (runOpsDiagnosis()).
+ if(view==='diagnostics'&&initialTarget&&document.getElementById('diagTarget'))diagTarget.value=initialTarget;
+}
+showOpsView(initialView);
+
+// -- Server Incident Recovery Console -----------------------------------
+function needsProductionConfirm(){return String(SERVER_ROLE||'').toUpperCase()==='PRODUCTION'}
+function recoveryToneBadge(status){const tone={HEALTHY:'healthy',DEGRADED:'warning',CRITICAL:'critical'}[status]||'';return tone}
+function recoveryStateDot(state){const tone={running:'ok',stopped:'crit',missing:'crit',unhealthy:'warn'}[state]||'muted';return dotStatus(state,tone)}
+function recoveryHealthDot(h){const tone=(h==='healthy'||h==='none')?'ok':h==='unknown'?'muted':'warn';return dotStatus(h,tone)}
+let recoveryServices=[];
+function recoveryRow(s){
+ const depText=(s.dependencies||[]).map(dep=>`${dep}:${(s.dependency_states||{})[dep]||'?'}`).join(', ')||'—';
+ const startBtn=s.can_start?`<button class="smallbtn primary" onclick="recoveryStart('${s.id}')">Khởi động</button>`:`<button class="smallbtn" disabled title="${esc(s.start_blocked_reason||'')}">Khởi động</button>`;
+ // Chẩn đoán (task section 14): navigates to the dedicated Diagnostics
+ // page with this service preselected as target -- does not run any
+ // diagnosis itself, and does not duplicate the diagnose UI here.
+ const diagHref=`{{url_for('ops_page')}}?view=diagnostics&target=${encodeURIComponent(s.id)}`;
+ return `<tr><td><b>${esc(s.label)}</b></td><td><code>${esc(s.container)}</code></td><td>${s.running?'✓':'—'}</td><td>${recoveryHealthDot(s.health)}</td><td>${esc(s.version||'—')}</td><td>${s.running?uptime(s.uptime_seconds):'—'}</td><td class="muted">${esc(depText)}</td><td class="muted">${esc(s.last_error||'—')}</td>
+ <td><button class="smallbtn" onclick="recoveryView('${s.id}')">Xem</button> <button class="smallbtn" onclick="recoveryLogs('${s.id}')">Log</button> ${startBtn} <a class="smallbtn" href="${diagHref}">Chẩn đoán</a>
+ <details style="display:inline-block;margin-left:4px"><summary style="display:inline-block">Thao tác nâng cao</summary>
+  <button class="smallbtn" onclick="recoveryAction('${s.id}','restart')" ${s.can_restart?'':'disabled'}>Restart</button>
+  <button class="smallbtn danger" onclick="recoveryAction('${s.id}','stop')" ${s.can_stop?'':'disabled'}>Stop</button>
+ </details></td></tr>`;
+}
+async function loadRecoveryServices(){
+ feedback('Đang tải danh sách dịch vụ…','loading');
+ const d=await api('/api/ops/recovery/services');
+ recoveryServices=d.items||[];
+ recoveryServiceRows.innerHTML=recoveryServices.map(recoveryRow).join('')||'<tr><td colspan="9" class="muted">Không có dữ liệu.</td></tr>';
+ feedback(d.ok===false?(d.error||'Không tải được dịch vụ'):`Đã tải ${recoveryServices.length} dịch vụ.`,d.ok===false?'error':'ready');
+}
+async function recoveryView(id){
+ const d=await api(`/api/ops/recovery/services/${id}`);
+ if(!d.ok){alert(d.error||'Không tải được chi tiết');return}
+ const s=d.item;
+ recoveryViewPanel.style.display='block';
+ recoveryViewBody.innerHTML=`<p><b>${esc(s.label)}</b> (<code>${esc(s.container)}</code>) — ${recoveryStateDot(s.state)} ${recoveryHealthDot(s.health)}</p>
+  <p>Version: ${esc(s.version||'—')} · Uptime: ${s.running?uptime(s.uptime_seconds):'—'} · Restart count: ${s.restart_count??0}</p>
+  <p>Dependencies: ${(s.dependencies||[]).map(dep=>`${esc(dep)}: ${esc((s.dependency_states||{})[dep]||'?')}`).join(', ')||'—'}</p>
+  <p>Last error: ${esc(s.last_error||'—')}</p>
+  <details><summary>Chi tiết kỹ thuật (docker inspect)</summary><pre>${esc(JSON.stringify(s.raw||{},null,2))}</pre></details>`;
+ recoveryViewPanel.scrollIntoView({behavior:'smooth',block:'nearest'});
+}
+async function recoveryLogs(id){
+ recoveryLogPanel.style.display='block';recoveryLogTitle.textContent=id;recoveryLogOutput.textContent='Đang tải log…';
+ recoveryLogPanel.scrollIntoView({behavior:'smooth',block:'nearest'});
+ const d=await api(`/api/ops/recovery/services/${id}/logs?lines=200`);
+ recoveryLogOutput.textContent=(d.stdout||'')+(d.stderr?'\n[stderr]\n'+d.stderr:'');
+}
+function recoveryStepMessage(step){
+ const map={STARTED:'Đã khởi động thành công.',SKIPPED_ALREADY_HEALTHY:'Đã healthy sẵn — không cần thao tác.',
+  RESTARTED:'Đã restart thành công.',STOPPED:'Đã dừng.',BLOCKED:'Bị chặn: '+(step.reason||''),
+  FAILED_PORT_CONFLICT:'Xung đột cổng — xem chi tiết bên dưới.',
+  FAILED_TO_START:'Không khởi động được: '+(step.reason||''),
+  FAILED_TO_RESTART:'Không restart được: '+(step.reason||''),
+  FAILED_TO_STOP:'Không dừng được: '+(step.reason||''),
+  FAILED_UNHEALTHY_AFTER_START:(step.detail&&step.detail.message)?step.detail.message:'Khởi động nhưng vẫn unhealthy.'};
+ return map[step.action]||step.action;
+}
+function handleRecoveryStepResult(d){
+ const step=(d&&d.item)||{};
+ if(step.action==='FAILED_PORT_CONFLICT'){
+  recoveryPortConflictPanel.style.display='block';
+  const rows=((step.detail&&step.detail.conflicts)||[]).map(c=>`<tr><td>${c.port}</td><td>${esc(c.protocol)}</td><td>${c.owner_pid||'—'}</td><td>${esc(c.owner_process||'—')}</td><td>${esc(c.owner_container||'—')}</td></tr>`).join('');
+  recoveryPortConflictBody.innerHTML=`<table><thead><tr><th>Port</th><th>Protocol</th><th>Owner PID</th><th>Owner process</th><th>Owner project/container</th></tr></thead><tbody>${rows}</tbody></table>
+   <div class="toolbar"><button onclick="recoveryRetryStart('${step.service_id}')">Thử lại</button></div>`;
+  recoveryPortConflictPanel.scrollIntoView({behavior:'smooth',block:'nearest'});
+ }
+ feedback(recoveryStepMessage(step),/^(FAILED|BLOCKED)/.test(step.action||'')?'error':'ready');
+}
+function recoveryRetryStart(id){recoveryPortConflictPanel.style.display='none';recoveryStart(id)}
+async function recoveryStart(id){
+ const body={};
+ if(needsProductionConfirm()){if(!confirm('Xác nhận khởi động dịch vụ trên PRODUCTION? Hành động này cần con người phê duyệt.'))return;body.confirm_production=true}
+ recoveryBusy.textContent=`Đang khởi động ${id}…`;
+ const d=await api(`/api/ops/recovery/services/${id}/start`,{method:'POST',body:JSON.stringify(body)});
+ recoveryBusy.textContent='';
+ handleRecoveryStepResult(d);
+ await loadRecoveryServices();await loadRecoveryAudit();
+}
+async function recoveryAction(id,action){
+ if(!confirm(`${action==='restart'?'Restart':'Stop'} ${id}? Đây là thao tác nâng cao.`))return;
+ const body={};
+ if(needsProductionConfirm()){if(!confirm('Xác nhận trên PRODUCTION? Hành động này cần con người phê duyệt.'))return;body.confirm_production=true}
+ const d=await api(`/api/ops/recovery/services/${id}/${action}`,{method:'POST',body:JSON.stringify(body)});
+ handleRecoveryStepResult(d);
+ await loadRecoveryServices();await loadRecoveryAudit();
+}
+function renderRecoveryRun(run){
+ if(!run)return;
+ recoveryRunPanel.style.display='block';
+ recoveryRunSteps.innerHTML=(run.steps||[]).map(s=>`<div class="ops-status-row"><span>${esc(s.label)}</span><span class="ops-badge ${/STARTED|SKIPPED/.test(s.action)?'healthy':/BLOCKED/.test(s.action)?'warning':'critical'}">${esc(s.action)}</span></div>`+(s.reason?`<div class="muted" style="margin:-4px 0 8px">${esc(s.reason)}</div>`:'')).join('');
+}
+async function runRecoveryStack(){
+ const body={};
+ if(needsProductionConfirm()){
+  if(!confirm('Khôi phục MESFlow Stack trên PRODUCTION? Hành động này cần con người phê duyệt và có thể khởi động lại các dịch vụ.'))return;
+  body.confirm_production=true;
+ }else if(!confirm('Khôi phục MESFlow Stack? Hệ thống sẽ kiểm tra và chỉ khởi động các dịch vụ đang dừng theo đúng thứ tự phụ thuộc (không đụng vào dịch vụ đã healthy).')){return}
+ recoveryBusy.textContent='Đang khôi phục MESFlow Stack…';
+ const d=await api('/api/ops/recovery/stack',{method:'POST',body:JSON.stringify(body)});
+ recoveryBusy.textContent='';
+ if(d.error==='RECOVERY_ALREADY_RUNNING'){feedback('Một tiến trình khôi phục khác đang chạy — vui lòng đợi.','error');return}
+ renderRecoveryRun(d.item);
+ await loadRecoveryServices();await loadRecoveryAudit();
+ feedback(d.ok?'Khôi phục MESFlow Stack hoàn tất.':'Khôi phục kết thúc với một số bước bị chặn/thất bại — xem chi tiết ở trên.',d.ok?'ready':'error');
+}
+function systemCheckHtml(d){
+ return `<div style="margin-bottom:8px"><span class="ops-badge ${recoveryToneBadge(d.status)}" style="font-size:13px;padding:6px 12px">${esc(d.status)}</span></div>`+
+  (d.components||[]).map(c=>`<div class="ops-status-row"><span>${esc(c.name)}</span><span class="ops-badge ${recoveryToneBadge(c.status)}">${esc(c.detail)}</span></div>`).join('');
+}
+async function runSystemCheck(){
+ // Services page summary banner -- part of "what is currently running"
+ // (task section 4), not a diagnosis; loaded once on page open + on
+ // "Làm mới", same cost class as loadRecoveryServices().
+ recoveryBusy.textContent='Đang kiểm tra toàn hệ thống…';
+ const d=await api('/api/ops/recovery/system-check');
+ recoveryBusy.textContent='';
+ if(!d.ok){systemCheckPanel.innerHTML=`<span class="muted">Không kiểm tra được: ${esc(d.error||'unknown')}</span>`;return}
+ systemCheckPanel.innerHTML=systemCheckHtml(d);
+}
+function diagResultHtml(d){
+ return `<div class="alert" style="background:#eef2f8;color:inherit;border-color:var(--line)"><b>SUMMARY</b><div>${esc(d.summary)}</div></div>
+  <p><b>EVIDENCE</b><br>${(d.evidence||[]).map(esc).join('<br>')}</p>
+  <p><b>PROBABLE CAUSE</b><br>${esc(d.probable_cause)}</p>
+  <p><b>RECOMMENDED ACTION</b><br>${esc(d.recommended_action)}</p>`;
+}
+// Diagnostics page (task section 9/10/12): one explicit action --
+// "Chạy chẩn đoán" -- dispatches the selected target to the existing
+// read-only /api/ops/recovery/diagnose/<kind> flows (or system-check for
+// "whole system"). Nothing here runs on page load; see showOpsView().
+const DIAG_TARGET_KIND={mesflow:'mesflow_unavailable',postgres:'postgres_unavailable',nginx:'gateway_502',docker:'docker_unavailable',disk:'disk_high',ram:'ram_high'};
+async function runOpsDiagnosis(){
+ const target=diagTarget.value;
+ diagOutput.textContent='Đang chẩn đoán…';
+ if(target==='whole'){
+  const d=await api('/api/ops/recovery/system-check');
+  diagOutput.innerHTML=d.ok?systemCheckHtml(d):`<span class="muted">Không kiểm tra được: ${esc(d.error||'unknown')}</span>`;
+  return;
+ }
+ if(target==='qa'){
+  // QA Center has no single adaptive diagnoser like mesflow_unavailable/
+  // postgres_unavailable/gateway_502 (task section 10: only implement
+  // targets with real backend evidence) -- read its actual current state
+  // first, then pick the diagnosis kind that state supports, exactly the
+  // same allowlisted service lookup the Services page itself uses.
+  const svc=await api('/api/ops/recovery/services/qa');
+  if(!svc.ok){diagOutput.innerHTML=`<span class="muted">Không đọc được trạng thái QA Center: ${esc(svc.error||'unknown')}</span>`;return}
+  const item=svc.item;
+  if(item.running&&(item.health==='healthy'||item.health==='none')){
+   diagOutput.innerHTML=`<div class="alert" style="background:#eef2f8;color:inherit;border-color:var(--line)"><b>SUMMARY</b><div>QA Center đang chạy và khoẻ mạnh.</div></div><p><b>EVIDENCE</b><br>running=true<br>health=${esc(item.health)}</p><p><b>PROBABLE CAUSE</b><br>Không có vấn đề.</p><p><b>RECOMMENDED ACTION</b><br>Không cần hành động.</p>`;
+   return;
+  }
+  const kind=item.running?'container_unhealthy':'container_stopped';
+  const d=await api(`/api/ops/recovery/diagnose/${kind}?service=qa`);
+  diagOutput.innerHTML=d.ok?diagResultHtml(d):`<span class="muted">Không chẩn đoán được: ${esc(d.error||'unknown')}</span>`;
+  return;
+ }
+ const kind=DIAG_TARGET_KIND[target];
+ if(!kind){diagOutput.innerHTML='<span class="muted">Mục tiêu không hợp lệ.</span>';return}
+ const svcParam={mesflow:'mesflow',postgres:'postgres',nginx:'nginx'}[target];
+ const d=await api(`/api/ops/recovery/diagnose/${kind}${svcParam?`?service=${svcParam}`:''}`);
+ diagOutput.innerHTML=d.ok?diagResultHtml(d):`<span class="muted">Không chẩn đoán được: ${esc(d.error||'unknown')}</span>`;
+}
+async function loadRecoveryAudit(){
+ const d=await api('/api/ops/recovery/audit');
+ const items=(d.items||[]).slice(0,50);
+ recoveryAuditRows.innerHTML=items.map(e=>`<tr><td>${fmtT(e.at)}</td><td>${esc(e.who||'')}</td><td>${esc(e.service||'')}</td><td><code>${esc(e.action||'')}</code></td><td>${esc(e.previous_state||'')}</td><td>${esc(e.result||'')}</td><td class="muted">${esc(e.reason||'')}</td><td>${esc(e.incident_id||'—')}</td></tr>`).join('')||'<tr><td colspan="8" class="muted">Chưa có hoạt động nào.</td></tr>';
+}
+
+function setResBar(el,pct){pct=Math.max(0,Math.min(100,Number(pct||0)));el.querySelector('span').style.width=pct+'%';el.className='ops-bar'+(pct>=90?' crit':pct>=75?' warn':'')}
+async function loadSummary(){let d=await api('{{url_for("api_ops_summary")}}'); let sc=d.score??0; score.textContent=sc+'/100';score.className='score '+(sc>=85?'ok':sc>=65?'warn':'bad');healthText.textContent=sc>=85?'HEALTHY':sc>=65?'WARNING':'CRITICAL';cpu.textContent=(d.cpu_percent??0).toFixed(0)+'%';load.textContent='Load '+(d.load||[]).join(' / ');ram.textContent=(d.ram?.percent??0).toFixed(0)+'%';ramDetail.textContent=`${d.ram?.used||'-'} / ${d.ram?.total||'-'}`;disk.textContent=(d.disk?.percent??0).toFixed(0)+'%';diskDetail.textContent=`${d.disk?.used||'-'} / ${d.disk?.total||'-'} · free ${d.disk?.free||'-'}`;setResBar(cpuBar,d.cpu_percent);setResBar(ramBar,d.ram?.percent);setResBar(diskBar,d.disk?.percent);serverInfo.innerHTML=`<b>${esc(d.hostname)}</b><br>${esc(d.os)}<br>Uptime ${uptime(d.uptime_seconds)} · boot ${esc(d.boot_time)}<br>Docker running: ${d.docker_running} · unhealthy: ${d.docker_unhealthy} · failed services: ${d.failed_services}`;mainHealth.innerHTML=`MESFlow: <b class="${d.mes?.online?'ok':'bad'}">${d.mes?.online?'ONLINE':'OFFLINE'}</b> · ${esc(d.mes?.version||'')}<br>QA Center: <b class="${d.qa?.online?'ok':'bad'}">${d.qa?.online?'ONLINE':'OFFLINE'}</b> · ${esc(d.qa?.version||'')}`;healthAlerts.innerHTML=(d.alerts||[]).length?(d.alerts.map(x=>`<div class="alert">⚠ ${esc(x)}</div>`).join('')):'Không có cảnh báo.'}
+function bytes(v){v=Number(v||0);for(const u of ['B','KB','MB','GB','TB']){if(v<1024||u==='TB')return v.toFixed(1)+' '+u;v/=1024}}
+function forecastHtml(x,capacity=false){if(!x||x.status==='INSUFFICIENT_DATA')return `<b>Đang học baseline</b><br>${esc(x?.reason||'Chưa đủ dữ liệu')}`;const growth=x.growth_per_day==null?'—':`${x.growth_per_day>=0?'+':''}${bytes(x.growth_per_day)}/ngày`;const threshold=capacity&&x.thresholds?.['90']!=null?`<br>90% dự kiến: khoảng ${Math.max(1,Math.round(x.thresholds['90']))} ngày`:'';return `<b>Hiện tại: ${bytes(x.current_value)}</b><br>Tăng trưởng: ${growth}${threshold}<br>Confidence: ${esc(x.confidence)}`}
+async function loadPredictions(){const d=await api('/api/ops/predictions');if(!d.ok){predictiveInsights.textContent='Không thể tải phân tích dự báo.';return}diskForecast.innerHTML=forecastHtml(d.disk,true);dbForecast.innerHTML=forecastHtml(d.database,false);predictiveInsights.innerHTML=(d.insights||[]).map(x=>`<article class="prediction ${esc(x.risk)}"><div><b>${esc(x.risk)}</b><small class="predicted">DỰ BÁO</small></div><div><b>${esc(x.title)}</b><small>Độ tin cậy ${esc(x.confidence)} · ${esc(x.type)}</small></div></article>`).join('')||'<span class="muted">Không có rủi ro dự báo đang active.</span>';recurringProblems.innerHTML=(d.recurring||[]).map(x=>`<article class="prediction ${esc(x.risk)}"><div><b>${esc(x.risk)}</b><small>${x.score}/100</small></div><div><b>${esc(x.fingerprint)}</b><small>${x.incidents} lần · 7 ngày: ${x.recent_7d} · ${esc(x.trend)}</small></div></article>`).join('')||'<span class="muted">Chưa phát hiện sự cố lặp lại.</span>'}
+async function loadSuggestions(){const d=await api('/api/ops/predictions');const suggestions=(d.insights||[]).flatMap(x=>(x.suggested_checks||[]).map(s=>({...s,insight:x.title})));suggestedRemediation.innerHTML=suggestions.map(s=>`<div class="suggestion ${esc(s.risk)}"><b>${esc(s.action)}</b><small>${esc(s.risk)} · ${esc(s.reason)} · Evidence: ${esc(s.insight)}</small></div>`).join('')||'<span class="muted">Chưa có suggested check.</span>'}
+async function loadServices(){feedback('Đang tải danh sách services…','loading');let d=await api('{{url_for("api_ops_services")}}');services=d.items||[];renderServices();feedback(d.ok===false?(d.error||'Không tải được services'):`Đã tải ${services.length} service.`,d.ok===false?'error':'ready')}
+function renderServices(){let q=serviceFilter.value.toLowerCase();serviceRows.innerHTML=services.filter(x=>(x.unit+' '+x.description).toLowerCase().includes(q)).map(x=>`<tr><td><b>${esc(x.unit)}</b></td><td>${serviceStatusDot(x.active)}</td><td>${esc(x.sub)}</td><td>${esc(x.description)}</td><td><details><summary>Thao tác nâng cao</summary><button class="smallbtn" onclick="serviceAction('${esc(x.unit)}','restart')">Restart</button> <button class="smallbtn danger" onclick="serviceAction('${esc(x.unit)}','stop')">Stop</button> <button class="smallbtn" onclick="serviceAction('${esc(x.unit)}','start')">Start</button></details></td></tr>`).join('')}
 serviceFilter.oninput=renderServices; async function serviceAction(unit,action){if((action==='stop'||action==='restart')&&!confirm(`${action} ${unit}?`))return;let d=await api('{{url_for("api_ops_service_action")}}',{method:'POST',body:JSON.stringify({unit,action})});alert(d.ok?'OK':(d.stderr||d.error||'Failed'));loadServices();loadSummary()}
-async function loadDocker(){let d=await api('{{url_for("api_ops_docker")}}');dockers=d.items||[];renderDocker()}
-function renderDocker(){let q=dockerFilter.value.toLowerCase();dockerRows.innerHTML=dockers.filter(x=>JSON.stringify(x).toLowerCase().includes(q)).map(x=>{let n=x.Names||x.Name||'';return `<tr><td><b>${esc(n)}</b></td><td>${esc(x.Image)}</td><td>${esc(x.Status)}</td><td>${esc(x.Ports)}</td><td><button class="smallbtn" onclick="dockerAction('${esc(n)}','restart')">Restart</button> <button class="smallbtn danger" onclick="dockerAction('${esc(n)}','stop')">Stop</button> <button class="smallbtn" onclick="dockerAction('${esc(n)}','start')">Start</button></td></tr>`}).join('')}
-dockerFilter.oninput=renderDocker;async function dockerAction(name,action){if((action==='stop'||action==='restart')&&!confirm(`${action} ${name}?`))return;let d=await api('{{url_for("api_ops_docker_action")}}',{method:'POST',body:JSON.stringify({name,action})});alert(d.ok?'OK':(d.stderr||d.error||'Failed'));loadDocker();loadSummary()}
-async function loadPorts(){let d=await api('{{url_for("api_ops_ports")}}');ports=d.items||[];renderPorts()}
+async function loadDocker(){feedback('Đang tải container Docker…','loading');let d=await api('{{url_for("api_ops_docker")}}');dockers=d.items||[];renderDocker();feedback(d.ok===false?(d.error||'Không tải được Docker'):`Đã tải ${dockers.length} container.`,d.ok===false?'error':'ready')}
+function renderDocker(){let q=dockerFilter.value.toLowerCase();dockerRows.innerHTML=dockers.filter(x=>JSON.stringify(x).toLowerCase().includes(q)).map(x=>{let n=x.Names||x.Name||'';return `<tr><td><b>${esc(n)}</b></td><td>${imageRef(x.Image)}</td><td>${dockerStatusDot(x.Status)}</td><td>${esc(x.Ports)}</td><td><details><summary>Thao tác nâng cao</summary><button type="button" class="smallbtn" data-docker-name="${esc(n)}" data-docker-action="restart">Restart</button> <button type="button" class="smallbtn danger" data-docker-name="${esc(n)}" data-docker-action="stop">Stop</button> <button type="button" class="smallbtn" data-docker-name="${esc(n)}" data-docker-action="start">Start</button></details></td></tr>`}).join('')}
+dockerFilter.oninput=renderDocker;
+// Defensive hardening (reports/DOCKER_ADVANCED_ACTION_UI_BUG.md) -- live
+// reproduction across every real row/viewport/timing variation on this
+// host never showed the reported list-disappearing bug, but the previous
+// per-row inline onclick attribute calling dockerAction with the
+// container name interpolated in had two real latent fragilities worth
+// closing anyway: (1) esc() HTML-entity-encodes
+// a container name, but that encoding is INSIDE an onclick attribute the
+// browser decodes back to raw characters before parsing it as JS -- a
+// name containing a single quote would have broken the inline JS string;
+// (2) buttons had no explicit type, defaulting to type="submit" (harmless
+// today since no <form> wraps this table, but not guaranteed to stay
+// true). A single delegated listener on the stable <tbody> reads
+// data-docker-name/data-docker-action via closest() instead -- plain
+// attribute values, never re-parsed as code -- and survives every
+// loadDocker()/filter re-render since it's attached once, not per row.
+dockerRows.addEventListener('click',e=>{const btn=e.target.closest('button[data-docker-action]');if(!btn)return;dockerAction(btn.dataset.dockerName,btn.dataset.dockerAction)});
+async function dockerAction(name,action){if((action==='stop'||action==='restart')&&!confirm(`${action} ${name}?`))return;let d=await api('{{url_for("api_ops_docker_action")}}',{method:'POST',body:JSON.stringify({name,action})});alert(d.ok?'OK':(d.stderr||d.error||'Failed'));loadDocker();loadSummary()}
+async function loadPorts(){feedback('Đang tải network ports…','loading');let d=await api('{{url_for("api_ops_ports")}}');ports=d.items||[];renderPorts();feedback(d.ok===false?(d.error||'Không tải được ports'):`Đã tải ${ports.length} port.`,d.ok===false?'error':'ready')}
 function renderPorts(){let q=portFilter.value.toLowerCase();portRows.innerHTML=ports.filter(x=>JSON.stringify(x).toLowerCase().includes(q)).map(x=>`<tr><td>${esc(x.ip)}</td><td><b>${esc(x.port)}</b></td><td>${esc(x.pid)}</td><td>${esc(x.process)}</td></tr>`).join('')}
-portFilter.oninput=renderPorts;async function loadLogs(){logOut.textContent='Loading...';let d=await api(`{{url_for("api_ops_logs")}}?source=${encodeURIComponent(logSource.value)}&lines=${encodeURIComponent(logLines.value)}`);logOut.textContent=(d.stdout||'')+(d.stderr?'\n[stderr]\n'+d.stderr:'')}
+portFilter.oninput=renderPorts;async function loadLogs(){feedback('Đang đọc log '+logSource.value+'…','loading');logOut.textContent='Loading...';let d=await api(`{{url_for("api_ops_logs")}}?source=${encodeURIComponent(logSource.value)}&lines=${encodeURIComponent(logLines.value)}`);logOut.textContent=(d.stdout||'')+(d.stderr?'\n[stderr]\n'+d.stderr:'');feedback(d.ok===false?(d.error||'Không đọc được log'):'Đã cập nhật log.',d.ok===false?'error':'ready')}
 function setLocal(c){localCmd.value=c;runLocal(false)}
 async function runLocal(confirmDanger){let cmd=localCmd.value.trim();if(!cmd)return;localOut.textContent='$ '+cmd+'\nRunning...';let d=await api('{{url_for("api_ops_local_command")}}',{method:'POST',body:JSON.stringify({command:cmd,confirm_dangerous:confirmDanger})});if(d.needs_confirmation){if(confirm(d.error+'\n\nBạn có chắc muốn chạy?'))return runLocal(true)}localOut.textContent='$ '+cmd+'\n\n'+(d.stdout||'')+(d.stderr?'\n[stderr]\n'+d.stderr:'')+`\n\n[exit ${d.exit_code}]`}
 async function runSSH(confirmDanger){let payload={host:sshHost.value.trim(),port:sshPort.value,user:sshUser.value.trim(),password:sshPassword.value,key_path:sshKey.value.trim(),command:sshCmd.value.trim(),confirm_dangerous:confirmDanger};sshOut.textContent=`${payload.user}@${payload.host}$ ${payload.command}\nConnecting...`;let d=await api('{{url_for("api_ops_ssh_command")}}',{method:'POST',body:JSON.stringify(payload)});if(d.needs_confirmation){if(confirm(d.error+'\n\nBạn có chắc muốn chạy?'))return runSSH(true)}sshOut.textContent=`${payload.user}@${payload.host}$ ${payload.command}\n\n`+(d.stdout||'')+(d.stderr?'\n[stderr]\n'+d.stderr:'')+`\n\n[exit ${d.exit_code}] ${d.duration_ms??''}ms`;sshPassword.value=''}
 localCmd.addEventListener('keydown',e=>{if(e.key==='Enter')runLocal(false)});sshCmd.addEventListener('keydown',e=>{if(e.key==='Enter')runSSH(false)});
-loadSummary();setInterval(loadSummary,15000);
+
+function fmtT(s){return s||'—'}
+function durationSince(startIso){if(!startIso)return '';const ms=Date.now()-new Date(startIso.replace(' ','T')).getTime();const m=Math.floor(ms/60000);if(m<1)return 'vừa mở';if(m<60)return m+' phút';return Math.floor(m/60)+'g '+(m%60)+'p'}
+const NOTIFY_ICON={SENT:'✓',FAILED:'✗',SKIPPED:'–',PENDING:'…'};
+function notifyBadgesHtml(deliveries){
+ if(!deliveries||!deliveries.length)return'';
+ const open=deliveries.filter(d=>d.notification_type==='OPEN');
+ const byChannel={};for(const d of open)byChannel[d.channel]=d.status;
+ return `<span class="notify-badges">${Object.entries(byChannel).map(([ch,st])=>`<span class="notify-badge ${esc(st)}" title="${esc(ch)}: ${esc(st)}">${esc(ch[0])}${NOTIFY_ICON[st]||'?'}</span>`).join('')}</span>`;
+}
+function incidentRow(x){return `<div class="incrow ${x.severity}"><div><span class="badge ${x.severity}">${x.severity}</span></div><div><b>${esc(x.summary||x.incident_type)}</b><br><span class="muted">${esc(x.service||x.source)} · <span class="st ${x.status}">${x.status}</span> · mở ${durationSince(x.started_at)} · ${x.occurrence_count||1} lần ${notifyBadgesHtml(x._deliveries)}</span></div><div><button class="smallbtn" onclick="openIncident('${x.incident_id}')">Chi tiết</button></div></div>`}
+async function loadAlerts(){feedback('Đang tải cảnh báo…','loading');const d=await api('{{url_for("api_incidents")}}?status=ACTIVE');const acked=await api('{{url_for("api_incidents")}}?status=ACKNOWLEDGED');const items=[...(d.items||[]),...(acked.items||[])];
+ // Best-effort per-row notification badges (section 36) -- small active
+ // list, never a blocking dependency: a failed fetch just omits badges.
+ await Promise.all(items.map(async x=>{try{x._deliveries=(await api(`/api/incidents/${x.incident_id}/notifications`)).items}catch(e){x._deliveries=[]}}));
+ alertRows.innerHTML=items.length?items.map(incidentRow).join(''):'<div class="muted">Không có sự cố nào đang mở. Hệ thống ổn định.</div>';feedback(`Đã cập nhật cảnh báo · ${items.length} mục.`)}
+async function loadIncidents(){feedback('Đang tải lịch sử sự cố…','loading');const status=incidentStatus.value;const d=await api('{{url_for("api_incidents")}}'+(status?`?status=${status}`:''));const items=d.items||[];incidentRows.innerHTML=items.map(x=>`<tr><td>${esc(x.incident_type)}</td><td><span class="badge ${x.severity}">${x.severity}</span></td><td>${esc(x.service||x.source)}</td><td class="st ${x.status}">${x.status}</td><td>${fmtT(x.started_at)}</td><td>${fmtT(x.last_seen_at)}</td><td>${x.occurrence_count||1}</td><td><button class="smallbtn" onclick="openIncident('${x.incident_id}')">Chi tiết</button></td></tr>`).join('')||'<tr><td colspan="8" class="muted">Không có sự cố.</td></tr>';feedback(`Đã cập nhật sự cố · ${items.length} mục.`)}
+incidentStatus.onchange=loadIncidents;
+function diagKindForIncident(incidentType){
+ incidentType=String(incidentType||'');
+ if(incidentType==='MESFLOW_DOWN')return 'mesflow_unavailable';
+ if(incidentType.startsWith('CONTAINER_UNHEALTHY:'))return 'container_unhealthy';
+ return 'container_stopped';
+}
+async function incidentRecoveryStart(serviceId,btn){
+ if(needsProductionConfirm()&&!confirm('Xác nhận khởi động dịch vụ trên PRODUCTION? Hành động này cần con người phê duyệt.'))return;
+ btn.disabled=true;const box=document.getElementById('incidentRecoveryResult');box.style.display='block';box.textContent='Đang khởi động…';
+ const body=needsProductionConfirm()?{confirm_production:true}:{};
+ const d=await api(`/api/ops/recovery/services/${serviceId}/start`,{method:'POST',body:JSON.stringify(body)});
+ box.textContent=recoveryStepMessage((d&&d.item)||{});
+ btn.disabled=false;
+ loadRecoveryServices();loadRecoveryAudit();
+}
+async function incidentRecoveryLogs(serviceId){
+ const box=document.getElementById('incidentRecoveryResult');box.style.display='block';box.textContent='Đang tải log…';
+ const d=await api(`/api/ops/recovery/services/${serviceId}/logs?lines=100`);
+ box.textContent=(d.stdout||'')+(d.stderr?'\n[stderr]\n'+d.stderr:'');
+}
+async function incidentRecoveryDiagnoseKind(kind,serviceId){
+ const box=document.getElementById('incidentRecoveryResult');box.style.display='block';box.textContent='Đang chẩn đoán…';
+ const d=await api(`/api/ops/recovery/diagnose/${kind}?service=${serviceId}`);
+ if(!d.ok){box.textContent='Không chẩn đoán được: '+(d.error||'unknown');return}
+ box.textContent=`SUMMARY: ${d.summary}\n\nEVIDENCE:\n${(d.evidence||[]).join('\n')}\n\nPROBABLE CAUSE:\n${d.probable_cause}\n\nRECOMMENDED ACTION:\n${d.recommended_action}`;
+}
+async function openIncident(id){const d=await api(`/api/incidents/${id}`);const x=d.item;if(!x)return;
+ const shell=document.createElement('div');shell.className='drawer-shell';
+ shell.innerHTML=`<button class="drawer-back"></button><aside class="drawer"><h2>${esc(x.summary||x.incident_type)}</h2><span class="badge ${x.severity}">${x.severity}</span> <span class="st ${x.status}">${x.status}</span>
+  <dl style="margin-top:14px">
+   <dt>Loại</dt><dd>${esc(x.incident_type)}</dd>
+   <dt>Fingerprint</dt><dd>${esc(x.fingerprint)}</dd>
+   <dt>Dịch vụ / Server</dt><dd>${esc(x.service||'')} / ${esc(x.server||'')}</dd>
+   <dt>Bắt đầu</dt><dd>${fmtT(x.started_at)}</dd>
+   <dt>Lần cuối thấy</dt><dd>${fmtT(x.last_seen_at)}</dd>
+   <dt>Đã khắc phục lúc</dt><dd>${fmtT(x.resolved_at)}</dd>
+   <dt>Số lần xảy ra</dt><dd>${x.occurrence_count||1}</dd>
+   <dt>Lý do kỹ thuật</dt><dd>${esc(x.technical_reason||'')}</dd>
+   <dt>Đã xác nhận bởi</dt><dd>${esc(x.acknowledged_by||'—')}</dd>
+   <dt>Lý do resolve</dt><dd>${esc(x.resolution_reason||'—')}</dd>
+  </dl>
+  <h3 style="margin-top:16px">Bằng chứng (evidence)</h3><pre>${esc(JSON.stringify(x.evidence||{},null,2))}</pre>
+  <section class="ai-section"><h3>Khôi phục</h3>${x.recovery?`
+   <p>${esc(x.recovery.recommendation_text)}</p>
+   <div class="toolbar">${x.recovery.actions.map(a=>{
+     if(a.type==='start')return `<button class="primary" onclick="incidentRecoveryStart('${x.recovery.service_id}',this)">${esc(a.label)}</button>`;
+     if(a.type==='logs')return `<button onclick="incidentRecoveryLogs('${x.recovery.service_id}')">${esc(a.label)}</button>`;
+     if(a.type==='diagnose')return `<button onclick="incidentRecoveryDiagnoseKind('${diagKindForIncident(x.incident_type)}','${x.recovery.service_id}')">${esc(a.label)}</button>`;
+     return '';
+   }).join('')}</div>
+   <pre id="incidentRecoveryResult" style="display:none"></pre>`
+   :'<span class="muted">Không có hành động khôi phục cho loại sự cố này.</span>'}</section>
+  <section class="ai-section"><h3>Notifications</h3><div id="incidentNotify">Đang tải lịch sử thông báo…</div></section>
+  <section class="ai-section"><h3>AI Analysis</h3><div id="incidentAI">Đang tải phân tích độc lập…</div></section>
+  <div class="toolbar" style="margin-top:14px">
+   ${x.status==='ACTIVE'?'<button class="primary" id="ackBtn">Xác nhận (Acknowledge)</button>':''}
+   ${x.status!=='RESOLVED'?'<button id="resolveBtn">Đánh dấu đã xử lý</button>':''}
+   <button onclick="this.closest('.drawer-shell').remove()">Đóng</button>
+  </div>
+ </aside>`;
+ document.body.appendChild(shell);
+ shell.querySelector('.drawer-back').onclick=()=>shell.remove();
+ (async()=>{
+  const nbox=shell.querySelector('#incidentNotify');
+  try{
+   const nd=await api(`/api/incidents/${id}/notifications`);const items=nd.items||[];
+   if(!items.length){nbox.innerHTML='<span class="muted">Chưa có thông báo nào được gửi cho sự cố này.</span>';return}
+   const open=items.filter(v=>v.notification_type==='OPEN'),recovery=items.filter(v=>v.notification_type==='RECOVERY');
+   const rowsHtml=list=>list.map(v=>`<div class="notify-row"><b>${esc(v.channel)}</b><span class="st ${v.status}">${esc(v.status)}</span><small>${fmtT(v.sent_at||v.attempted_at)}${v.error?` · ${esc(v.error)}`:''}</small></div>`).join('');
+   nbox.innerHTML=`<div class="notify-group"><h4>OPEN</h4>${rowsHtml(open)||'<span class="muted">—</span>'}</div>${recovery.length?`<div class="notify-group"><h4>RECOVERY</h4>${rowsHtml(recovery)}</div>`:''}`;
+  }catch(e){nbox.innerHTML=`<span class="muted">Không tải được lịch sử thông báo: ${esc(e.message||e)}</span>`}
+ })();
+ const ai=await api(`/api/incidents/${id}/ai-analysis`);const box=shell.querySelector('#incidentAI');const analysis=ai.analysis||{};if(analysis.status==='SUCCESS'){const r=analysis.result||{};box.innerHTML=`<p><b>Summary</b><br>${esc(r.summary)}</p><div class="ai-evidence"><b>Observed evidence</b>${(r.evidence||[]).map(v=>`<span>${esc(typeof v==='string'?v:JSON.stringify(v))}</span>`).join('')||'<span class="muted">Không có evidence từ AI.</span>'}</div><p><b>Possible causes</b><br>${(r.likely_causes||[]).map(esc).join('<br>')||'Unknown'}</p><p><b>Uncertainty</b><br>${(r.uncertainties||[]).map(esc).join('<br>')||'Không nêu'}</p>${(r.suggested_checks||[]).map(v=>`<div class="suggestion ${esc(v.risk)}"><b>${esc(v.action)}</b><small>${esc(v.risk)} · ${esc(v.reason)}</small></div>`).join('')}`}else box.innerHTML=`<span class="muted">${esc(analysis.status||'UNAVAILABLE')} — deterministic evidence vẫn hoạt động bình thường.</span>`;
+ shell.querySelector('#ackBtn')?.addEventListener('click',async()=>{await api(`/api/incidents/${id}/acknowledge`,{method:'POST'});shell.remove();loadIncidents();loadAlerts()});
+ shell.querySelector('#resolveBtn')?.addEventListener('click',async()=>{const reason=prompt('Lý do xử lý (tuỳ chọn):')||'';await api(`/api/incidents/${id}/resolve`,{method:'POST',body:JSON.stringify({reason})});shell.remove();loadIncidents();loadAlerts()});
+}
+loadSummary();setInterval(loadSummary,15000);loadPredictions();loadSuggestions();setInterval(()=>{loadPredictions();loadSuggestions()},60000);loadAlerts();setInterval(loadAlerts,30000);
+
+// -- P4 Backup / DB / Storage Center ---------------------------------
+const PRESSURE_LABEL={OK:'Bình thường',WARNING:'Cảnh báo',CRITICAL:'Nghiêm trọng'};
+function verifBadge(s){return `<span class="badge ${s==='VERIFIED'?'LOW':s==='VERIFY_FAILED'?'CRITICAL':'MEDIUM'}">${esc(s)}</span>`}
+function statusBadge(s){return `<span class="badge ${s==='SUCCESS'?'LOW':s==='FAILED'?'CRITICAL':'MEDIUM'}">${esc(s)}</span>`}
+function pressureBadge(level){return `<span class="badge ${level==='CRITICAL'?'CRITICAL':level==='WARNING'?'MEDIUM':'LOW'}">${esc(PRESSURE_LABEL[level]||level)}</span>`}
+
+async function loadBackupCenter(){
+ feedback('Đang tải Backup / DB / Storage…','loading');
+ await Promise.all([loadPgSummary(),loadStorage(),loadDbBackups(),loadRestoreDrills(),loadDbAudit()]);
+ retentionRows.innerHTML='';retentionSummary.textContent='';applyRetentionBtn.disabled=true;
+ feedback('Đã cập nhật Backup / DB / Storage.');
+}
+
+async function loadPgSummary(){
+ const d=await api('/api/ops/db/summary');
+ if(!d.ok||!d.available){pgSummary.innerHTML=`<span class="muted">Không kết nối được PostgreSQL: ${esc(d.error||'unknown')}</span>`;pgTableRows.innerHTML='<tr><td colspan="2" class="muted">Không có dữ liệu (PostgreSQL chưa kết nối).</td></tr>';return}
+ const c=d.connections||{};
+ pgSummary.innerHTML=`<div class="grid" style="grid-template-columns:repeat(4,1fr);gap:8px">
+  <div><div class="label">Kích thước DB</div><div class="value">${esc(d.database_size_human)}</div></div>
+  <div><div class="label">Kết nối</div><div class="value">${c.active??'—'}/${c.total??'—'} <span class="muted">(max ${c.max??'—'})</span></div></div>
+  <div><div class="label">Truy vấn chậm</div><div class="value">${(d.long_running_queries||[]).length}</div></div>
+  <div><div class="label">Lock đang chờ</div><div class="value">${d.blocked_lock_count??'—'}</div></div>
+  </div><p class="muted">Migration revision: <b>${esc(d.db_revision||'—')}</b></p>
+  ${(d.long_running_queries||[]).length?`<div class="tablewrap"><table><thead><tr><th>PID</th><th>Thời gian</th><th>Trạng thái</th><th>Query</th></tr></thead><tbody>${d.long_running_queries.map(q=>`<tr><td>${q.pid}</td><td>${q.duration_seconds}s</td><td>${esc(q.state)}</td><td><code>${esc(q.query)}</code></td></tr>`).join('')}</tbody></table></div>`:''}`;
+ pgTableRows.innerHTML=(d.largest_tables||[]).map(t=>`<tr><td>${esc(t.table)}</td><td>${esc(t.size_human)}</td></tr>`).join('')||'<tr><td colspan="2" class="muted">Không có dữ liệu.</td></tr>';
+}
+
+async function loadStorage(){
+ const d=await api('/api/ops/storage');
+ if(!d.ok){storageSummary.innerHTML=`<span class="muted">Không tải được storage.</span>`;return}
+ const fs=d.filesystem||{};
+ storageSummary.innerHTML=`<div class="value">${esc(fs.used)} / ${esc(fs.total)} (${esc(fs.percent)}%) ${pressureBadge(fs.pressure_level)}</div><div class="muted">Còn trống: ${esc(fs.free)}</div>`;
+ const cats=d.categories||{};
+ storageCategoryRows.innerHTML=Object.entries(cats).map(([name,v])=>`<tr><td>${esc(name)}</td><td>${v.exists?esc(v.human):'<span class="muted">không có</span>'}</td></tr>`).join('')||'<tr><td colspan="2" class="muted">—</td></tr>';
+}
+
+async function loadDbBackups(){
+ const d=await api('/api/ops/db-backups');
+ const items=d.items||[];
+ dbBackupRows.innerHTML=items.map(b=>`<tr>
+  <td><code>${esc(b.backup_id.slice(0,8))}</code></td>
+  <td>${fmtT(b.created_at)}</td>
+  <td>${statusBadge(b.status)}</td>
+  <td>${verifBadge(b.verification_status)}</td>
+  <td>${b.restore_tested?'<span class="badge LOW">RESTORE_TESTED</span>':'<span class="muted">chưa</span>'}</td>
+  <td>${esc(b.size_bytes?bytes(b.size_bytes):'—')}</td>
+  <td>${b.pinned?'📌':''}</td>
+  <td>
+   <button class="smallbtn" onclick="verifyDbBackup('${b.backup_id}')" ${b.status!=='SUCCESS'?'disabled':''}>Verify</button>
+   <button class="smallbtn" onclick="togglePinDbBackup('${b.backup_id}',${b.pinned?'true':'false'})">${b.pinned?'Unpin':'Pin'}</button>
+   <button class="smallbtn" onclick="restoreTestDbBackup('${b.backup_id}')" ${b.verification_status!=='VERIFIED'?'disabled':''}>Restore test</button>
+  </td></tr>`).join('')||'<tr><td colspan="8" class="muted">Chưa có backup nào. Bấm "Tạo backup thủ công" để bắt đầu.</td></tr>';
+}
+
+async function createDbBackup(){
+ backupBusy.textContent='Đang tạo backup…';
+ const reason=prompt('Lý do tạo backup (tuỳ chọn):')||'';
+ const d=await api('/api/ops/db-backups',{method:'POST',body:JSON.stringify({retention_class:'manual',reason})});
+ backupBusy.textContent='';
+ if(!d.ok){alert('Backup thất bại: '+(d.item?.error||d.detail||d.error||'unknown'));}
+ await loadDbBackups();await loadStorage();await loadDbAudit();
+ feedback(d.ok?'Backup thành công và đã xác minh.':'Backup thất bại — xem chi tiết.');
+}
+
+async function verifyDbBackup(id){
+ const d=await api(`/api/ops/db-backups/${id}/verify`,{method:'POST'});
+ await loadDbBackups();await loadDbAudit();
+ feedback(d.ok?'Verify: VERIFIED.':'Verify: VERIFY_FAILED.');
+}
+
+async function togglePinDbBackup(id,pinned){
+ await api(`/api/ops/db-backups/${id}/${pinned?'unpin':'pin'}`,{method:'POST'});
+ await loadDbBackups();
+}
+
+async function restoreTestDbBackup(id){
+ if(!confirm('Chạy restore drill vào database tạm (LOCAL/TEST only)? Database tạm sẽ tự động bị xoá sau khi kiểm tra xong.'))return;
+ feedback('Đang chạy restore drill…','loading');
+ const d=await api(`/api/ops/db-backups/${id}/restore-test`,{method:'POST',body:JSON.stringify({confirm:true})});
+ if(!d.ok){alert('Restore drill từ chối/thất bại: '+(d.detail||d.item?.error||d.error||'unknown'))}
+ await loadDbBackups();await loadRestoreDrills();await loadDbAudit();
+ feedback(d.ok?'Restore drill: SUCCESS.':'Restore drill: FAILED.');
+}
+
+async function previewRetention(){
+ const d=await api('/api/ops/storage/retention/preview');
+ if(!d.ok){retentionSummary.textContent='Không tải được retention preview.';return}
+ retentionRows.innerHTML=(d.eligible||[]).map(r=>`<tr><td><code>${esc(r.backup_id.slice(0,8))}</code></td><td>${esc(r.reason)}</td><td>${esc(bytes(r.size_bytes))}</td></tr>`).join('')||'<tr><td colspan="3" class="muted">Không có backup nào đủ điều kiện xoá.</td></tr>';
+ retentionSummary.textContent=`${d.eligible_count} backup đủ điều kiện · có thể giải phóng ${esc(d.eligible_bytes_human)} · ${(d.protected||[]).length} backup được bảo vệ.`;
+ applyRetentionBtn.disabled=d.eligible_count===0;
+}
+
+async function applyRetention(){
+ if(!confirm('Xoá vĩnh viễn các backup đủ điều kiện theo chính sách retention? Hành động này không thể hoàn tác.'))return;
+ const reason=prompt('Lý do áp dụng retention (tuỳ chọn):')||'';
+ const d=await api('/api/ops/storage/retention/apply',{method:'POST',body:JSON.stringify({confirm:true,reason})});
+ alert(d.ok?`Đã xoá ${d.deleted_count} backup, giải phóng ${d.reclaimed_bytes_human}.`:'Retention thất bại: '+(d.detail||d.error||'unknown'));
+ await loadDbBackups();await loadStorage();await loadDbAudit();
+ retentionRows.innerHTML='';retentionSummary.textContent='';applyRetentionBtn.disabled=true;
+}
+
+async function loadRestoreDrills(){
+ const d=await api('/api/ops/restore-drills');
+ const items=d.items||[];
+ restoreDrillRows.innerHTML=items.map(r=>`<tr><td><code>${esc(r.drill_id.slice(0,8))}</code></td><td><code>${esc(r.backup_id.slice(0,8))}</code></td><td>${fmtT(r.started_at)}</td><td>${statusBadge(r.status)}</td><td>${r.validation?.passed?'✓ OK':(r.validation?.reason?esc(r.validation.reason):'—')}</td><td>${r.cleanup_ok?'✓':'✗'}</td></tr>`).join('')||'<tr><td colspan="6" class="muted">Chưa có restore drill nào.</td></tr>';
+}
+
+async function loadDbAudit(){
+ const d=await api('/api/ops/db-audit');
+ const items=(d.items||[]).slice(0,50);
+ dbAuditRows.innerHTML=items.map(e=>{const {action,at,...rest}=e;return `<tr><td>${fmtT(at)}</td><td><code>${esc(action)}</code></td><td class="muted">${esc(Object.entries(rest).map(([k,v])=>`${k}=${v}`).join(', '))}</td></tr>`}).join('')||'<tr><td colspan="3" class="muted">Chưa có hoạt động nào.</td></tr>';
+}
+
+// -- P5 Multi-server: Servers / Fleet ---------------------------------
+const REG_LABEL={PENDING:'PENDING',ACTIVE:'ACTIVE',DISABLED:'DISABLED',UNREACHABLE:'UNREACHABLE',REVOKED:'REVOKED'};
+function regBadge(s){return `<span class="badge ${s==='ACTIVE'?'LOW':s==='PENDING'?'MEDIUM':'CRITICAL'}">${esc(REG_LABEL[s]||s)}</span>`}
+function healthBadge(s){return `<span class="badge ${s==='ONLINE'?'LOW':s==='DEGRADED'?'MEDIUM':s==='OFFLINE'?'CRITICAL':'MEDIUM'}">${esc(s||'UNKNOWN')}</span>`}
+function envBadge(e){return `<span class="badge ${e==='PRODUCTION'?'CRITICAL':e==='TEST'?'MEDIUM':'LOW'}">${esc(e||'—')}</span>`}
+
+async function loadFleet(){
+ feedback('Đang tải Fleet…','loading');
+ const d=await api('/api/servers');
+ if(!d.ok){feedback('Không tải được danh sách server.');return}
+ const s=d.summary||{};
+ fsTotal.textContent=s.total??'--';fsOnline.textContent=s.online??'--';fsDegraded.textContent=s.degraded??'--';
+ fsOffline.textContent=s.offline??'--';fsProduction.textContent=s.production??'--';
+ const fleet=await api('/api/fleet/summary');
+ fsIncidents.textContent=fleet.ok?fleet.counts.active_incidents:'--';
+ const fic=(fleet.ok?fleet.active_incidents:[])||[];
+ fleetIncidentRows.innerHTML=fic.length?fic.map(x=>`<div class="incrow-flat ${x.severity}"><span class="badge ${x.severity}">${esc(x.severity)}</span><b>${esc(x.server_name||x.server_id)}</b>${envBadge(x.environment)}<span class="incrow-flat-text">${esc(x.summary||x.incident_type)}</span></div>`).join(''):'<div class="muted">Không có sự cố đang mở trên toàn Fleet.</div>';
+ serverRows.innerHTML=(d.items||[]).map(x=>`<tr>
+  <td><a href="#" onclick="openServer('${x.server_id}');return false">${esc(x.name)}</a>${x.server_id==='local'?' <span class="muted">(local)</span>':''}</td>
+  <td>${envBadge(x.environment)}</td>
+  <td>${regBadge(x.registration_status)}</td>
+  <td>${healthBadge(x.health_status)}</td>
+  <td>${esc(x.agent_version||'—')}</td>
+  <td class="muted">${esc((x.roles||[]).join(', '))}</td>
+  <td>
+   <button class="smallbtn" onclick="testConnection('${x.server_id}')">Test connection</button>
+   ${x.server_id!=='local'?(x.enabled?`<button class="smallbtn" onclick="disableServer('${x.server_id}')">Disable</button>`:`<button class="smallbtn" onclick="enableServer('${x.server_id}')">Enable</button>`):''}
+  </td></tr>`).join('')||'<tr><td colspan="7" class="muted">Chưa có server nào.</td></tr>';
+ feedback('Đã cập nhật Fleet.');
+}
+
+async function registerServer(){
+ const name=newSrvName.value.trim();if(!name){alert('Nhập tên server');return}
+ const environment=newSrvEnv.value;
+ const roles=newSrvRoles.value.split(',').map(s=>s.trim()).filter(Boolean);
+ const agent_url=newSrvUrl.value.trim();const agent_user=newSrvUser.value.trim()||'admin';const agent_password=newSrvPassword.value;
+ const production_confirmed=newSrvProdConfirm.checked;
+ if(environment==='PRODUCTION'&&!production_confirmed){alert('Bạn đang đăng ký server này là PRODUCTION. Vui lòng tích "Xác nhận đây là server PRODUCTION" -- chính sách an toàn Production sẽ được áp dụng.');return}
+ registerBusy.textContent='Đang đăng ký…';
+ const d=await api('/api/servers',{method:'POST',body:JSON.stringify({name,environment,roles,agent_url,agent_user,agent_password,production_confirmed})});
+ registerBusy.textContent='';
+ if(!d.ok){alert('Đăng ký thất bại: '+(d.detail||d.error||'unknown'));return}
+ newSrvName.value='';newSrvUrl.value='';newSrvPassword.value='';newSrvRoles.value='';newSrvProdConfirm.checked=false;
+ await loadFleet();
+ feedback('Đã đăng ký server (PENDING) -- bấm "Test connection" để kích hoạt.');
+}
+
+async function testConnection(id){
+ feedback('Đang kiểm tra kết nối…','loading');
+ const d=await api(`/api/servers/${id}/test-connection`,{method:'POST'});
+ if(!d.ok){alert('Kết nối thất bại: '+(d.detail||d.error||'unknown'))}
+ await loadFleet();
+ feedback(d.ok?'Kết nối thành công, server ACTIVE.':'Kết nối thất bại.');
+}
+
+async function disableServer(id){
+ if(!confirm('Disable server này? Lịch sử (deployments/backups/incidents) vẫn được giữ nguyên.'))return;
+ await api(`/api/servers/${id}/disable`,{method:'POST'});
+ await loadFleet();
+}
+async function enableServer(id){
+ await api(`/api/servers/${id}/enable`,{method:'POST'});
+ await loadFleet();
+}
+
+async function openServer(id){
+ const shell=document.createElement('div');shell.className='drawer-shell';document.body.appendChild(shell);
+ const rec=(await api(`/api/servers/${id}`)).item||{};
+ shell.innerHTML=`<button class="drawer-back"></button><aside class="drawer"><h2>${esc(rec.name)}</h2>${envBadge(rec.environment)} ${regBadge(rec.registration_status)} ${healthBadge(rec.health_status)}
+  <p class="muted">Agent: ${esc(rec.agent_version||'—')} · Roles: ${esc((rec.roles||[]).join(', ')||'—')} · Last seen: ${fmtT(rec.last_seen)}</p>
+  <div id="srvHealth"><b>Health</b><div class="muted">Đang tải…</div></div>
+  <div id="srvStorage" style="margin-top:10px"><b>Storage</b><div class="muted">Đang tải…</div></div>
+  <div id="srvBackups" style="margin-top:10px"><b>Backups</b><div class="muted">Đang tải…</div></div>
+  <div id="srvIncidents" style="margin-top:10px"><b>Incidents</b><div class="muted">Đang tải…</div></div>
+  </aside>`;
+ shell.querySelector('.drawer-back').addEventListener('click',()=>shell.remove());
+
+ (async()=>{try{const h=await api(`/api/servers/${id}/health`);const detail=(h.item||{}).health_detail||{};
+   shell.querySelector('#srvHealth').innerHTML=`<b>Health</b><pre class="terminal" style="max-height:160px">${esc(JSON.stringify(detail,null,1)).slice(0,2000)}</pre>`;
+ }catch(e){}})();
+ (async()=>{try{const s=await api(`/api/servers/${id}/storage`);
+   shell.querySelector('#srvStorage').innerHTML=s.ok?`<b>Storage</b><div class="muted">${esc(s.filesystem?.used||'—')} / ${esc(s.filesystem?.total||'—')} (${esc(s.filesystem?.percent??'—')}%)</div>`:`<b>Storage</b><span class="muted">Không khả dụng: ${esc(s.detail||s.error||'')}</span>`;
+ }catch(e){}})();
+ (async()=>{try{const b=await api(`/api/servers/${id}/backups`);const items=(b.items||[]).slice(0,5);
+   shell.querySelector('#srvBackups').innerHTML=`<b>Backups</b>`+(items.length?`<div class="tablewrap"><table><thead><tr><th>Backup</th><th>Trạng thái</th><th>Xác minh</th></tr></thead><tbody>${items.map(x=>`<tr><td><code>${esc((x.backup_id||'').slice(0,8))}</code></td><td>${statusBadge(x.status)}</td><td>${verifBadge(x.verification_status)}</td></tr>`).join('')}</tbody></table></div>`:'<div class="muted">Chưa có backup.</div>');
+ }catch(e){}})();
+ (async()=>{try{const inc=await api(`/api/servers/${id}/incidents`);const items=(inc.items||[]).filter(x=>['ACTIVE','ACKNOWLEDGED'].includes(x.status)).slice(0,5);
+   shell.querySelector('#srvIncidents').innerHTML=`<b>Incidents</b>`+(items.length?items.map(x=>`<div class="incrow-flat ${x.severity}"><span class="badge ${x.severity}">${x.severity}</span><span class="incrow-flat-text">${esc(x.summary||x.incident_type)}</span></div>`).join(''):'<div class="muted">Không có sự cố đang mở.</div>');
+ }catch(e){}})();
+}
 </script></body></html>

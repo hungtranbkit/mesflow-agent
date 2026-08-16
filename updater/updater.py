@@ -15,14 +15,36 @@ Endpoints:
   GET  /updater/health              no auth; liveness only
   GET  /updater/status              auth required; current Agent image/version/role
   POST /updater/update              auth required; body = the AGENT_UPDATE_<version>.zip
-                                     bytes (Content-Type: application/zip)
+                                     bytes (Content-Type: application/zip); optional
+                                     header X-MESFlow-Allow-Downgrade: 1 to override the
+                                     downgrade guard (see do_update below)
 
 Normal operation needs no SSH: DEV pushes the update artifact to this
 service over HTTP with a bearer token. SSH remains available separately
 for first bootstrap / offline recovery / diagnostics / emergency rollback.
+
+Consolidation note (see reports/BOOTSTRAP_AGENT_UPDATER_CONSOLIDATION.md):
+`bootstrap/` (port 8098) now owns Deploy Agent lifecycle (install/update/
+rollback/restart/status) for a human operator, and vendors a copy of this
+exact file (unmodified) to reuse its tested artifact-verification/
+update/rollback logic instead of re-implementing it. This service keeps
+running as the machine-to-machine DEV -> target push-update receiver
+during the migration; it is retired only after Bootstrap parity is proven
+on real hosts (see the report's MIGRATION GATE section) -- do not remove it
+before then.
+
+do_update() below acquires an exclusive, non-blocking file lock
+(STATE_DIR/update.lock) for its full duration -- a concurrent call is
+rejected immediately with AGENT_UPDATE_ALREADY_RUNNING rather than racing
+the first one's compose/.env writes -- and rejects a downgrade (new
+version older than the currently recorded AGENT_IMAGE tag) unless the
+caller explicitly opts in. Neither existed before this consolidation; both
+are additive/backward-compatible (absent header = old behavior's safe
+default, not a new failure mode for existing callers that only ever push
+newer versions).
 """
 from __future__ import annotations
-import hashlib, hmac, http.server, json, os, shutil, subprocess, sys, tempfile, time, zipfile
+import fcntl, hashlib, hmac, http.server, json, os, re, shutil, subprocess, sys, tempfile, time, zipfile
 from pathlib import Path
 
 UPDATER_HOME = Path(__file__).resolve().parent
@@ -32,7 +54,7 @@ BIND = os.environ.get("MESFLOW_AGENT_UPDATER_HOST", "127.0.0.1")
 STATE_DIR = UPDATER_HOME / "state"
 STATE_DIR.mkdir(parents=True, exist_ok=True)
 LOG_FILE = STATE_DIR / "updater.log"
-UPDATER_VERSION = "1.0.0"
+UPDATER_VERSION = "1.1.0"  # 1.1.0: added downgrade protection + update lock (see module docstring)
 HEALTH_POLL_TIMEOUT = int(os.environ.get("MESFLOW_AGENT_UPDATE_HEALTH_TIMEOUT", "60"))
 # Target layout is normally a single compose.yml + .env under TARGET_DIR
 # (application code lives only in the image). During the transition off
@@ -166,11 +188,53 @@ def extract_and_verify_artifact(zip_bytes: bytes, workdir: Path):
     return manifest, bundle
 
 
-def do_update(zip_bytes: bytes) -> dict:
+def _norm_version(v: str) -> str:
+    return v[: -len("-docker-runtime")] if v.endswith("-docker-runtime") else v
+
+
+def version_key(v: str) -> tuple:
+    nums = re.findall(r"\d+", _norm_version(v))
+    return tuple(int(x) for x in nums) or (0,)
+
+
+def _installed_version_hint(image_ref: str) -> str | None:
+    """Best-effort version read from the currently recorded AGENT_IMAGE tag
+    (e.g. "mesflow-deploy-agent:2.23.15" -> "2.23.15"). Zero extra I/O (no
+    subprocess/network call) -- deliberately, so this can run unconditionally
+    inside do_update() without disturbing the health-poll call sequence
+    tests/callers already depend on. Returns None when AGENT_IMAGE is empty
+    or is a raw image id (e.g. right after a rollback that restored by id,
+    not tag) -- in that case the downgrade check is skipped rather than
+    guessing, since blocking a legitimate recovery would be worse."""
+    if not image_ref or image_ref.startswith("sha256:") or ":" not in image_ref:
+        return None
+    return image_ref.rsplit(":", 1)[1]
+
+
+def do_update(zip_bytes: bytes, allow_downgrade: bool = False) -> dict:
     # SERVER_ROLE/MESFLOW_BUILD_ENABLED are never touched by this updater --
     # only AGENT_IMAGE changes in .env, so role/build-enabled are preserved
     # by construction. "Role compatibility" is enforced by verifying the
     # freshly-updated Agent still reports the SAME role it had before.
+    #
+    # Held for the whole call (not just a point-in-time check) so a second
+    # concurrent /updater/update request is rejected outright instead of
+    # racing this one's docker load/.env writes/compose up.
+    lock_path = STATE_DIR / "update.lock"
+    lock_fd = open(lock_path, "w")
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        lock_fd.close()
+        raise ValueError("AGENT_UPDATE_ALREADY_RUNNING")
+    try:
+        return _do_update_locked(zip_bytes, allow_downgrade)
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        lock_fd.close()
+
+
+def _do_update_locked(zip_bytes: bytes, allow_downgrade: bool) -> dict:
     prev_image_ref = current_image_ref()
     prev_role = compose_env().get("SERVER_ROLE", "")
     with tempfile.TemporaryDirectory() as tmp:
@@ -180,6 +244,11 @@ def do_update(zip_bytes: bytes) -> dict:
         expected_image_id = str(manifest.get("image_id") or "")
         if not new_version or not expected_image_id.startswith("sha256:"):
             raise ValueError("agent-release.json missing version or a valid image_id")
+
+        installed_hint = _installed_version_hint(prev_image_ref)
+        if installed_hint and not allow_downgrade and version_key(new_version) < version_key(installed_hint):
+            raise ValueError(f"DOWNGRADE_REJECTED: installed={installed_hint} uploaded={new_version} "
+                              f"(pass X-MESFlow-Allow-Downgrade: 1 to override explicitly)")
 
         log(f"UPDATE START from={prev_image_ref or 'unknown'} to={new_version}")
         load_r = run(["docker", "load", "-i", str(bundle)], timeout=300)
@@ -284,8 +353,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._json(400, {"ok": False, "error": "INVALID_CONTENT_LENGTH"})
             return
         body = self.rfile.read(length)
+        allow_downgrade = self.headers.get("X-MESFlow-Allow-Downgrade", "").strip().lower() in {"1", "true", "yes"}
         try:
-            result = do_update(body)
+            result = do_update(body, allow_downgrade=allow_downgrade)
         except Exception as ex:
             log(f"UPDATE FAILED before mutation (safe to retry): {type(ex).__name__}: {ex}")
             self._json(409, {"ok": False, "error": f"{type(ex).__name__}: {ex}"})
