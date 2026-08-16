@@ -1,6 +1,6 @@
 FROM python:3.13-alpine3.22
 
-ARG AGENT_VERSION=2.24.6-docker-runtime
+ARG AGENT_VERSION=2.24.7-docker-runtime
 LABEL org.opencontainers.image.title="MESFlow Deploy Agent" \
       org.opencontainers.image.version="$AGENT_VERSION"
 

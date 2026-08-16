@@ -1,1 +1,1 @@
-2.24.6-docker-runtime
+2.24.7-docker-runtime
