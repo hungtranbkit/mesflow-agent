@@ -3,7 +3,7 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile
-    image: mesflow-deploy-agent:2.24.7
+    image: mesflow-deploy-agent:2.24.8
     container_name: mesflow-deploy-agent
     restart: unless-stopped
     ports:

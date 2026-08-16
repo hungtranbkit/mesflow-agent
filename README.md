@@ -1,6 +1,6 @@
 # MESFlow Deploy Agent
 
-Current version: **2.24.7-docker-runtime**
+Current version: **2.24.8-docker-runtime**
 
 The Agent manages MESFlow release upload, validation, dry-run, application deployment/rollback, health diagnostics, QA integration and server operations. Phase 2B keeps the production nginx gateway independent from application deployment.
 
