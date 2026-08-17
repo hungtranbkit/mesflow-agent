@@ -404,7 +404,21 @@ async function loadSuggestions(){const d=await api('/api/ops/predictions');const
 async function loadServices(){feedback('Đang tải danh sách services…','loading');let d=await api('{{url_for("api_ops_services")}}');services=d.items||[];renderServices();feedback(d.ok===false?(d.error||'Không tải được services'):`Đã tải ${services.length} service.`,d.ok===false?'error':'ready')}
 function renderServices(){let q=serviceFilter.value.toLowerCase();serviceRows.innerHTML=services.filter(x=>(x.unit+' '+x.description).toLowerCase().includes(q)).map(x=>`<tr><td><b>${esc(x.unit)}</b></td><td>${serviceStatusDot(x.active)}</td><td>${esc(x.sub)}</td><td>${esc(x.description)}</td><td><details><summary>Thao tác nâng cao</summary><button class="smallbtn" onclick="serviceAction('${esc(x.unit)}','restart')">Restart</button> <button class="smallbtn danger" onclick="serviceAction('${esc(x.unit)}','stop')">Stop</button> <button class="smallbtn" onclick="serviceAction('${esc(x.unit)}','start')">Start</button></details></td></tr>`).join('')}
 serviceFilter.oninput=renderServices; async function serviceAction(unit,action){if((action==='stop'||action==='restart')&&!confirm(`${action} ${unit}?`))return;let d=await api('{{url_for("api_ops_service_action")}}',{method:'POST',body:JSON.stringify({unit,action})});alert(d.ok?'OK':(d.stderr||d.error||'Failed'));loadServices();loadSummary()}
-async function loadDocker(){feedback('Đang tải container Docker…','loading');let d=await api('{{url_for("api_ops_docker")}}');dockers=d.items||[];renderDocker();feedback(d.ok===false?(d.error||'Không tải được Docker'):`Đã tải ${dockers.length} container.`,d.ok===false?'error':'ready')}
+// dockers is the authoritative fetched collection; a click, an advanced
+// action, or a transient auth/network failure must never wipe it -- only
+// a CONFIRMED successful refresh (d.ok!==false) may replace it. Before
+// this fix, dockers=d.items||[] ran unconditionally, so any soft failure
+// (e.g. {"ok":false,"error":"AUTH_REQUIRED"} from an expired/invalid
+// session -- the exact shape /api/ops/docker returns with no "items" key
+// once the session cookie is no longer valid, reproduced directly via
+// curl) set dockers=[] and rendered an empty table, even though nothing
+// about the real Docker state had changed. dockerAction() (Restart/Stop/
+// Start, the action reachable by clicking a row's "Thao tác nâng cao")
+// calls this same function afterward, so the same expired-session request
+// wiped the whole list right after a single row click -- the exact
+// symptom reported ("normal", long-lived browser tab: session can go
+// stale; a fresh incognito login: it can't, within a short test).
+async function loadDocker(){feedback('Đang tải container Docker…','loading');let d=await api('{{url_for("api_ops_docker")}}');if(d.ok===false){feedback(d.error||'Không tải được Docker (đã giữ nguyên danh sách hiện tại)','error');return}dockers=d.items||[];renderDocker();feedback(`Đã tải ${dockers.length} container.`,'ready')}
 function renderDocker(){let q=dockerFilter.value.toLowerCase();dockerRows.innerHTML=dockers.filter(x=>JSON.stringify(x).toLowerCase().includes(q)).map(x=>{let n=x.Names||x.Name||'';return `<tr><td><b>${esc(n)}</b></td><td>${imageRef(x.Image)}</td><td>${dockerStatusDot(x.Status)}</td><td>${esc(x.Ports)}</td><td><details><summary>Thao tác nâng cao</summary><button type="button" class="smallbtn" data-docker-name="${esc(n)}" data-docker-action="restart">Restart</button> <button type="button" class="smallbtn danger" data-docker-name="${esc(n)}" data-docker-action="stop">Stop</button> <button type="button" class="smallbtn" data-docker-name="${esc(n)}" data-docker-action="start">Start</button></details></td></tr>`}).join('')}
 dockerFilter.oninput=renderDocker;
 // Defensive hardening (reports/DOCKER_ADVANCED_ACTION_UI_BUG.md) -- live

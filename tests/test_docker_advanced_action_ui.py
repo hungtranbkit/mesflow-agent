@@ -1,5 +1,6 @@
 """Docker List Disappear UI Bug (reports/DOCKER_LIST_DISAPPEAR_UI_FIX.md,
-reports/DOCKER_ADVANCED_ACTION_UI_BUG.md).
+reports/DOCKER_ADVANCED_ACTION_UI_BUG.md,
+reports/DOCKER_NORMAL_PROFILE_LIST_DISAPPEAR_FIX.md).
 
 Real-browser regression for Operations -> Docker: clicking an ordinary row
 (anywhere in the row, not just the "Thao tác nâng cao" toggle) or the
@@ -15,6 +16,18 @@ criteria: row count and list visibility unchanged across a plain row
 click, opening/closing the advanced toggle, and switching to a second
 row's toggle -- zero page/console errors, no reload required, no
 duplicate DOM ids.
+
+A third round (DOCKER_NORMAL_PROFILE_LIST_DISAPPEAR_FIX.md) found what the
+first two missed: both prior rounds always tested with a continuously
+valid session. loadDocker() unconditionally ran `dockers = d.items || []`
+-- so ANY soft API failure (most concretely `/api/ops/docker` returning
+`{"ok":false,"error":"AUTH_REQUIRED"}`, exactly what it returns once the
+session cookie is no longer valid -- reproduced directly via curl with no
+cookie) wiped the whole list, even though nothing about the real Docker
+state had changed. dockerAction() (the function a Restart/Stop/Start click
+inside "Thao tác nâng cao" calls) always calls loadDocker() afterward, so
+one row-level click with a stale session was enough to blank the list --
+this is `test_stale_session_docker_refresh_preserves_the_list` below.
 
 Spawns a REAL second `agent.py` process (matches tests/test_p5_fleet_routes.py's
 convention -- Flask's test client can't be driven by a real browser) and
@@ -124,6 +137,69 @@ def test_docker_advanced_action_toggle_never_hides_the_list(tmp_path_factory, br
         assert navigations_seen == [], f"unexpected document navigation during toggling: {navigations_seen}"
         assert page_errors == [], f"page errors during Docker toggle: {page_errors}"
         assert console_errors == [], f"console errors during Docker toggle: {console_errors}"
+
+        page.close()
+    finally:
+        stop_agent(proc)
+
+
+def test_stale_session_docker_refresh_preserves_the_list(tmp_path_factory, browser):
+    """reports/DOCKER_NORMAL_PROFILE_LIST_DISAPPEAR_FIX.md -- the actual
+    root cause the first two rounds missed, because both always tested
+    with a continuously valid session. A long-lived "normal" browser tab
+    is exactly the case most likely to have its session cookie go stale
+    mid-visit (logout in another tab, cookie eviction, browser session
+    restore, an Agent restart that predates a persisted secret_key, etc.);
+    a fresh Incognito login essentially never hits this within a short
+    session -- matching the reported Normal-vs-Incognito split without
+    needing any caching/service-worker/localStorage mechanism at all.
+
+    Reproduces the exact failure directly: clears the session cookie
+    (simulating an expired/invalid session) with the Docker list already
+    showing real rows, then triggers the same loadDocker() a Restart/Stop/
+    Start click would trigger afterward. /api/ops/docker now genuinely
+    returns {"ok": false, "error": "AUTH_REQUIRED"} (no "items" key) --
+    confirmed live via curl during this investigation. Before the fix,
+    `dockers = d.items || []` ran unconditionally and wiped the list to
+    empty on exactly this response shape. After the fix, loadDocker()
+    only replaces `dockers` when d.ok !== false, so the previously
+    fetched rows must stay exactly as they were.
+    """
+    tmp_path = tmp_path_factory.mktemp("docker-ui-stale-session")
+    proc, base_url = spawn_agent(tmp_path, PORT + 1, server_role="DEV")
+    try:
+        page = browser.new_page(viewport={"width": 1920, "height": 1080})
+        page.goto(base_url + "/login", wait_until="domcontentloaded")
+        page.fill("input[name=username]", "admin")
+        page.fill("input[name=password]", ADMIN_PASSWORD)
+        with page.expect_navigation(wait_until="domcontentloaded"):
+            page.click("button")
+
+        page.goto(base_url + "/ops?view=docker", wait_until="domcontentloaded")
+        page.wait_for_timeout(1500)
+
+        rows = page.locator("#dockerRows tr")
+        row_count_before = rows.count()
+        assert row_count_before > 0, "expected at least one real Docker row on this host"
+
+        # Simulate an expired/invalid session WITHOUT navigating away, so
+        # the already-rendered list stays exactly as it was -- reproducing
+        # "the list was showing fine, then this one action broke it."
+        page.context.clear_cookies()
+
+        # Trigger the exact function a Restart/Stop/Start click calls
+        # afterward (loadDocker()) via the Docker section's own "Làm mới"
+        # button -- scoped to #docker specifically, since the page has
+        # several other sections with their own same-labeled buttons.
+        page.click("#docker .toolbar button:has-text('Làm mới')")
+        page.wait_for_timeout(800)
+
+        row_count_after = page.locator("#dockerRows tr").count()
+        assert row_count_after == row_count_before, (
+            f"Docker list was wiped by a stale-session refresh: "
+            f"{row_count_before} rows before, {row_count_after} after"
+        )
+        assert page.locator("#dockerRows").is_visible(), "Docker list hidden after a stale-session refresh"
 
         page.close()
     finally:
