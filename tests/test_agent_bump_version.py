@@ -16,6 +16,7 @@ from pathlib import Path
 import pytest
 
 REAL_SCRIPT = Path(__file__).resolve().parent.parent / "scripts" / "bump-version.sh"
+REAL_VERSION_DOCTOR = Path(__file__).resolve().parent.parent / "scripts" / "version-doctor.sh"
 FILES = {
     "VERSION.txt": "{v}",
     "agent.py": 'AGENT_VERSION="{v}"\nOTHER_LINE=1\n',
@@ -34,9 +35,10 @@ def _seed(root: Path, version: str) -> None:
     (root / "scripts").mkdir(parents=True, exist_ok=True)
     for rel, template in FILES.items():
         (root / rel).write_text(template.format(v=version, core=core))
-    script = root / "scripts" / "bump-version.sh"
-    script.write_bytes(REAL_SCRIPT.read_bytes())
-    script.chmod(0o755)
+    for source in (REAL_SCRIPT, REAL_VERSION_DOCTOR):
+        script = root / "scripts" / source.name
+        script.write_bytes(source.read_bytes())
+        script.chmod(0o755)
 
 
 def _run(root: Path, *args: str) -> subprocess.CompletedProcess:
@@ -47,6 +49,7 @@ def _run(root: Path, *args: str) -> subprocess.CompletedProcess:
 @pytest.fixture()
 def repo(tmp_path):
     assert REAL_SCRIPT.is_file(), f"real script missing: {REAL_SCRIPT}"
+    assert REAL_VERSION_DOCTOR.is_file(), f"real script missing: {REAL_VERSION_DOCTOR}"
     root = tmp_path / "deploy-agent"
     _seed(root, "1.0.0-docker-runtime")
     (tmp_path / "artifacts" / "deploy-agent" / "releases").mkdir(parents=True)

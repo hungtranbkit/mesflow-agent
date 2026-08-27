@@ -30,6 +30,40 @@
 </div>
 {% endif %}
 
+{# SYSTEM_ISSUE_EXPLAINABILITY_V2 #}
+{% if system_issues %}
+<div class="rel-card" style="border-color:#dc2626;background:#fff7f7">
+  <h3 style="margin-top:0">⚠ Hệ thống đang có lỗi</h3>
+  <p class="sub">Hiển thị nguyên nhân gần nhất và việc nên làm tiếp theo.</p>
+  {% for x in system_issues %}
+  <div style="padding:10px 0;border-top:1px solid #fecaca">
+    <div><b>{{x.component}}</b> · <span class="bad">{{x.code}}</span>{% if x.at %} · <span class="label">{{x.at}}</span>{% endif %}</div>
+    <div style="margin-top:4px">{{x.reason}}</div>
+    <div class="label" style="margin-top:4px"><b>Cần làm:</b> {{x.next_action}}</div>
+    <details style="margin-top:7px">
+      <summary style="cursor:pointer;font-weight:600">Xem chi tiết lỗi</summary>
+      <div style="margin-top:7px">
+        {% if x.log_path %}<div class="label"><b>Log file:</b> <code>{{x.log_path}}</code></div>{% endif %}
+        <pre style="white-space:pre-wrap;word-break:break-word;max-height:360px;overflow:auto;background:#111827;color:#f9fafb;padding:10px;border-radius:6px;margin-top:6px">{{x.detail}}</pre>
+        <button class="secondary btn issue-copy-btn" type="button" data-copy="{{x.detail|e}}">Copy lỗi</button>
+      </div>
+    </details>
+  </div>
+  {% endfor %}
+</div>
+<script>
+document.querySelectorAll('.issue-copy-btn').forEach(btn=>{
+  btn.addEventListener('click', async ()=>{
+    try{
+      await navigator.clipboard.writeText(btn.dataset.copy||'');
+      const old=btn.textContent; btn.textContent='Đã copy';
+      setTimeout(()=>btn.textContent=old,1200);
+    }catch(e){ alert('Không copy được: '+e); }
+  });
+});
+</script>
+{% endif %}
+
 {% if release_summary.contamination and release_summary.contamination.contaminated %}
 <div class="rel-card" style="background:#4a1010;color:#ffb4b4;border-color:#ff6b6b">⚠ CONTAMINATED: {{release_summary.contamination.reason}}</div>
 {% endif %}
@@ -148,6 +182,27 @@
     <span class="ops-badge {{'pass' if qlatest and qlatest.package_sha256 else ''}}">{% if qlatest and qlatest.package_sha256 %}Artifact VERIFIED{% else %}Chưa có artifact{% endif %}</span>
   </div>
   <div class="ops-pipeline" aria-label="QA release pipeline">{{pipestage('BUILD', qs.build)}}{{pipestage('LOCAL', qs.local)}}{{pipestage('TEST', qs.test)}}{{pipestage('PRODUCTION', qs.production)}}</div>
+  {# QA_PROMOTE_READINESS_UI_V1 #}
+  {% if qs.local == 'PASS' and qs.test != 'PASS' %}
+  <div id="qaPromoteReadiness" style="margin:12px 0;padding:12px;border:1px solid #fca5a5;border-radius:8px;background:#fff7ed">
+    <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+      <b>Điều kiện Promote to Test</b>
+      {% if qa_promote_preflight %}<span class="ops-badge {{'pass' if qa_promote_preflight.ready else 'blocked'}}">{{'READY' if qa_promote_preflight.ready else 'BLOCKED'}}</span>{% endif %}
+      <button id="qaPromotePreflightButton" class="secondary btn" type="button">Kiểm tra điều kiện Promote</button>
+      {% if qa_promote_preflight and qa_promote_preflight.checked_at %}<span class="label">Kiểm tra: {{qa_promote_preflight.checked_at}}</span>{% endif %}
+    </div>
+    {% if qa_promote_preflight %}
+      <div style="margin-top:8px">
+      {% for c in qa_promote_preflight.checks %}
+        <div style="padding:3px 0"><span class="{{'ok' if c.ok else 'bad'}}">{{'✓' if c.ok else '✗'}}</span> <b>{{c.label}}</b>{% if c.detail %} — {{c.detail}}{% endif %}{% if not c.ok and c.next_action %}<div class="label" style="margin-left:20px"><b>Cần làm:</b> {{c.next_action}}</div>{% endif %}</div>
+      {% endfor %}
+      </div>
+      {% if not qa_promote_preflight.ready %}<p class="bad" style="margin-bottom:0"><b>{{qa_promote_preflight.blocked_code}}</b>: {{qa_promote_preflight.blocked_reason}}<br><span class="label"><b>Bước tiếp theo:</b> {{qa_promote_preflight.next_action}}</span></p>{% endif %}
+    {% else %}
+      <p class="label" style="margin-bottom:0">LOCAL_PASS đã có. Bấm <b>Kiểm tra điều kiện Promote</b> để xác minh target, login, role, build policy và capability trước khi promote.</p>
+    {% endif %}
+  </div>
+  {% endif %}
   <div class="rel-next">
     <button id="{{qna.id}}" class="btn btn-primary" data-stage="{{qna.stage}}" {% if not qna.enabled %}disabled{% endif %}>{{qna.label}}</button>
     {% if qna.why %}<span class="why">{{qna.why}}</span>{% endif %}
@@ -182,6 +237,74 @@
   </div>
   </details>
 </div>
+
+<style>
+.tutorial-workspace{display:grid;grid-template-columns:minmax(280px,.8fr) minmax(340px,1.2fr);gap:16px}.tutorial-form{min-width:0}.tutorial-form label{display:block;margin:0 0 5px;font-weight:650}.tutorial-form input[type=text],.tutorial-form input[type=password]{box-sizing:border-box;width:100%;min-height:38px;margin-bottom:10px}.tutorial-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:12px}.tutorial-result{min-height:48px;margin-top:12px;padding:10px 12px;border:1px solid var(--ops-line);border-radius:var(--radius-sm,6px);background:var(--surface-subtle,#f7f9fc);overflow-wrap:anywhere}.tutorial-result.success{border-color:var(--status-success);color:var(--status-success)}.tutorial-result.error{border-color:var(--status-danger);color:var(--status-danger)}.tutorial-job{min-width:0;padding-inline-start:16px;border-inline-start:1px solid var(--ops-line)}.tutorial-job-head{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap}.tutorial-job-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px 16px;margin-top:12px}.tutorial-job-grid .value{font-weight:700;overflow-wrap:anywhere}.tutorial-progress{width:100%;height:10px;margin:12px 0 4px}.tutorial-current{margin:8px 0 0;overflow-wrap:anywhere}.tutorial-history .release{align-items:flex-start}.tutorial-history .historical{font-size:11px;color:var(--ops-muted);font-weight:650}.tutorial-spinner{display:inline-block;width:12px;height:12px;border:2px solid currentColor;border-inline-end-color:transparent;border-radius:50%;animation:tutorial-spin .7s linear infinite;vertical-align:-2px;margin-inline-end:6px}@keyframes tutorial-spin{to{transform:rotate(360deg)}}@media(max-width:760px){.tutorial-workspace{grid-template-columns:1fr}.tutorial-job{padding-inline-start:0;padding-top:14px;border-inline-start:0;border-top:1px solid var(--ops-line)}.tutorial-actions .btn{min-height:44px}.tutorial-form input[type=text],.tutorial-form input[type=password]{min-height:44px;font-size:16px}}
+</style>
+<div class="card" id="mesflowTutorialCard" style="margin-top:16px">
+  <h3>Video hướng dẫn MESFlow</h3>
+  <p class="sub">Xác minh tài khoản, bắt đầu background job và theo dõi từng giai đoạn quay/publish ngay tại đây.</p>
+  {% if mes_build_enabled %}
+  <div class="tutorial-workspace">
+    <form id="tutorialCredentialForm" class="tutorial-form" novalidate>
+      <label for="tutorialUsername">Tài khoản MESFlow</label>
+      <input id="tutorialUsername" name="tutorial_username" type="text" value="admin" maxlength="120" required autocomplete="username">
+      <label for="tutorialPassword">Mật khẩu</label>
+      <input id="tutorialPassword" name="tutorial_password" type="password" required autocomplete="current-password" aria-describedby="tutorialAuthResult">
+      <label><input id="tutorialSeedData" type="checkbox" checked> Tạo dữ liệu tutorial tạm thời</label>
+      <div class="tutorial-actions">
+        <button id="tutorialCheckLoginButton" class="secondary btn" type="button">Kiểm tra đăng nhập</button>
+        <button id="tutorialExportButton" class="btn btn-primary" type="button" {% if tutorial_job and tutorial_job.status in ['queued','running'] %}disabled{% else %}disabled{% endif %}>Xuất lại video hướng dẫn</button>
+      </div>
+      <div id="tutorialAuthResult" class="tutorial-result" role="status" aria-live="polite">NEEDS AUTHENTICATION<br><span class="label">Nhập username/password → Kiểm tra đăng nhập</span></div>
+    </form>
+    <section class="tutorial-job" aria-labelledby="tutorialJobHeading">
+      <div class="tutorial-job-head"><h4 id="tutorialJobHeading" style="margin:0">Job hiện tại</h4><span id="tutorialJobStatus" class="ops-badge {{'healthy' if tutorial_job.status=='completed' else 'warning' if tutorial_job.status in ['queued','running'] else 'critical' if tutorial_job.status=='failed' else 'blocked'}}">{{(tutorial_job.status or 'NEEDS AUTHENTICATION')|upper}}</span></div>
+      <div class="tutorial-job-grid">
+        <div><div class="label">Job</div><div id="tutorialJobId" class="value">{{tutorial_job.job_id or '—'}}</div></div>
+        <div><div class="label">Stage</div><div id="tutorialJobStage" class="value">{{(tutorial_job.stage or 'needs_authentication')|upper}}</div></div>
+        <div><div class="label">Progress</div><div id="tutorialJobCount" class="value">{{tutorial_job.current or 0}} / {{tutorial_job.total or 0}}</div></div>
+        <div><div class="label">Bắt đầu</div><div id="tutorialJobStarted" class="value">{{tutorial_job.started_at or '—'}}</div></div>
+      </div>
+      <progress id="tutorialJobProgress" class="tutorial-progress" max="100" value="{{tutorial_job.progress or 0}}">{{tutorial_job.progress or 0}}%</progress>
+      <p id="tutorialJobMessage" class="tutorial-current">{{tutorial_job.message or 'Chưa xác minh tài khoản MESFlow'}}</p>
+      <div class="tutorial-actions"><a id="tutorialMonitorLink" class="secondary btn" href="{{url_for('tutorial_monitor')}}">Mở màn hình theo dõi</a></div>
+    </section>
+  </div>
+  {% else %}
+  <p><span class="ops-badge blocked">DEV ONLY</span> Agent này tắt source build nên không được phép quay video trên server.</p>
+  {% endif %}
+  <p class="label" style="margin-top:12px">Publish: <code>{{tutorial_publish_dir}}</code></p>
+  {% if tutorial_history %}
+  <details class="tutorial-history"><summary>Lịch sử gần đây</summary>
+    {% for h in tutorial_history %}<div class="release"><div><b>{{h.started_at}}</b><div class="label">{{h.message}}</div>{% if not h.agent_version or h.agent_version != agent_version %}<div class="historical">Historical — Agent {{h.agent_version or 'legacy'}}</div>{% endif %}</div><span class="{{'ok' if h.status in ['success','completed'] else 'run' if h.status=='warning' else 'bad'}}">{{h.status}}</span></div>{% endfor %}
+  </details>
+  {% endif %}
+</div>
+
+{% if mes_build_enabled %}<script>
+(function(){
+  const form=document.getElementById('tutorialCredentialForm'), user=document.getElementById('tutorialUsername'), password=document.getElementById('tutorialPassword'), seed=document.getElementById('tutorialSeedData'), check=document.getElementById('tutorialCheckLoginButton'), start=document.getElementById('tutorialExportButton'), auth=document.getElementById('tutorialAuthResult');
+  const status=document.getElementById('tutorialJobStatus'), stage=document.getElementById('tutorialJobStage'), jobId=document.getElementById('tutorialJobId'), count=document.getElementById('tutorialJobCount'), started=document.getElementById('tutorialJobStarted'), progress=document.getElementById('tutorialJobProgress'), message=document.getElementById('tutorialJobMessage');
+  const CHECK_URL={{url_for('api_tutorial_check_login')|tojson}}, START_URL={{url_for('api_tutorial_export')|tojson}}, STATUS_URL={{url_for('api_tutorial_job',job_id='current')|tojson}};
+  let authenticated=false,activeJob={{(tutorial_job.job_id or '')|tojson}},pollTimer=null;
+  const busy=(button,text,on)=>{button.disabled=on;if(on){button.dataset.label=button.textContent;button.innerHTML='<span class="tutorial-spinner" aria-hidden="true"></span>'+text}else if(button.dataset.label){button.textContent=button.dataset.label}};
+  const credentials=()=>({username:user.value.trim()||'admin',password:password.value,seed_data:seed.checked});
+  function setAuth(kind,title,detail){auth.className='tutorial-result '+kind;auth.innerHTML='<strong>'+esc(title)+'</strong><br><span class="label">'+esc(detail)+'</span>'}
+  function renderJob(job){
+    if(!job)return;const state=String(job.status||'needs_authentication').toLowerCase(),isActive=['queued','running'].includes(state);activeJob=job.job_id||activeJob;
+    status.textContent=state.toUpperCase();status.className='ops-badge '+(state==='completed'?'healthy':isActive?'warning':state==='failed'?'critical':'blocked');stage.textContent=String(job.stage||'—').toUpperCase();jobId.textContent=job.job_id||'—';count.textContent=(job.current||0)+' / '+(job.total||0);started.textContent=job.started_at||'—';progress.value=Number(job.progress||0);message.textContent=job.message||job.reason||'';
+    start.disabled=isActive||!authenticated;if(isActive){start.textContent='Đang chạy…';schedulePoll()}else{start.textContent='Xuất lại video hướng dẫn';if(pollTimer){clearTimeout(pollTimer);pollTimer=null}}
+  }
+  async function poll(){try{const data=await apiFetch(activeJob?STATUS_URL.replace(/current$/,encodeURIComponent(activeJob)):STATUS_URL);if(data.ok)renderJob(data.job)}catch(_){message.textContent='Mất kết nối trạng thái; sẽ thử lại.'}finally{if(['QUEUED','RUNNING'].includes(status.textContent))schedulePoll()}}
+  function schedulePoll(){if(pollTimer)clearTimeout(pollTimer);pollTimer=setTimeout(poll,1500)}
+  form.addEventListener('submit',event=>event.preventDefault());
+  [user,password].forEach(input=>input.addEventListener('input',()=>{authenticated=false;if(!['QUEUED','RUNNING'].includes(status.textContent))start.disabled=true;setAuth('','NEEDS AUTHENTICATION','Nhập username/password → Kiểm tra đăng nhập')}));
+  check.addEventListener('click',async()=>{if(!password.value){setAuth('error','ĐĂNG NHẬP THẤT BẠI','Chưa nhập mật khẩu');password.focus();return}busy(check,'Đang kiểm tra…',true);try{const data=await apiFetch(CHECK_URL,{method:'POST',body:JSON.stringify(credentials())});authenticated=!!data.authenticated;if(authenticated){setAuth('success','ĐĂNG NHẬP HỢP LỆ','User: '+data.username+' · HTTP '+data.status+' · Sẵn sàng xuất video');start.disabled=['QUEUED','RUNNING'].includes(status.textContent)}else{setAuth('error','ĐĂNG NHẬP THẤT BẠI','HTTP '+(data.status||data._status||'—')+' · '+(data.reason||data.error||'Không xác minh được'))}}catch(error){authenticated=false;setAuth('error','ĐĂNG NHẬP THẤT BẠI',error.message||'Không gửi được request')}finally{busy(check,'',false)}});
+  start.addEventListener('click',async()=>{if(!authenticated){setAuth('error','NEEDS AUTHENTICATION','Kiểm tra đăng nhập trước khi xuất video');return}busy(start,'Đang bắt đầu…',true);try{const data=await apiFetch(START_URL,{method:'POST',body:JSON.stringify(credentials())});if(data._status===202&&data.ok){password.value='';authenticated=false;activeJob=data.job_id;renderJob(data.job||{job_id:data.job_id,status:'queued',stage:'queued',message:'Đã bắt đầu'});setAuth('success','ĐÃ BẮT ĐẦU','Job: '+data.job_id)}else if(data._status===409&&data.code==='TUTORIAL_JOB_ALREADY_RUNNING'){activeJob=data.existing_job_id;renderJob(data.job);setAuth('error','JOB ĐANG CHẠY','Theo dõi job '+(activeJob||''))}else{setAuth('error','KHÔNG THỂ BẮT ĐẦU',data.reason||data.code||data.error||'HTTP '+data._status)}}catch(error){setAuth('error','KHÔNG THỂ BẮT ĐẦU',error.message||'Lỗi mạng')}finally{if(!['QUEUED','RUNNING'].includes(status.textContent))busy(start,'',false)}});
+  {% if tutorial_job %}renderJob({{tutorial_job|tojson}});{% endif %}
+})();
+</script>{% endif %}
 
 {# ESP Firmware Builder / ESP Tutorial moved to their own pages under
    /kiosk/firmware and /kiosk/tutorial (task: ESP_KIOSK_UI_SEPARATION) --
@@ -235,6 +358,25 @@
   runReleaseAction('qaReleaseLocalButton','{{url_for("qa_release_manager_deploy_local")}}','Đang deploy QA image release…','Local deploy failed',1200,'qaReleaseBuildStatus');
   runReleaseAction('qaReleaseTestButton','{{url_for("qa_release_manager_promote_test")}}','UPLOADING — Đang promote QA sang Test…','Promote Test failed',1500,'qaReleaseBuildStatus');
   wireProdButton('releaseProdButton','releaseBuildStatus','{{url_for("release_manager_promote_production")}}','Xác nhận triển khai PRODUCTION? Hành động này cần con người phê duyệt và không thể tự động hoàn tác.');
+  const qaPreflight=document.getElementById('qaPromotePreflightButton');
+  if(qaPreflight) qaPreflight.onclick=async()=>{
+    const status=document.getElementById('qaReleaseBuildStatus');
+    qaPreflight.disabled=true;if(status)status.textContent='Đang kiểm tra điều kiện Promote to Test…';
+    try{
+      const r=await fetch('{{url_for("qa_release_manager_promote_test_preflight")}}',{method:'POST',credentials:'same-origin',headers:{'X-CSRF-Token':CSRF,'X-Requested-With':'XMLHttpRequest'}});
+      const ct=(r.headers.get('content-type')||'').toLowerCase();
+      let d=null;
+      if(ct.includes('application/json')){
+        d=await r.json();
+      }else{
+        const body=(await r.text()).replace(/\s+/g,' ').trim().slice(0,300);
+        throw new Error('PREFLIGHT_INVALID_RESPONSE: HTTP '+r.status+'; expected JSON, got '+(ct||'unknown')+(body?' — '+body:''));
+      }
+      if(!r.ok)throw new Error((d.reason||d.error||'Preflight failed')+(d.next_action?' — '+d.next_action:'')+(d.detail?' — '+d.detail:''));
+      if(status)status.textContent=d.ready?'READY: Có thể Promote to Test.':'BLOCKED: '+(d.blocked_reason||'Chưa đủ điều kiện.')+' '+(d.next_action||'');
+      setTimeout(()=>location.reload(),250);
+    }catch(e){if(status)status.textContent='Preflight lỗi: '+e.message;qaPreflight.disabled=false;}
+  };
   wireProdButton('qaReleaseProdButton','qaReleaseBuildStatus','{{url_for("qa_release_manager_promote_production")}}','Xác nhận triển khai QA Center lên PRODUCTION? Hành động này cần con người phê duyệt và không thể tự động hoàn tác.');
   // Primary "Next Action" buttons: same underlying endpoints, chosen by the
   // server (Jinja next_action()) based on current pipeline state -- never
