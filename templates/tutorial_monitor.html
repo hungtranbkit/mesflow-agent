@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="vi"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Theo dõi video hướng dẫn · MESFlow Operations</title>
+<link rel="stylesheet" href="{{static_url('css/agent.css')}}">
+<style>
+.tut-wrap{max-width:1180px;margin:0 auto}.tut-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px}.tut-card{background:var(--ops-surface,#fff);border:1px solid var(--ops-line);border-radius:var(--radius-md,10px);padding:16px}.tut-value{font-size:20px;font-weight:750}.tut-log{white-space:pre-wrap;overflow:auto;max-height:62vh;min-height:360px;background:#0c1117;color:#d9e2ec;padding:14px;border-radius:8px;font-size:12px;line-height:1.45}.tut-actions{display:flex;gap:8px;flex-wrap:wrap}.tut-status-running{color:var(--ops-blue)}.tut-status-success{color:var(--status-success)}.tut-status-failed{color:var(--status-danger)}
+</style></head><body>
+{% set page_title='Tutorial Monitor' %}{% include '_operations_shell_start.html' %}
+<div class="wrap tut-wrap">
+<header class="ops-page-head"><div><h2>Theo dõi xuất video hướng dẫn</h2><p>Màn hình riêng. Release &amp; Deploy không polling; trang này dùng một luồng SSE nhẹ chỉ theo dõi state + file log tutorial.</p></div><div class="tut-actions"><a class="secondary btn" href="{{url_for('release_manager_page',tab='deploy')}}">← Release &amp; Deploy</a><button class="secondary btn" type="button" onclick="location.reload()">Tải lại</button></div></header>
+{% with messages=get_flashed_messages(with_categories=true) %}{% for c,m in messages %}<div class="{{c}} tut-card" style="margin-bottom:12px">{{m}}</div>{% endfor %}{% endwith %}
+<div class="tut-grid">
+  <div class="tut-card"><div class="label">Trạng thái</div><div id="tutorialStatus" class="tut-value">{{tutorial_job.status or 'idle'}}</div></div>
+  <div class="tut-card"><div class="label">Giai đoạn</div><div id="tutorialStage" class="tut-value">{{tutorial_job.stage or '—'}}</div></div>
+  <div class="tut-card"><div class="label">Bắt đầu</div><div id="tutorialStarted">{{tutorial_job.started_at or '—'}}</div></div>
+  <div class="tut-card"><div class="label">Thời gian chạy</div><div id="tutorialElapsed">—</div></div>
+</div>
+<div class="tut-card" style="margin-top:12px"><div class="label">Tiến độ hiện tại</div><div id="tutorialMessage" style="font-size:17px;margin-top:6px">{{tutorial_job.message or 'Chưa có job'}}</div><div class="label" style="margin-top:8px">Publish: <code id="tutorialPublish">{{tutorial_publish_dir}}</code></div><div id="tutorialConnection" class="label" style="margin-top:8px">Đang kết nối live monitor…</div></div>
+<div class="tut-card" style="margin-top:12px"><div style="display:flex;justify-content:space-between;align-items:center;gap:12px"><div><div class="label">LIVE LOG</div><h3 style="margin:4px 0">Tutorial builder</h3></div><label class="label"><input id="tutorialAutoScroll" type="checkbox" checked> Tự cuộn</label></div><pre id="tutorialLog" class="tut-log">{{tutorial_log}}</pre></div>
+{% if tutorial_history %}<div class="tut-card" style="margin-top:12px"><h3>Lịch sử gần đây</h3>{% for h in tutorial_history %}<div class="release"><div><b>{{h.started_at}}</b><div class="label">{{h.message}}</div></div><span class="{{'ok' if h.status=='success' else 'run' if h.status in ['running','warning'] else 'bad'}}">{{h.status}}</span></div>{% endfor %}</div>{% endif %}
+</div>
+{% include '_operations_shell_end.html' %}
+<script>
+(function(){
+  const $=id=>document.getElementById(id), log=$('tutorialLog'), conn=$('tutorialConnection');
+  let started={{ (tutorial_job.started_at or '')|tojson }};
+  function parseStart(v){if(!v)return null;const d=new Date(v.replace(' ','T'));return isNaN(d)?null:d}
+  function elapsed(){const d=parseStart(started);if(!d){$('tutorialElapsed').textContent='—';return}const s=Math.max(0,Math.floor((Date.now()-d.getTime())/1000)),h=Math.floor(s/3600),m=Math.floor((s%3600)/60),x=s%60;$('tutorialElapsed').textContent=(h?h+'h ':'')+String(m).padStart(2,'0')+'m '+String(x).padStart(2,'0')+'s'}
+  elapsed();setInterval(elapsed,1000);
+  function render(d){
+    const status=(d.status||'idle').toLowerCase();$('tutorialStatus').textContent=status;$('tutorialStatus').className='tut-value tut-status-'+status;$('tutorialStage').textContent=d.stage||'—';$('tutorialMessage').textContent=d.message||'';
+    if(d.started_at){started=d.started_at;$('tutorialStarted').textContent=d.started_at}if(d.publish_dir)$('tutorialPublish').textContent=d.publish_dir;
+    if(typeof d.log==='string'&&d.log!==log.textContent){log.textContent=d.log;if($('tutorialAutoScroll').checked)log.scrollTop=log.scrollHeight}
+    if(['success','warning','failed','cancelled'].includes(status))conn.textContent='Job đã kết thúc · '+(d.finished_at||d.updated_at||'');
+  }
+  if(window.EventSource){const es=new EventSource({{url_for('tutorial_events')|tojson}});es.addEventListener('tutorial',e=>{try{render(JSON.parse(e.data));conn.textContent='● Live monitor đang nhận log'}catch(_){}});es.onopen=()=>conn.textContent='● Live monitor đã kết nối';es.onerror=()=>conn.textContent='Mất kết nối live monitor. Có thể bấm Tải lại; Agent/job vẫn tiếp tục chạy.'}else conn.textContent='Trình duyệt không hỗ trợ EventSource. Dùng nút Tải lại thủ công.';
+  log.scrollTop=log.scrollHeight;
+})();
+</script></body></html>

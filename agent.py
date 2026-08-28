@@ -1,4 +1,5 @@
 from __future__ import annotations
+from flask import send_file
 import hashlib, hmac, http.cookiejar, io, json, os, secrets, shutil, socket, ssl, subprocess, sys, threading, time, urllib.request, urllib.error, uuid, zipfile, platform, re, tempfile
 from urllib.parse import quote, urlencode, urlparse
 import psutil
@@ -6,7 +7,7 @@ import paramiko
 from datetime import datetime
 from pathlib import Path
 from typing import Any
-from flask import Flask, abort, flash, jsonify, redirect, render_template, request, session, url_for, send_file
+from flask import Flask, Response, abort, flash, jsonify, redirect, render_template, request, session, stream_with_context, url_for, send_file
 from waitress import serve
 from werkzeug.middleware.proxy_fix import ProxyFix
 from werkzeug.security import check_password_hash, generate_password_hash
@@ -26,7 +27,7 @@ import agent_backend.db_backup as db_backup  # P4 Backup/DB/Storage Center -- re
 import agent_backend.fleet as fleet  # P5 Multi-server: Server Registry / Fleet Health -- see fleet.py module docstring.
 import agent_backend.incident_recovery as recovery  # Server Incident Recovery Console -- see incident_recovery.py module docstring.
 
-AGENT_VERSION="2.24.8-docker-runtime"
+AGENT_VERSION="2.24.37-docker-runtime"
 # Bumped when the wire contract changes in a way a caller might need to
 # branch on (new required fields, new endpoints a promotion depends on).
 # Independent of AGENT_VERSION: two different AGENT_VERSION builds can
@@ -36,7 +37,7 @@ API_PROTOCOL_VERSION=2
 # Capabilities this Agent build actually implements. A promotion (or the
 # DEV Target Agents table) checks REQUIRED_CAPABILITIES against this list
 # -- never AGENT_VERSION strings -- to decide COMPATIBLE/INCOMPATIBLE.
-AGENT_CAPABILITIES=["image_release_receive","digest_verify","remote_deploy","deploy_status","health_status","agent_self_update","qa_image_release_receive","qa_deploy","release_gate_evidence","operations_incidents","predictive_health","incident_ai_advisory","deployment_platform","build_once_local","mes_release_test_gate"]
+AGENT_CAPABILITIES=["image_release_receive","digest_verify","remote_deploy","deploy_status","health_status","agent_self_update","qa_image_release_receive","qa_chunked_release_receive","qa_deploy","release_gate_evidence","operations_incidents","predictive_health","incident_ai_advisory","deployment_platform","build_once_local","mes_release_test_gate"]
 AGENT_HOME=Path(os.environ.get("WORKSHOP_AGENT_HOME","/opt/mesflow-agent"))
 TARGET_HOME=Path(os.environ.get("WORKSHOP_TARGET_HOME","/opt/mesflow"))
 QA_HOME=Path(os.environ.get("MESFLOW_QA_HOME","/opt/mesflow-qa-center"))
@@ -631,9 +632,9 @@ def _release_summary():
     if not build.get("version"): local_block="No release has been built yet."
     elif contamination.get("contaminated"): local_block=f"Release {build.get('version')} is CONTAMINATED: {contamination.get('reason')}"
     test_block=None
-    if not local_pass: test_block="LOCAL_PASS is required before promoting to Production Test."
+    if not local_pass: test_block="BLOCKED: QA Center chưa LOCAL_PASS cho artifact hiện tại. Hãy Deploy Local và chờ LOCAL_PASS."
     elif contamination.get("contaminated"): test_block=f"Release {build.get('version')} is CONTAMINATED: {contamination.get('reason')}"
-    elif not (os.environ.get("MESFLOW_PRODUCTION_TEST_AGENT_URL") or "").strip(): test_block="No Production Test Agent is configured (set MESFLOW_PRODUCTION_TEST_AGENT_URL/_USER/_PASSWORD)."
+    elif not (os.environ.get("MESFLOW_PRODUCTION_TEST_AGENT_URL") or "").strip(): test_block="BLOCKED: Chưa cấu hình Production Test Agent. Cần MESFLOW_PRODUCTION_TEST_AGENT_URL/_USER/_PASSWORD."
     production_block=None
     if not gate_ok:
         missing=[]
@@ -1070,8 +1071,70 @@ def _remote_agent_deploy(opener,base,csrf,version,timeout=600,path_fmt="/deploy/
     with opener.open(req,timeout=timeout) as r:
         return r.status,r.read().decode("utf-8",errors="replace")
 
+QA_CHUNK_BYTES=max(1024*1024,min(int(os.environ.get("MESFLOW_QA_UPLOAD_CHUNK_MB","16"))*1024*1024,64*1024*1024))
+
+def _remote_agent_json_post(opener,base,path,csrf,payload,timeout=120,extra_headers=None):
+    data=json.dumps(payload).encode("utf-8")
+    headers={"Content-Type":"application/json","X-CSRF-Token":csrf,"User-Agent":"MESFlow-Deploy-Agent-Promote"}
+    if extra_headers: headers.update(extra_headers)
+    req=urllib.request.Request(base+path,data=data,headers=headers)
+    try:
+        with opener.open(req,timeout=timeout) as r:
+            body=r.read().decode("utf-8",errors="replace")
+            return json.loads(body or "{}")
+    except urllib.error.HTTPError as e:
+        body=e.read().decode("utf-8",errors="replace")
+        try: detail=json.loads(body or "{}")
+        except Exception: detail={"error":f"HTTP {e.code}: {e.reason}"}
+        raise _RemoteAgentError(str(detail.get("error") or detail.get("message") or f"HTTP {e.code}: {e.reason}"))
+
 def _remote_agent_qa_upload(opener,base,csrf,zip_path,timeout=600):
-    return _remote_agent_upload(opener,base,csrf,zip_path,timeout=timeout,path="/qa-release/upload",field_name="qa_release_zip")
+    """Transfer a potentially multi-GB immutable QA release without one huge
+    HTTP request. Cloud/reverse proxies commonly cap request bodies (the live
+    Production Test path returned HTTP 413 for the ~2GB QA image artifact).
+    The target receives small ordered chunks, verifies every chunk plus the
+    final whole-file SHA256, then stages the exact original ZIP.
+    """
+    zip_path=Path(zip_path)
+    total=zip_path.stat().st_size
+    expected_sha=sha(zip_path)
+    start=_remote_agent_json_post(opener,base,"/qa-release/chunk/start",csrf,{
+        "filename":zip_path.name,"total_size":total,"sha256":expected_sha,"chunk_size":QA_CHUNK_BYTES},timeout=60)
+    upload_id=str(start.get("upload_id") or "")
+    if not upload_id: raise _RemoteAgentError(f"QA_CHUNK_START_FAILED: {start}")
+    sent=0; index=0
+    try:
+        with zip_path.open("rb") as f:
+            while True:
+                chunk=f.read(QA_CHUNK_BYTES)
+                if not chunk: break
+                chunk_sha=hashlib.sha256(chunk).hexdigest()
+                req=urllib.request.Request(
+                    base+f"/qa-release/chunk/{quote(upload_id,safe='')}/{index}",data=chunk,
+                    headers={"Content-Type":"application/octet-stream","X-CSRF-Token":csrf,
+                             "X-Chunk-SHA256":chunk_sha,"User-Agent":"MESFlow-Deploy-Agent-Promote"})
+                try:
+                    with opener.open(req,timeout=timeout) as r:
+                        payload=json.loads(r.read().decode("utf-8",errors="replace") or "{}")
+                except urllib.error.HTTPError as e:
+                    body=e.read().decode("utf-8",errors="replace")
+                    try: detail=json.loads(body or "{}")
+                    except Exception: detail={"error":f"HTTP {e.code}: {e.reason}"}
+                    raise _RemoteAgentError(f"QA_CHUNK_UPLOAD_FAILED index={index}: {detail.get('error') or detail}")
+                sent += len(chunk); index += 1
+                if not payload.get("ok"):
+                    raise _RemoteAgentError(f"QA_CHUNK_UPLOAD_FAILED index={index-1}: {payload}")
+        if sent!=total: raise _RemoteAgentError(f"QA_CHUNK_SIZE_MISMATCH sent={sent} expected={total}")
+        complete=_remote_agent_json_post(opener,base,f"/qa-release/chunk/{quote(upload_id,safe='')}/complete",csrf,{
+            "sha256":expected_sha,"total_size":total,"chunks":index},timeout=timeout)
+        if not complete.get("ok"):
+            raise _RemoteAgentError(f"QA_CHUNK_COMPLETE_FAILED: {complete}")
+        return 200,json.dumps(complete)
+    except Exception:
+        try:
+            _remote_agent_json_post(opener,base,f"/qa-release/chunk/{quote(upload_id,safe='')}/abort",csrf,{},timeout=30)
+        except Exception: pass
+        raise
 
 def _remote_agent_qa_deploy(opener,base,csrf,version,timeout=600):
     return _remote_agent_deploy(opener,base,csrf,version,timeout=timeout,path_fmt="/qa-release/deploy/{}")
@@ -1132,7 +1195,7 @@ REQUIRED_PROMOTION_CAPABILITIES={"image_release_receive","digest_verify","remote
 # Same idea for QA Center promotion -- a distinct capability set so an
 # older target that can receive MESFlow releases but not QA ones (or vice
 # versa) is reported precisely, never conflated with the MESFlow gate.
-QA_REQUIRED_PROMOTION_CAPABILITIES={"qa_image_release_receive","qa_deploy","digest_verify","deploy_status","health_status"}
+QA_REQUIRED_PROMOTION_CAPABILITIES={"qa_image_release_receive","qa_chunked_release_receive","qa_deploy","digest_verify","deploy_status","health_status"}
 
 def _agent_compatibility(target_status,required=None):
     """Classify a target Agent's /api/status (or None/error on unreachable)
@@ -1793,9 +1856,9 @@ def _qa_release_summary():
     if not build.get("version"): local_block="No QA release has been built yet."
     elif contamination.get("contaminated"): local_block=f"Release {build.get('version')} is CONTAMINATED: {contamination.get('reason')}"
     test_block=None
-    if not local_pass: test_block="LOCAL_PASS is required before promoting to Production Test."
+    if not local_pass: test_block="BLOCKED: QA Center chưa LOCAL_PASS cho artifact hiện tại. Hãy Deploy Local và chờ LOCAL_PASS."
     elif contamination.get("contaminated"): test_block=f"Release {build.get('version')} is CONTAMINATED: {contamination.get('reason')}"
-    elif not (os.environ.get("MESFLOW_PRODUCTION_TEST_AGENT_URL") or "").strip(): test_block="No Production Test Agent is configured (set MESFLOW_PRODUCTION_TEST_AGENT_URL/_USER/_PASSWORD)."
+    elif not (os.environ.get("MESFLOW_PRODUCTION_TEST_AGENT_URL") or "").strip(): test_block="BLOCKED: Chưa cấu hình Production Test Agent. Cần MESFLOW_PRODUCTION_TEST_AGENT_URL/_USER/_PASSWORD."
     production_block=None
     if not gate_ok:
         missing=[]
@@ -2312,6 +2375,140 @@ def _run_qa_promote_test(version):
         qa_promote_test_update("FAILED",code,error_code=code)
     finally:
         if _qa_promote_test_lock.locked(): _qa_promote_test_lock.release()
+
+# QA_PROMOTE_EXPLAINABILITY_V1
+_QA_ERROR_HELP = {
+    "TESTS_FAILED": (
+        "Build/package Agent thất bại ở bước test.",
+        "Bấm Xem chi tiết lỗi để xem test nào fail; sửa lỗi đó rồi Build & Pack Agent lại.",
+    ),
+    "PRODUCTION_TEST_AGENT_NOT_CONFIGURED": ("Chưa cấu hình Agent Production Test.", "Cấu hình MESFLOW_PRODUCTION_TEST_AGENT_URL / _USER / _PASSWORD rồi kiểm tra lại."),
+    "LOCAL_PASS_REQUIRED": ("QA Center chưa có LOCAL_PASS cho đúng artifact hiện tại.", "Deploy Local lại và chờ LOCAL_PASS."),
+    "PACKAGE_NOT_FOUND": ("Không tìm thấy ZIP artifact QA đã build.", "Build Release lại để tạo artifact."),
+    "PACKAGE_SHA_SELF_CHECK_FAILED": ("SHA256 của artifact đã thay đổi sau khi build.", "Không promote artifact này; build lại release mới."),
+    "TARGET_AGENT_INCOMPATIBLE": ("Agent Production Test thiếu capability cần cho QA Center.", "Cập nhật Deploy Agent trên máy Production Test rồi kiểm tra lại."),
+    "TARGET_AGENT_WRONG_ROLE": ("Agent đích không có SERVER_ROLE=PRODUCTION_TEST.", "Sửa cấu hình role của Agent đích; không promote vào server sai vai trò."),
+    "TARGET_AGENT_BUILD_ENABLED": ("Production Test đang bật quyền build source.", "Đặt MESFLOW_BUILD_ENABLED=0 trên Agent Production Test."),
+    "REMOTE_LOGIN_FAILED": ("Không đăng nhập được Agent Production Test.", "Kiểm tra URL, username, password và reverse proxy/tunnel."),
+    "QA_CHUNK_UPLOAD_FAILED": ("Upload artifact QA lên Production Test bị lỗi.", "Kiểm tra network/proxy, dung lượng đĩa và log upload."),
+    "REMOTE_DEPLOY_FAILED": ("Agent Production Test nhận artifact nhưng deploy thất bại.", "Mở log deploy trên Agent đích và xử lý lỗi được hiển thị."),
+    "REMOTE_DEPLOY_TIMEOUT": ("Deploy trên Production Test quá thời gian chờ.", "Kiểm tra container/health trên Agent đích rồi retry."),
+    "REMOTE_VERIFY_FAILED": ("Deploy xong nhưng version/health trên Production Test không đúng.", "Kiểm tra version thực tế và health QA Center trên máy Test."),
+}
+
+def _qa_error_explain(raw):
+    raw = str(raw or '').strip()
+    code = raw.split(':', 1)[0].strip() if raw else 'UNKNOWN'
+    if '413' in raw:
+        return {"code":"HTTP_413","reason":"Proxy từ chối artifact vì request quá lớn.","next_action":"Dùng Agent hỗ trợ qa_chunked_release_receive và kiểm tra proxy/tunnel.","detail":raw}
+    for key, (reason, next_action) in _QA_ERROR_HELP.items():
+        if key in raw:
+            return {"code":key,"reason":reason,"next_action":next_action,"detail":raw}
+    if 'no session/csrf' in raw.lower() or 'login' in raw.lower():
+        return {"code":"REMOTE_LOGIN_FAILED","reason":"Không đăng nhập được Agent Production Test.","next_action":"Kiểm tra URL, username, password và reverse proxy/tunnel.","detail":raw}
+    return {"code":code or 'UNKNOWN',"reason":raw or 'Không xác định được nguyên nhân.',"next_action":"Mở chi tiết lỗi/log và chạy lại Kiểm tra điều kiện Promote.","detail":raw}
+
+def _qa_promote_test_preflight():
+    summary = _qa_release_summary()
+    latest = summary.get('latest') or {}
+    promotion = summary.get('promotion') or {}
+    checks = []
+    def add(key, label, ok, detail='', next_action=''):
+        checks.append({"key":key,"label":label,"ok":ok,"detail":str(detail or ''),"next_action":str(next_action or '')})
+
+    version = str(latest.get('version') or '')
+    add('release','Có release để promote',bool(version),version or 'Chưa build release','Build Release QA Center.' if not version else '')
+    local_ok = bool(promotion.get('local_pass'))
+    add('local_pass','LOCAL_PASS cho artifact hiện tại',local_ok,promotion.get('local_message') or '','Deploy Local và chờ LOCAL_PASS.' if not local_ok else '')
+    package = Path(str(latest.get('package') or '')) if latest.get('package') else None
+    package_ok = bool(package and package.is_file())
+    add('artifact','Artifact ZIP tồn tại',package_ok,str(package or ''),'Build Release lại để tạo ZIP.' if not package_ok else '')
+
+    url = (os.environ.get('MESFLOW_PRODUCTION_TEST_AGENT_URL') or '').strip()
+    user = (os.environ.get('MESFLOW_PRODUCTION_TEST_AGENT_USER') or 'admin').strip()
+    password = (os.environ.get('MESFLOW_PRODUCTION_TEST_AGENT_PASSWORD') or '').strip()
+    configured = bool(url and password)
+    add('configured','Production Test Agent đã cấu hình',configured,url or 'Chưa có URL','Cấu hình MESFLOW_PRODUCTION_TEST_AGENT_URL/_USER/_PASSWORD.' if not configured else '')
+
+    if configured:
+        try:
+            opener, base, csrf = _remote_agent_client(url, user, password)
+            target_status = _remote_agent_get_json(opener, base, '/api/status')
+            add('reachable','Kết nối & đăng nhập Agent đích',True,f"{target_status.get('agent_version','?')} @ {url}")
+            role_ok = target_status.get('server_role') == 'PRODUCTION_TEST'
+            add('role','SERVER_ROLE = PRODUCTION_TEST',role_ok,str(target_status.get('server_role') or '—'),'Sửa SERVER_ROLE trên Agent đích.' if not role_ok else '')
+            build_off = not bool(target_status.get('build_enabled'))
+            add('build_disabled','Build source trên Test đã tắt',build_off,f"build_enabled={target_status.get('build_enabled')}",'Đặt MESFLOW_BUILD_ENABLED=0 trên Agent Test.' if not build_off else '')
+            compat = _agent_compatibility(target_status, QA_REQUIRED_PROMOTION_CAPABILITIES)
+            compat_ok = compat.get('status') != 'INCOMPATIBLE'
+            add('capabilities','Capability QA tương thích',compat_ok,compat.get('reason') or 'OK','Cập nhật Deploy Agent trên máy Test.' if not compat_ok else '')
+        except Exception as ex:
+            info = _qa_error_explain(str(ex))
+            add('reachable','Kết nối & đăng nhập Agent đích',False,info['reason'],info['next_action'])
+
+    ready = all(x.get('ok') is True for x in checks)
+    failed = next((x for x in checks if x.get('ok') is False), None)
+    result = {
+        "checked_at": now_text(), "ready": ready, "version": version, "checks": checks,
+        "blocked_code": None if ready else (failed or {}).get('key','UNKNOWN').upper(),
+        "blocked_reason": 'Sẵn sàng Promote to Test.' if ready else (failed or {}).get('detail','Chưa đủ điều kiện.'),
+        "next_action": 'Bấm Promote to Test.' if ready else (failed or {}).get('next_action','Kiểm tra chi tiết bên dưới.'),
+    }
+    def mutate(state): state['qa_promote_test_preflight'] = result
+    update_state(mutate)
+    return result
+
+def _release_system_issues(state=None):
+    """Cheap UI-only issue summary from persisted state; no network/Docker polling."""
+    state = state or load_state()
+    issues = []
+    jobs = [
+        ("MESFlow deploy", "job"),
+        ("QA Local", "qa_local_deploy_job"),
+        ("QA Promote Test", "qa_promote_test_job"),
+        ("MESFlow Promote Test", "promote_test_job"),
+        ("QA Build", "qa_release_build_job"),
+        ("Agent package", "agent_package_build_job"),
+        ("Tutorial video", "tutorial_job"),
+    ]
+    bad = {"FAILED", "failed", "ERROR", "error", "WARNING", "warning"}
+    for label, key in jobs:
+        j = state.get(key) or {}
+        status = str(j.get("status") or "")
+        if status not in bad:
+            continue
+        raw = j.get("message") or j.get("error_code") or j.get("error") or "Unknown error"
+        info = _qa_error_explain(raw)
+        detail_parts = []
+        for field, title in (
+            ("error", "Error"), ("message", "Message"), ("log_tail", "Log tail"),
+            ("output", "Output"), ("stderr", "stderr"), ("stdout", "stdout"),
+            ("log_path", "Log file"),
+        ):
+            val = j.get(field)
+            if val:
+                text = str(val).strip()
+                if text:
+                    detail_parts.append(f"{title}:\n{text}")
+        detail = "\n\n".join(detail_parts).strip() or str(info.get("detail") or raw)
+        if "Tutorial builder exited with code 125" in str(raw):
+            info = {
+                "code": "TUTORIAL_DOCKER_RUN_FAILED",
+                "reason": "Docker không khởi động được Tutorial builder (exit 125).",
+                "next_action": "Mở chi tiết lỗi ngay bên dưới để xem lỗi docker run/mount/network/container cụ thể.",
+                "detail": detail,
+            }
+        issues.append({
+            "component": label,
+            "status": status,
+            "code": info["code"],
+            "reason": info["reason"],
+            "next_action": info["next_action"],
+            "detail": detail,
+            "log_path": str(j.get("log_path") or ""),
+            "at": j.get("updated_at") or j.get("finished_at") or "",
+        })
+    return issues[:6]
 
 def start_qa_promote_test(version):
     if not _qa_promote_test_lock.acquire(False): raise RuntimeError("PROMOTE_TEST_ALREADY_RUNNING")
@@ -3690,7 +3887,51 @@ def logout():verify_csrf();session.clear();return redirect(url_for("login"))
 def tutorial_job_running():
     return _tutorial_job_lock.locked()
 
+def _tutorial_safe_log_path(raw):
+    """Return a tutorial log path only when it is inside LOG_DIR.
+
+    The monitor never accepts an arbitrary filesystem path from the browser; it
+    only follows the path already persisted by the Agent job state.
+    """
+    if not raw: return None
+    try:
+        path=Path(str(raw)).resolve()
+        root=LOG_DIR.resolve()
+        if path.parent!=root or not path.name.startswith("tutorial_") or path.suffix!=".log": return None
+        return path
+    except (OSError,ValueError):
+        return None
+
+def _tutorial_log_tail(raw,max_bytes=65536):
+    path=_tutorial_safe_log_path(raw)
+    if not path or not path.is_file(): return ""
+    try:
+        size=path.stat().st_size
+        with path.open("rb") as f:
+            if size>max_bytes: f.seek(size-max_bytes)
+            data=f.read(max_bytes)
+        text=data.decode("utf-8","replace")
+        if size>max_bytes:
+            # Drop the possibly-partial first line after seeking into the file.
+            text=text.split("\n",1)[1] if "\n" in text else text
+            text="… log trước đó đã được rút gọn …\n"+text
+        return text
+    except OSError:
+        return ""
+
+def _tutorial_error_hint(log_path,max_chars=320):
+    text=_tutorial_log_tail(log_path,16384)
+    if not text: return ""
+    lines=[x.strip() for x in text.splitlines() if x.strip()]
+    # Docker exit 125 normally prints the useful daemon/CLI reason at the end.
+    interesting=[x for x in lines[-12:] if not x.startswith("RUN: docker run")]
+    if not interesting: return ""
+    hint=" | ".join(interesting[-3:])
+    hint=re.sub(r'(?i)(password|token|secret)([=:]\s*)[^\s]+',r'\1\2***',hint)
+    return hint[-max_chars:]
+
 def _tutorial_update(**values):
+    values.setdefault("updated_at",now_text())
     def f(st):
         job=dict(st.get("tutorial_job") or {})
         job.update(values)
@@ -3700,7 +3941,7 @@ def _tutorial_update(**values):
 def _tutorial_finish(status,message):
     def f(st):
         job=dict(st.get("tutorial_job") or {})
-        job.update({"status":status,"message":message,"finished_at":now_text()})
+        job.update({"status":status,"message":message,"finished_at":now_text(),"updated_at":now_text()})
         st["tutorial_job"]=job
         hist=st.setdefault("tutorial_history",[])
         hist.insert(0,dict(job))
@@ -3769,7 +4010,7 @@ def _tutorial_seed(log,action):
 def _run_tutorial_job(username,password,seed_data=True):
     log_path=LOG_DIR/f"tutorial_{datetime.now():%Y%m%d_%H%M%S}.log"
     _tutorial_update(
-        status="running",message="Đang chuẩn bị xuất video hướng dẫn",
+        status="running",stage="preparing",message="Đang chuẩn bị xuất video hướng dẫn",
         started_at=now_text(),finished_at="",log_file=str(log_path),
         username=username,seed_data=bool(seed_data)
     )
@@ -3781,10 +4022,15 @@ def _run_tutorial_job(username,password,seed_data=True):
             raise RuntimeError("MESFlow đang deploy; chờ deploy hoàn tất rồi xuất video")
         if qa_job_running():
             raise RuntimeError("QA Center đang deploy; chờ deploy hoàn tất rồi xuất video")
-        if not (TARGET_HOME/"scripts/make-user-guide-video.sh").is_file():
-            raise RuntimeError("MESFlow hiện tại chưa có scripts/make-user-guide-video.sh")
-        if not (TARGET_HOME/"tutorial/narration").is_dir():
-            raise RuntimeError("MESFlow hiện tại chưa có bộ lời thuyết minh tutorial")
+        if not MESFLOW_BUILD_ENABLED:
+            raise RuntimeError("SERVER_VIDEO_GENERATION_DEV_ONLY: Agent này không có quyền build source")
+        tutorial_source=MESFLOW_SOURCE_DIR
+        if not tutorial_source.is_dir():
+            raise RuntimeError(f"Không tìm thấy MESFlow source workspace: {tutorial_source}")
+        if not (tutorial_source/"scripts/make-user-guide-video.sh").is_file():
+            raise RuntimeError("MESFlow source chưa có scripts/make-user-guide-video.sh")
+        if not (tutorial_source/"tutorial/narration").is_dir():
+            raise RuntimeError("MESFlow source chưa có bộ lời thuyết minh tutorial")
         if not password:
             raise RuntimeError("Cần nhập mật khẩu tài khoản MESFlow để quay video")
 
@@ -3792,18 +4038,18 @@ def _run_tutorial_job(username,password,seed_data=True):
             log.write(f"[{now_text()}] Tutorial export requested user={username or 'admin'} seed={bool(seed_data)}\n")
             log.flush()
 
-            _tutorial_update(message="Đang kiểm tra tài khoản MESFlow")
+            _tutorial_update(stage="auth",message="Đang kiểm tra tài khoản MESFlow")
             _tutorial_login_preflight(username,password,log)
 
             if seed_data:
-                _tutorial_update(message="Đang tạo dữ liệu hướng dẫn tạm thời")
+                _tutorial_update(stage="seed",message="Đang tạo dữ liệu hướng dẫn tạm thời")
                 _tutorial_seed(log,"seed")
                 seeded=True
 
             image="mesflow-tutorial-builder:1.62.1-v1"
             if subprocess.run(["docker","image","inspect",image],
                               stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL).returncode:
-                _tutorial_update(message="Đang build môi trường quay video lần đầu")
+                _tutorial_update(stage="builder",message="Đang build môi trường quay video lần đầu")
                 log.write("BUILD tutorial builder image (first run only)\n");log.flush()
                 r=subprocess.run(
                     ["docker","build","-t",image,"-"],
@@ -3813,6 +4059,22 @@ def _run_tutorial_job(username,password,seed_data=True):
                 if r.returncode:
                     raise RuntimeError(f"Build tutorial builder failed with code {r.returncode}")
 
+            tutorial_candidates=[
+                Path(tutorial_source),
+                Path("/workspace/mesflow"),
+                Path("/workspace/mesflow/mesflow"),
+            ]
+            tutorial_source=next(
+                (p for p in tutorial_candidates if (p/"scripts/make-user-guide-video.sh").is_file()),
+                None,
+            )
+            if tutorial_source is None:
+                checked=", ".join(str(p) for p in tutorial_candidates)
+                raise RuntimeError(
+                    "TUTORIAL_SOURCE_SCRIPT_NOT_FOUND: scripts/make-user-guide-video.sh "
+                    f"không tồn tại trong các source root đã kiểm tra: {checked}"
+                )
+
             tutorial_runtime=TARGET_HOME/"runtime/tutorial-builder"
             output_dir=tutorial_runtime/"output"
             workspace_dir=tutorial_runtime/"workspace"
@@ -3820,7 +4082,7 @@ def _run_tutorial_job(username,password,seed_data=True):
             for d in (tutorial_runtime,output_dir,workspace_dir,publish_dir):
                 d.mkdir(parents=True,exist_ok=True)
 
-            _tutorial_update(message="Đang quay, lồng tiếng và publish video hướng dẫn")
+            _tutorial_update(stage="recording",message="Đang quay, lồng tiếng và publish video hướng dẫn")
             cmd=[
                 "docker","run","--rm","--name","mesflow-tutorial-builder",
                 "--network","mesflow-edge",
@@ -3832,19 +4094,30 @@ def _run_tutorial_job(username,password,seed_data=True):
                 "-e","MESFLOW_TUTORIAL_AUTO_PUBLISH=1",
                 "-e","MESFLOW_VIDEO_WORKSPACE=/work/workspace",
                 "-e","MESFLOW_VIDEO_OUTPUT=/work/output",
-                "-v",f"{TARGET_HOME}:/opt/mesflow:ro",
+                "-v",f"{tutorial_source}:/src/mesflow:ro",
                 "-v",f"{tutorial_runtime}:/work",
-                "-v",f"{publish_dir}:/opt/mesflow/runtime/tutorials",
-                "-w","/opt/mesflow",
+                "-v",f"{publish_dir}:/publish",
+                "-w","/src/mesflow",
                 image,
-                "bash","scripts/make-user-guide-video.sh","http://mesflow-app:8080"
+                "bash","-lc",
+                "mkdir -p /opt/mesflow/runtime && "
+                "ln -sfn /publish /opt/mesflow/runtime/tutorials && "
+                "exec bash scripts/make-user-guide-video.sh http://mesflow-app:8080"
             ]
             child_env=os.environ.copy()
             child_env["MESFLOW_TUTORIAL_PASSWORD"]=password
             log.write("RUN: docker run ... mesflow-tutorial-builder (MESFlow password hidden)\n");log.flush()
             r=subprocess.run(cmd,env=child_env,stdout=log,stderr=subprocess.STDOUT,text=True,timeout=7200)
             if r.returncode not in (0,3):
-                raise RuntimeError(f"Tutorial builder exited with code {r.returncode}")
+                hint=_tutorial_error_hint(log_path)
+                detail=f": {hint}" if hint else ""
+                if r.returncode==125 and hint and "read-only file system" in hint.lower():
+                    raise RuntimeError(
+                        "TUTORIAL_NESTED_READONLY_MOUNT: Docker không tạo được writable tutorial publish mount; "
+                        "publish phải mount độc lập ở /publish; không bind trực tiếp vào /opt/mesflow/runtime/tutorials"
+                        + detail
+                    )
+                raise RuntimeError(f"Tutorial builder exited with code {r.returncode}{detail}")
             if r.returncode==3:
                 log.write("[WARN] Một số video thất bại sau retry; các video tạo được vẫn đã publish.\n")
 
@@ -3867,7 +4140,7 @@ def _run_tutorial_job(username,password,seed_data=True):
     finally:
         if seeded:
             try:
-                _tutorial_update(message="Đang dọn dữ liệu hướng dẫn tạm thời")
+                _tutorial_update(stage="cleanup",message="Đang dọn dữ liệu hướng dẫn tạm thời")
                 with log_path.open("a",encoding="utf-8") as log:
                     _tutorial_seed(log,"cleanup")
             except Exception as cleanup_ex:
@@ -3891,7 +4164,8 @@ def start_tutorial_job(username,password,seed_data=True):
 @app.post("/tutorial/check-login")
 def tutorial_check_login():
     verify_csrf()
-    return jsonify(ok=False,error="SERVER_VIDEO_GENERATION_DISABLED",message="Video được build trên máy local và upload qua Agent"),410
+    if not MESFLOW_BUILD_ENABLED:
+        return jsonify(ok=False,error="SERVER_VIDEO_GENERATION_DEV_ONLY",message="Chỉ DEV Agent có source-build capability mới được tạo video"),403
     username=(request.form.get("tutorial_username") or "admin").strip() or "admin"
     password=request.form.get("tutorial_password") or ""
     if not password:
@@ -3909,16 +4183,66 @@ def tutorial_check_login():
 @app.post("/tutorial/rebuild")
 def tutorial_rebuild():
     verify_csrf()
-    return jsonify(ok=False,error="SERVER_VIDEO_GENERATION_DISABLED",message="Video được build trên máy local và upload qua Agent"),410
+    if not MESFLOW_BUILD_ENABLED:
+        return jsonify(ok=False,error="SERVER_VIDEO_GENERATION_DEV_ONLY",message="Chỉ DEV Agent có source-build capability mới được tạo video"),403
     try:
         username=(request.form.get("tutorial_username") or "admin").strip() or "admin"
         password=request.form.get("tutorial_password") or ""
         seed_data=request.form.get("tutorial_seed_data")=="1"
         start_tutorial_job(username,password,seed_data)
-        flash("Đã bắt đầu xuất lại video hướng dẫn. Job chạy nền và có thể mất khá lâu.","success")
+        flash("Đã bắt đầu xuất lại video hướng dẫn. Màn hình theo dõi sẽ hiển thị tiến độ và log trực tiếp.","success")
+        return redirect(url_for("tutorial_monitor"))
     except Exception as ex:
         flash(f"Không thể xuất video hướng dẫn: {ex}","error")
-    return redirect(url_for("index"))
+    return redirect(url_for("tutorial_monitor"))
+
+@app.get("/tutorial/monitor")
+def tutorial_monitor():
+    st=load_state();job=st.get("tutorial_job") or {}
+    return render_template("tutorial_monitor.html",page_key="releases",csrf=session.get("csrf",""),
+        agent_version=AGENT_VERSION,server_role=SERVER_ROLE,tutorial_job=job,
+        tutorial_history=(st.get("tutorial_history") or [])[:10],
+        tutorial_log=_tutorial_log_tail(job.get("log_file")),
+        tutorial_publish_dir=str(TARGET_HOME/"runtime/tutorials"))
+
+@app.get("/tutorial/events")
+def tutorial_events():
+    """One lightweight SSE stream for the dedicated tutorial monitor.
+
+    The Release page does not poll this route.  The monitor opens one HTTP
+    stream and incrementally follows only the current tutorial log/state, so it
+    cannot trigger Docker/health/release-summary work on the Agent.  The stream
+    closes automatically when the job leaves RUNNING.
+    """
+    if not logged_in(): return jsonify(ok=False,error="AUTH_REQUIRED"),401
+    @stream_with_context
+    def generate():
+        last_status_sig="";last_size=-1;idle=0
+        yield "retry: 3000\n\n"
+        while idle<14400:
+            st=load_state();job=st.get("tutorial_job") or {}
+            path=_tutorial_safe_log_path(job.get("log_file"))
+            try:size=path.stat().st_size if path and path.is_file() else 0
+            except OSError:size=0
+            status_payload={
+                "status":job.get("status",""),"stage":job.get("stage",""),
+                "message":job.get("message",""),"started_at":job.get("started_at",""),
+                "finished_at":job.get("finished_at",""),"updated_at":job.get("updated_at",""),
+                "publish_dir":str(TARGET_HOME/"runtime/tutorials")
+            }
+            sig=json.dumps(status_payload,sort_keys=True,ensure_ascii=False)
+            changed=sig!=last_status_sig or size!=last_size
+            if changed:
+                payload=dict(status_payload,log=_tutorial_log_tail(job.get("log_file")))
+                yield "event: tutorial\ndata: "+json.dumps(payload,ensure_ascii=False)+"\n\n"
+                last_status_sig=sig;last_size=size;idle=0
+            else:
+                idle+=1
+                if idle%15==0: yield ": keepalive\n\n"
+            if job and job.get("status") not in {"running","queued"}: break
+            time.sleep(1)
+    return Response(generate(),mimetype="text/event-stream",headers={
+        "Cache-Control":"no-cache, no-transform","X-Accel-Buffering":"no","Connection":"keep-alive"})
 
 ESP_TUTORIAL_STAGES=("uploading","validating","validating_manifest","staging","backing_up","publishing","verifying","success","failed")
 
@@ -4143,6 +4467,9 @@ def _release_deploy_tab_context():
         deployment_platform=_deployment_platform_summary(mes=mes,qa=qa,mes_release=release_summary,qa_release=qa_release_summary),
         mes=mes,qa=qa,
         qa_open_url=f"http://{host}:{QA_PORT}/",qa_log="",
+        tutorial_job=st.get("tutorial_job"),tutorial_history=(st.get("tutorial_history") or [])[:5],
+        tutorial_publish_dir=str(TARGET_HOME/"runtime/tutorials"),
+        qa_promote_preflight=st.get("qa_promote_test_preflight"),system_issues=_release_system_issues(st),
         mes_build_enabled=MESFLOW_BUILD_ENABLED)
 
 def _deployment_history_tab_context():
@@ -4153,12 +4480,20 @@ def _deployment_history_tab_context():
     return dict()
 
 def _agent_update_tab_context():
-    """Agent Update tab: target Agents + this tab's own job/history only."""
+    """Agent Update tab: target Agents + this tab's own job/history only.
+    Keep the package destination explicit so the operator always knows which
+    immutable ZIP Bootstrap should install.
+    """
+    version_file=DEPLOY_AGENT_SOURCE_DIR/"VERSION.txt"
+    source_version=version_file.read_text(encoding="utf-8-sig").strip() if version_file.is_file() else ""
+    host=(request.host or "localhost").split(":",1)[0]
     return dict(target_agents=load_json(CONFIG_DIR/"target-agents.json",{}),
         agent_update_job=load_state().get("agent_update_job"),mes_build_enabled=MESFLOW_BUILD_ENABLED,
         latest_agent_release=_latest_agent_release(),
         agent_package_build_job=load_state().get("agent_package_build_job"),
-        agent_version_bump=load_state().get("agent_version_bump"))
+        agent_version_bump=load_state().get("agent_version_bump"),
+        agent_source_version=source_version,
+        bootstrap_open_url=f"http://{host}:8098/")
 
 # ---------------- ESP Kiosk (task: ESP_KIOSK_UI_SEPARATION) ----------------
 # Firmware Builder and Tutorial used to live inside the Release & Deploy
@@ -4707,6 +5042,17 @@ def qa_release_manager_deploy_local():
 def qa_release_manager_promote_test_status():
     if not logged_in(): return jsonify(ok=False,error="AUTH_REQUIRED"),401
     return jsonify(ok=True,job=load_state().get("qa_promote_test_job"),summary=_qa_release_summary())
+
+@app.post("/api/qa-release-manager/promote-test-preflight")
+def qa_release_manager_promote_test_preflight():
+    if not logged_in(): return jsonify(ok=False,error="AUTH_REQUIRED"),401
+    verify_csrf()
+    try:
+        result = _qa_promote_test_preflight()
+        return jsonify(ok=True, **result)
+    except Exception as ex:
+        info = _qa_error_explain(str(ex))
+        return jsonify(ok=False,error=info['code'],reason=info['reason'],next_action=info['next_action'],detail=info['detail']),409
 
 @app.post("/api/qa-release-manager/promote-test")
 def qa_release_manager_promote_test():
@@ -6433,16 +6779,11 @@ def deploy(version):
 # metadata, never application source) and deploy it --no-build. Store-only
 # on upload; /qa-release/deploy/<version> is the sole deploy trigger (no
 # redundant double-deploy-call ambiguity).
-@app.post("/qa-release/upload")
-def qa_release_upload():
-    verify_csrf(); u=request.files.get("qa_release_zip")
-    append_log(f"QA image-release upload received: filename={getattr(u,'filename','')!r}")
-    if not u or not u.filename or not u.filename.lower().endswith('.zip'):
-        return jsonify(ok=False,error="Chọn file ZIP QA hợp lệ"),400
-    z=QA_UPLOAD_DIR/f"qa_release_{int(time.time())}_{secure_filename(u.filename)}"
-    e=QA_UPLOAD_DIR/f"extract_{secrets.token_hex(8)}"
+def _stage_qa_release_zip(z,source_name):
+    """Validate and atomically stage one completed immutable QA release ZIP.
+    Shared by the legacy single-request receiver and the chunked receiver."""
+    z=Path(z); e=QA_UPLOAD_DIR/f"extract_{secrets.token_hex(8)}"
     try:
-        u.save(z)
         if not zipfile.is_zipfile(z): raise ValueError("Uploaded file is not a valid ZIP")
         e.mkdir(); safe_extract_zip(z,e); r=locate_qa_image_release_root(e)
         v,meta=validate_qa_image_release_contract(r)
@@ -6450,7 +6791,7 @@ def qa_release_upload():
         t=QA_IMAGE_RELEASES_DIR/v
         replacement=QA_IMAGE_RELEASES_DIR/f".{v}.replacement-{secrets.token_hex(6)}"
         shutil.copytree(r,replacement)
-        save_json(replacement/"agent_manifest.json",{"version":v,"uploaded_at":now_text(),"source_name":u.filename,"sha256":sha(z)})
+        save_json(replacement/"agent_manifest.json",{"version":v,"uploaded_at":now_text(),"source_name":source_name,"sha256":sha(z)})
         if t.exists():
             old=QA_IMAGE_RELEASES_DIR/f".{v}.previous-{secrets.token_hex(6)}"
             t.replace(old)
@@ -6461,12 +6802,117 @@ def qa_release_upload():
         else:
             replacement.replace(t)
         append_log(f"QA image-release stored: {v}")
+        return v
+    finally:
+        shutil.rmtree(e,ignore_errors=True)
+
+@app.post("/qa-release/upload")
+def qa_release_upload():
+    """Legacy single-request QA receiver, retained for compatibility.
+    New promotion clients use the chunked routes below so large image bundles
+    never hit reverse-proxy/cloud request-body limits."""
+    verify_csrf(); u=request.files.get("qa_release_zip")
+    append_log(f"QA image-release upload received: filename={getattr(u,'filename','')!r}")
+    if not u or not u.filename or not u.filename.lower().endswith('.zip'):
+        return jsonify(ok=False,error="Chọn file ZIP QA hợp lệ"),400
+    z=QA_UPLOAD_DIR/f"qa_release_{int(time.time())}_{secure_filename(u.filename)}"
+    try:
+        u.save(z)
+        v=_stage_qa_release_zip(z,u.filename)
         return jsonify(ok=True,version=v,message=f"Đã nhận QA release {v}")
     except Exception as ex:
         append_log(f"QA image-release upload failed: {type(ex).__name__}: {ex}")
         return jsonify(ok=False,error=str(ex)),400
     finally:
-        z.unlink(missing_ok=True); shutil.rmtree(e,ignore_errors=True)
+        z.unlink(missing_ok=True)
+
+QA_CHUNK_DIR=QA_UPLOAD_DIR/"chunked"
+QA_CHUNK_DIR.mkdir(parents=True,exist_ok=True)
+QA_CHUNK_MAX_BYTES=max(1024*1024,min(int(os.environ.get("MESFLOW_QA_UPLOAD_CHUNK_MAX_MB","32"))*1024*1024,64*1024*1024))
+QA_CHUNK_MAX_ARTIFACT_BYTES=max(1024*1024,int(os.environ.get("MESFLOW_QA_UPLOAD_MAX_ARTIFACT_MB","8192"))*1024*1024)
+
+def _qa_chunk_upload_dir(upload_id):
+    if not re.fullmatch(r"[0-9a-f]{32}",str(upload_id or "")): raise ValueError("INVALID_UPLOAD_ID")
+    return QA_CHUNK_DIR/upload_id
+
+def _qa_chunk_meta(upload_id):
+    d=_qa_chunk_upload_dir(upload_id); meta=load_json(d/"meta.json",{})
+    if not meta: raise ValueError("QA_CHUNK_UPLOAD_NOT_FOUND")
+    return d,meta
+
+@app.post("/qa-release/chunk/start")
+def qa_release_chunk_start():
+    verify_csrf(); payload=request.get_json(silent=True) or {}
+    filename=secure_filename(str(payload.get("filename") or ""))
+    try: total_size=int(payload.get("total_size") or 0)
+    except Exception: total_size=0
+    expected_sha=str(payload.get("sha256") or "").lower()
+    try: requested_chunk=int(payload.get("chunk_size") or 0)
+    except Exception: requested_chunk=0
+    if not filename.lower().endswith('.zip'): return jsonify(ok=False,error="QA_CHUNK_INVALID_FILENAME"),400
+    if total_size<=0 or total_size>QA_CHUNK_MAX_ARTIFACT_BYTES: return jsonify(ok=False,error="QA_CHUNK_INVALID_TOTAL_SIZE"),400
+    if not re.fullmatch(r"[0-9a-f]{64}",expected_sha): return jsonify(ok=False,error="QA_CHUNK_INVALID_SHA256"),400
+    if requested_chunk<=0 or requested_chunk>QA_CHUNK_MAX_BYTES: return jsonify(ok=False,error="QA_CHUNK_SIZE_NOT_ALLOWED",max_bytes=QA_CHUNK_MAX_BYTES),400
+    upload_id=uuid.uuid4().hex; d=QA_CHUNK_DIR/upload_id; d.mkdir(parents=True)
+    meta={"filename":filename,"total_size":total_size,"sha256":expected_sha,"chunk_size":requested_chunk,
+          "next_index":0,"received":0,"created_at":now_text()}
+    save_json(d/"meta.json",meta); (d/"payload.zip.part").touch()
+    append_log(f"QA chunked upload started: id={upload_id} file={filename} bytes={total_size} chunk={requested_chunk}")
+    return jsonify(ok=True,upload_id=upload_id,max_chunk_bytes=QA_CHUNK_MAX_BYTES)
+
+@app.post("/qa-release/chunk/<upload_id>/<int:index>")
+def qa_release_chunk_put(upload_id,index):
+    verify_csrf()
+    try:
+        d,meta=_qa_chunk_meta(upload_id)
+        if index!=int(meta.get("next_index",0)): raise ValueError(f"QA_CHUNK_OUT_OF_ORDER expected={meta.get('next_index')} got={index}")
+        content_length=request.content_length
+        if content_length is not None and (content_length<=0 or content_length>QA_CHUNK_MAX_BYTES): raise ValueError("QA_CHUNK_TOO_LARGE")
+        data=request.get_data(cache=False)
+        if not data or len(data)>QA_CHUNK_MAX_BYTES: raise ValueError("QA_CHUNK_TOO_LARGE_OR_EMPTY")
+        expected=request.headers.get("X-Chunk-SHA256","").lower()
+        actual=hashlib.sha256(data).hexdigest()
+        if not re.fullmatch(r"[0-9a-f]{64}",expected) or actual!=expected: raise ValueError("QA_CHUNK_SHA256_MISMATCH")
+        received=int(meta.get("received",0))+len(data)
+        if received>int(meta["total_size"]): raise ValueError("QA_CHUNK_EXCEEDS_TOTAL_SIZE")
+        with (d/"payload.zip.part").open("ab") as f: f.write(data)
+        meta["received"]=received; meta["next_index"]=index+1; save_json(d/"meta.json",meta)
+        return jsonify(ok=True,upload_id=upload_id,index=index,received=received,total_size=meta["total_size"])
+    except Exception as ex:
+        append_log(f"QA chunk upload failed: id={upload_id} index={index} error={ex}")
+        return jsonify(ok=False,error=str(ex)),400
+
+@app.post("/qa-release/chunk/<upload_id>/complete")
+def qa_release_chunk_complete(upload_id):
+    verify_csrf(); payload=request.get_json(silent=True) or {}
+    try:
+        d,meta=_qa_chunk_meta(upload_id); part=d/"payload.zip.part"
+        expected_sha=str(meta["sha256"]); expected_size=int(meta["total_size"])
+        if int(meta.get("received",0))!=expected_size or part.stat().st_size!=expected_size: raise ValueError("QA_CHUNK_FINAL_SIZE_MISMATCH")
+        if payload.get("total_size") is not None and int(payload["total_size"])!=expected_size: raise ValueError("QA_CHUNK_CLIENT_SIZE_MISMATCH")
+        if payload.get("sha256") and str(payload["sha256"]).lower()!=expected_sha: raise ValueError("QA_CHUNK_CLIENT_SHA_MISMATCH")
+        if payload.get("chunks") is not None and int(payload["chunks"])!=int(meta.get("next_index",0)): raise ValueError("QA_CHUNK_COUNT_MISMATCH")
+        actual_sha=sha(part)
+        if actual_sha!=expected_sha: raise ValueError("QA_CHUNK_FINAL_SHA256_MISMATCH")
+        final=QA_UPLOAD_DIR/f"qa_release_chunked_{int(time.time())}_{meta['filename']}"
+        part.replace(final)
+        try:
+            version=_stage_qa_release_zip(final,meta["filename"])
+        finally:
+            final.unlink(missing_ok=True)
+        shutil.rmtree(d,ignore_errors=True)
+        append_log(f"QA chunked upload completed: id={upload_id} version={version} bytes={expected_size}")
+        return jsonify(ok=True,version=version,sha256=actual_sha,total_size=expected_size)
+    except Exception as ex:
+        append_log(f"QA chunk complete failed: id={upload_id} error={ex}")
+        return jsonify(ok=False,error=str(ex)),400
+
+@app.post("/qa-release/chunk/<upload_id>/abort")
+def qa_release_chunk_abort(upload_id):
+    verify_csrf()
+    try: d=_qa_chunk_upload_dir(upload_id); shutil.rmtree(d,ignore_errors=True)
+    except Exception as ex: return jsonify(ok=False,error=str(ex)),400
+    return jsonify(ok=True,upload_id=upload_id)
 
 @app.post("/qa-release/deploy/<version>")
 def qa_release_deploy(version):
@@ -6534,4 +6980,90 @@ def main():
     # retried connections (observed while load-testing P5's multi-server
     # test harness -- see reports/P5_MULTI_SERVER.md).
     serve(app,host=HOST,port=PORT,threads=max(8,int(os.environ.get("WORKSHOP_AGENT_THREADS","8") or 8)))
+
+# === AGENT PACKAGE COMPLETE UI v1 ===
+def _agent_package_candidate_roots():
+    roots=[]
+    configured=os.environ.get("MESFLOW_AGENT_PACKAGE_DIR","").strip()
+    if configured:
+        roots.append(Path(configured))
+    here=Path(__file__).resolve().parent
+    roots += [
+        here/"artifacts",
+        here.parent/"artifacts"/"deploy-agent",
+        here.parent/"artifacts"/"deploy-agent"/"releases",
+        Path("/workspace/mesflow/artifacts/deploy-agent"),
+        Path("/workspace/mesflow/artifacts/deploy-agent/releases"),
+    ]
+    out=[]; seen=set()
+    for p in roots:
+        try: key=str(p.resolve())
+        except Exception: key=str(p)
+        if key not in seen:
+            seen.add(key); out.append(p)
+    return out
+
+def _agent_latest_package():
+    candidates=[]
+    for root in _agent_package_candidate_roots():
+        if not root.exists():
+            continue
+        try:
+            for p in root.rglob("*.zip"):
+                n=p.name.lower()
+                if not any(x in n for x in ("agent_update","deploy-agent","deploy_agent","agent-package","agent_package")):
+                    continue
+                try:
+                    st=p.stat()
+                    candidates.append((st.st_mtime,p,st.st_size))
+                except OSError:
+                    pass
+        except OSError:
+            pass
+    if not candidates:
+        return None
+    mtime,p,size=max(candidates,key=lambda x:x[0])
+    try: digest=hashlib.sha256(p.read_bytes()).hexdigest()
+    except Exception: digest=""
+    vf=Path(__file__).resolve().parent/"VERSION.txt"
+    try: source_version=vf.read_text(encoding="utf-8").strip()
+    except Exception: source_version=AGENT_VERSION
+    return {
+        "filename":p.name,
+        "path":str(p),
+        "sha256":digest,
+        "size":size,
+        "size_mb":round(size/1024/1024,2),
+        "built_at":datetime.fromtimestamp(mtime).astimezone().isoformat(timespec="seconds"),
+        "source_version":source_version,
+        "runtime_version":AGENT_VERSION,
+    }
+
+@app.get("/api/agent-package/latest")
+def agent_package_latest_complete():
+    if not logged_in(): return jsonify(ok=False,error="AUTH_REQUIRED"),401
+    pkg=_agent_latest_package()
+    vf=Path(__file__).resolve().parent/"VERSION.txt"
+    try: source_version=vf.read_text(encoding="utf-8").strip()
+    except Exception: source_version=AGENT_VERSION
+    return jsonify(ok=True,package=pkg,source_version=source_version,runtime_version=AGENT_VERSION,
+                   bootstrap_url=os.environ.get("MESFLOW_BOOTSTRAP_URL","").strip())
+
+@app.get("/api/agent-package/download")
+def agent_package_download_complete():
+    if not logged_in(): return jsonify(ok=False,error="AUTH_REQUIRED"),401
+    pkg=_agent_latest_package()
+    if not pkg: return jsonify(ok=False,error="AGENT_PACKAGE_NOT_FOUND"),404
+    p=Path(pkg["path"])
+    allowed=False
+    for root in _agent_package_candidate_roots():
+        try:
+            p.resolve().relative_to(root.resolve()); allowed=True; break
+        except Exception:
+            pass
+    if not allowed or not p.is_file():
+        return jsonify(ok=False,error="AGENT_PACKAGE_PATH_NOT_ALLOWED"),403
+    return send_file(p,as_attachment=True,download_name=p.name,mimetype="application/zip")
+
+
 if __name__=="__main__":main()

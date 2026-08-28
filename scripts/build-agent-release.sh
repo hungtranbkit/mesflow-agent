@@ -17,6 +17,12 @@ for f in agent.py VERSION.txt docker/Dockerfile; do
   [[ -f "$ROOT/$f" ]] || die "SOURCE_PREFLIGHT_FAILED: missing $f"
 done
 
+# One source of truth: refuse to build an inconsistent source tree. The
+# doctor is read-only in --check mode; it never mutates source during build.
+if [[ -x "$ROOT/scripts/version-doctor.sh" ]]; then
+  "$ROOT/scripts/version-doctor.sh" --check || die "VERSION_INCONSISTENT: run scripts/version-doctor.sh --repair before building"
+fi
+
 # --- 2. version validation ---
 agent_version="$(tr -d '[:space:]' < VERSION.txt)"
 [[ "$agent_version" == *-docker-runtime ]] || die "VERSION_INVALID: expected a *-docker-runtime version, got $agent_version"

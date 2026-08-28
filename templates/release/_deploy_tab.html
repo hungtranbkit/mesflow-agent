@@ -30,6 +30,40 @@
 </div>
 {% endif %}
 
+{# SYSTEM_ISSUE_EXPLAINABILITY_V2 #}
+{% if system_issues %}
+<div class="rel-card" style="border-color:#dc2626;background:#fff7f7">
+  <h3 style="margin-top:0">⚠ Hệ thống đang có lỗi</h3>
+  <p class="sub">Hiển thị nguyên nhân gần nhất và việc nên làm tiếp theo.</p>
+  {% for x in system_issues %}
+  <div style="padding:10px 0;border-top:1px solid #fecaca">
+    <div><b>{{x.component}}</b> · <span class="bad">{{x.code}}</span>{% if x.at %} · <span class="label">{{x.at}}</span>{% endif %}</div>
+    <div style="margin-top:4px">{{x.reason}}</div>
+    <div class="label" style="margin-top:4px"><b>Cần làm:</b> {{x.next_action}}</div>
+    <details style="margin-top:7px">
+      <summary style="cursor:pointer;font-weight:600">Xem chi tiết lỗi</summary>
+      <div style="margin-top:7px">
+        {% if x.log_path %}<div class="label"><b>Log file:</b> <code>{{x.log_path}}</code></div>{% endif %}
+        <pre style="white-space:pre-wrap;word-break:break-word;max-height:360px;overflow:auto;background:#111827;color:#f9fafb;padding:10px;border-radius:6px;margin-top:6px">{{x.detail}}</pre>
+        <button class="secondary btn issue-copy-btn" type="button" data-copy="{{x.detail|e}}">Copy lỗi</button>
+      </div>
+    </details>
+  </div>
+  {% endfor %}
+</div>
+<script>
+document.querySelectorAll('.issue-copy-btn').forEach(btn=>{
+  btn.addEventListener('click', async ()=>{
+    try{
+      await navigator.clipboard.writeText(btn.dataset.copy||'');
+      const old=btn.textContent; btn.textContent='Đã copy';
+      setTimeout(()=>btn.textContent=old,1200);
+    }catch(e){ alert('Không copy được: '+e); }
+  });
+});
+</script>
+{% endif %}
+
 {% if release_summary.contamination and release_summary.contamination.contaminated %}
 <div class="rel-card" style="background:#4a1010;color:#ffb4b4;border-color:#ff6b6b">⚠ CONTAMINATED: {{release_summary.contamination.reason}}</div>
 {% endif %}
@@ -148,6 +182,27 @@
     <span class="ops-badge {{'pass' if qlatest and qlatest.package_sha256 else ''}}">{% if qlatest and qlatest.package_sha256 %}Artifact VERIFIED{% else %}Chưa có artifact{% endif %}</span>
   </div>
   <div class="ops-pipeline" aria-label="QA release pipeline">{{pipestage('BUILD', qs.build)}}{{pipestage('LOCAL', qs.local)}}{{pipestage('TEST', qs.test)}}{{pipestage('PRODUCTION', qs.production)}}</div>
+  {# QA_PROMOTE_READINESS_UI_V1 #}
+  {% if qs.local == 'PASS' and qs.test != 'PASS' %}
+  <div id="qaPromoteReadiness" style="margin:12px 0;padding:12px;border:1px solid #fca5a5;border-radius:8px;background:#fff7ed">
+    <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+      <b>Điều kiện Promote to Test</b>
+      {% if qa_promote_preflight %}<span class="ops-badge {{'pass' if qa_promote_preflight.ready else 'blocked'}}">{{'READY' if qa_promote_preflight.ready else 'BLOCKED'}}</span>{% endif %}
+      <button id="qaPromotePreflightButton" class="secondary btn" type="button">Kiểm tra điều kiện Promote</button>
+      {% if qa_promote_preflight and qa_promote_preflight.checked_at %}<span class="label">Kiểm tra: {{qa_promote_preflight.checked_at}}</span>{% endif %}
+    </div>
+    {% if qa_promote_preflight %}
+      <div style="margin-top:8px">
+      {% for c in qa_promote_preflight.checks %}
+        <div style="padding:3px 0"><span class="{{'ok' if c.ok else 'bad'}}">{{'✓' if c.ok else '✗'}}</span> <b>{{c.label}}</b>{% if c.detail %} — {{c.detail}}{% endif %}{% if not c.ok and c.next_action %}<div class="label" style="margin-left:20px"><b>Cần làm:</b> {{c.next_action}}</div>{% endif %}</div>
+      {% endfor %}
+      </div>
+      {% if not qa_promote_preflight.ready %}<p class="bad" style="margin-bottom:0"><b>{{qa_promote_preflight.blocked_code}}</b>: {{qa_promote_preflight.blocked_reason}}<br><span class="label"><b>Bước tiếp theo:</b> {{qa_promote_preflight.next_action}}</span></p>{% endif %}
+    {% else %}
+      <p class="label" style="margin-bottom:0">LOCAL_PASS đã có. Bấm <b>Kiểm tra điều kiện Promote</b> để xác minh target, login, role, build policy và capability trước khi promote.</p>
+    {% endif %}
+  </div>
+  {% endif %}
   <div class="rel-next">
     <button id="{{qna.id}}" class="btn btn-primary" data-stage="{{qna.stage}}" {% if not qna.enabled %}disabled{% endif %}>{{qna.label}}</button>
     {% if qna.why %}<span class="why">{{qna.why}}</span>{% endif %}
@@ -181,6 +236,42 @@
   </div>
   </div>
   </details>
+</div>
+
+<div class="card" id="mesflowTutorialCard" style="margin-top:16px">
+  <h3>Video hướng dẫn MESFlow</h3>
+  <p class="sub">Quay video ngay trên DEV Agent bằng Playwright + voice, sau đó publish vào runtime tutorial của MESFlow.</p>
+  {% if mes_build_enabled %}
+  <div class="grid">
+    <form method="post" action="{{url_for('tutorial_check_login')}}">
+      <input type="hidden" name="csrf" value="{{csrf}}">
+      <label>Tài khoản MESFlow</label>
+      <input name="tutorial_username" value="admin" autocomplete="username" style="width:100%">
+      <label style="margin-top:8px">Mật khẩu</label>
+      <input name="tutorial_password" type="password" required autocomplete="current-password" style="width:100%">
+      <button class="secondary btn" type="submit" style="margin-top:10px">Kiểm tra đăng nhập</button>
+    </form>
+    <form method="post" action="{{url_for('tutorial_rebuild')}}">
+      <input type="hidden" name="csrf" value="{{csrf}}">
+      <label>Tài khoản MESFlow</label>
+      <input name="tutorial_username" value="admin" autocomplete="username" style="width:100%">
+      <label style="margin-top:8px">Mật khẩu</label>
+      <input name="tutorial_password" type="password" required autocomplete="current-password" style="width:100%">
+      <label style="display:block;margin-top:10px"><input type="checkbox" name="tutorial_seed_data" value="1" checked> Tạo dữ liệu tutorial tạm thời</label>
+      <button class="btn btn-primary" type="submit" style="margin-top:10px" {% if tutorial_job and tutorial_job.status=='running' %}disabled{% endif %}>Xuất lại video hướng dẫn</button>
+      <a class="secondary btn" href="{{url_for('tutorial_monitor')}}" target="_blank" style="margin-top:10px">Mở màn hình theo dõi</a>
+    </form>
+  </div>
+  {% else %}
+  <p><span class="ops-badge blocked">DEV ONLY</span> Agent này tắt source build nên không được phép quay video trên server.</p>
+  {% endif %}
+  <p class="label" style="margin-top:10px">Publish: <code>{{tutorial_publish_dir}}</code></p>
+  {% if tutorial_job %}<p><b>{{tutorial_job.status}}</b> — {{tutorial_job.message}} · <a href="{{url_for('tutorial_monitor')}}" target="_blank">xem log / tiến độ</a></p>{% endif %}
+  {% if tutorial_history %}
+  <details><summary>Lịch sử gần đây</summary>
+    {% for h in tutorial_history %}<div class="release"><div><b>{{h.started_at}}</b><div class="label">{{h.message}}</div></div><span class="{{'ok' if h.status=='success' else 'run' if h.status=='warning' else 'bad'}}">{{h.status}}</span></div>{% endfor %}
+  </details>
+  {% endif %}
 </div>
 
 {# ESP Firmware Builder / ESP Tutorial moved to their own pages under
@@ -235,6 +326,25 @@
   runReleaseAction('qaReleaseLocalButton','{{url_for("qa_release_manager_deploy_local")}}','Đang deploy QA image release…','Local deploy failed',1200,'qaReleaseBuildStatus');
   runReleaseAction('qaReleaseTestButton','{{url_for("qa_release_manager_promote_test")}}','UPLOADING — Đang promote QA sang Test…','Promote Test failed',1500,'qaReleaseBuildStatus');
   wireProdButton('releaseProdButton','releaseBuildStatus','{{url_for("release_manager_promote_production")}}','Xác nhận triển khai PRODUCTION? Hành động này cần con người phê duyệt và không thể tự động hoàn tác.');
+  const qaPreflight=document.getElementById('qaPromotePreflightButton');
+  if(qaPreflight) qaPreflight.onclick=async()=>{
+    const status=document.getElementById('qaReleaseBuildStatus');
+    qaPreflight.disabled=true;if(status)status.textContent='Đang kiểm tra điều kiện Promote to Test…';
+    try{
+      const r=await fetch(((location.pathname==='/agent'||location.pathname.startsWith('/agent/'))?'/agent':'')+'/api/qa-release-manager/promote-test-preflight',{method:'POST',credentials:'same-origin',headers:{'X-CSRF-Token':CSRF,'X-Requested-With':'XMLHttpRequest'}});
+      const ct=(r.headers.get('content-type')||'').toLowerCase();
+      let d=null;
+      if(ct.includes('application/json')){
+        d=await r.json();
+      }else{
+        const body=(await r.text()).replace(/\s+/g,' ').trim().slice(0,300);
+        throw new Error('PREFLIGHT_INVALID_RESPONSE: HTTP '+r.status+'; expected JSON, got '+(ct||'unknown')+(body?' — '+body:''));
+      }
+      if(!r.ok)throw new Error((d.reason||d.error||'Preflight failed')+(d.next_action?' — '+d.next_action:'')+(d.detail?' — '+d.detail:''));
+      if(status)status.textContent=d.ready?'READY: Có thể Promote to Test.':'BLOCKED: '+(d.blocked_reason||'Chưa đủ điều kiện.')+' '+(d.next_action||'');
+      setTimeout(()=>location.reload(),250);
+    }catch(e){if(status)status.textContent='Preflight lỗi: '+e.message;qaPreflight.disabled=false;}
+  };
   wireProdButton('qaReleaseProdButton','qaReleaseBuildStatus','{{url_for("qa_release_manager_promote_production")}}','Xác nhận triển khai QA Center lên PRODUCTION? Hành động này cần con người phê duyệt và không thể tự động hoàn tác.');
   // Primary "Next Action" buttons: same underlying endpoints, chosen by the
   // server (Jinja next_action()) based on current pipeline state -- never

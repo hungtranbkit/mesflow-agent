@@ -16,6 +16,7 @@ from pathlib import Path
 import pytest
 
 REAL_SCRIPT = Path(__file__).resolve().parent.parent / "scripts" / "bump-version.sh"
+REAL_DOCTOR = Path(__file__).resolve().parent.parent / "scripts" / "version-doctor.sh"
 FILES = {
     "VERSION.txt": "{v}",
     "agent.py": 'AGENT_VERSION="{v}"\nOTHER_LINE=1\n',
@@ -37,6 +38,9 @@ def _seed(root: Path, version: str) -> None:
     script = root / "scripts" / "bump-version.sh"
     script.write_bytes(REAL_SCRIPT.read_bytes())
     script.chmod(0o755)
+    doctor = root / "scripts" / "version-doctor.sh"
+    doctor.write_bytes(REAL_DOCTOR.read_bytes())
+    doctor.chmod(0o755)
 
 
 def _run(root: Path, *args: str) -> subprocess.CompletedProcess:
