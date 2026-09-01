@@ -17,6 +17,11 @@ for f in agent.py VERSION.txt docker/Dockerfile; do
   [[ -f "$ROOT/$f" ]] || die "SOURCE_PREFLIGHT_FAILED: missing $f"
 done
 
+# One source of truth: refuse to build an inconsistent source tree. The
+# doctor is read-only in --check mode; it never mutates source during build.
+[[ -x "$ROOT/scripts/version-doctor.sh" ]] || die "VERSION_DOCTOR_MISSING: scripts/version-doctor.sh must exist and be executable"
+"$ROOT/scripts/version-doctor.sh" --check || die "VERSION_INCONSISTENT: run scripts/version-doctor.sh --repair before building"
+
 # --- 2. version validation ---
 agent_version="$(tr -d '[:space:]' < VERSION.txt)"
 [[ "$agent_version" == *-docker-runtime ]] || die "VERSION_INVALID: expected a *-docker-runtime version, got $agent_version"
@@ -48,7 +53,7 @@ fi
 # workflows exactly like this one.
 PYBIN="python3"
 [[ -x "$ROOT/.venv/bin/python" ]] && "$ROOT/.venv/bin/python" -c "import sys" >/dev/null 2>&1 && PYBIN="$ROOT/.venv/bin/python"
-"$PYBIN" -c "import pytest" >/dev/null 2>&1 || "$PYBIN" -m pip install --quiet pytest || die "PYTEST_INSTALL_FAILED: could not install pytest into $PYBIN"
+"$PYBIN" -m pip install --quiet -r "$ROOT/requirements.txt" pytest || die "TEST_DEPENDENCIES_FAILED: could not install requirements + pytest into $PYBIN"
 test_home="$(mktemp -d)"
 cleanup_test_home(){ rm -rf "$test_home"; }
 trap cleanup_test_home EXIT

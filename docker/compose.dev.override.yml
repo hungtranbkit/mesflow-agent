@@ -1,5 +1,7 @@
 services:
   mesflow-deploy-agent:
+    ports:
+      - "127.0.0.1:8090:8090"
     environment:
       SERVER_ROLE: DEV
       MESFLOW_BUILD_ENABLED: "1"

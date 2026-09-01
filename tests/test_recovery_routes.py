@@ -84,14 +84,28 @@ def test_get_routes_require_login(agent):
 
 
 def test_post_routes_require_login(agent):
-    # POST routes aren't in protect()'s exempt set (same as every other
-    # state-changing /api/ops/* route in this Agent) -- an unauthenticated
-    # request never reaches the handler at all; before_request redirects
-    # to /login first, matching e.g. /api/ops/docker-action's behavior.
+    # /api/ops/recovery/stack (bulk "restart everything") deliberately
+    # stays OUT of protect()'s exempt set -- Deploy Agent's own browser
+    # session only, no internal-token path, no MESFlow SUPER_ADMIN
+    # exposure for this one (task section: avoid exposing destructive
+    # actions unless there is a real operational need). before_request
+    # redirects an unauthenticated request before the handler even runs.
     client = agent.app.test_client()
-    for path in POST_ROUTES:
+    resp = client.post("/api/ops/recovery/stack", json={})
+    assert resp.status_code == 302
+
+    # start/restart/stop ARE now exempt from the blanket redirect (same as
+    # the read-only recovery GET routes) so MESFlow's SUPER_ADMIN System
+    # Console can reach them with the internal token instead of a Deploy
+    # Agent browser session -- the route body itself still requires
+    # logged_in() OR _internal_allowed(), so a bare unauthenticated request
+    # gets a real 401 JSON response, not a login redirect.
+    for path in ("/api/ops/recovery/services/postgres/start",
+                 "/api/ops/recovery/services/postgres/restart",
+                 "/api/ops/recovery/services/postgres/stop"):
         resp = client.post(path, json={})
-        assert resp.status_code == 302, path
+        assert resp.status_code == 401, path
+        assert resp.get_json()["error"] == "AUTH_REQUIRED"
 
 
 def test_post_routes_require_csrf(agent):
@@ -106,6 +120,49 @@ def test_get_routes_work_when_logged_in(agent):
     for path in GET_ROUTES:
         resp = client.get(path)
         assert resp.status_code == 200, (path, resp.get_json())
+
+
+def test_start_restart_stop_accept_the_internal_token_no_session_needed(agent, monkeypatch):
+    # MESFlow's SUPER_ADMIN System Console calls these three with
+    # X-MESFlow-Internal-Token instead of a Deploy Agent browser session
+    # (same shared-secret pattern api_ops_summary already used). No CSRF
+    # token is required on this path -- verify_csrf() only runs when
+    # logged_in() is true (a real session with a forgeable ambient cookie);
+    # a bearer secret in a custom header isn't subject to that threat model.
+    monkeypatch.setenv("MESFLOW_INTERNAL_API_TOKEN", "shared-test-token")
+    client = agent.app.test_client()
+    headers = {"X-MESFlow-Internal-Token": "shared-test-token"}
+    for path in ("/api/ops/recovery/services/postgres/start",
+                 "/api/ops/recovery/services/postgres/restart",
+                 "/api/ops/recovery/services/postgres/stop"):
+        resp = client.post(path, json={"actor": "mesflow-super-admin", "reason": "test"}, headers=headers)
+        assert resp.status_code == 200, (path, resp.get_json())
+        # the container genuinely doesn't exist (test-safe naming) -- the
+        # call must still be REAL (reach the orchestrator, get a real
+        # FAILED_TO_* outcome), not silently no-op into a fake success.
+        assert resp.get_json()["ok"] is False
+
+    audit_items = client.get("/api/ops/recovery/audit", headers=headers).get_json()["items"]
+    assert any(a["who"] == "mesflow-super-admin" for a in audit_items), audit_items
+
+
+def test_wrong_internal_token_is_rejected(agent, monkeypatch):
+    monkeypatch.setenv("MESFLOW_INTERNAL_API_TOKEN", "shared-test-token")
+    client = agent.app.test_client()
+    resp = client.post("/api/ops/recovery/services/postgres/restart", json={},
+                        headers={"X-MESFlow-Internal-Token": "wrong-token"})
+    assert resp.status_code == 401
+
+
+def test_stack_route_never_accepts_the_internal_token(agent, monkeypatch):
+    # Deliberate scope limit: the bulk "restart everything" action stays
+    # Deploy Agent console-only, unlike the three individual service
+    # actions above.
+    monkeypatch.setenv("MESFLOW_INTERNAL_API_TOKEN", "shared-test-token")
+    client = agent.app.test_client()
+    resp = client.post("/api/ops/recovery/stack", json={},
+                        headers={"X-MESFlow-Internal-Token": "shared-test-token"})
+    assert resp.status_code == 302  # still redirected by protect(), never reaches the handler
 
 
 def test_services_list_is_exactly_the_four_allowlisted_rows_in_order(agent):

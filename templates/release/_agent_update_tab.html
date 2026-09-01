@@ -1,38 +1,57 @@
+<div class="label" id="agentPackageEmptyState">Chưa build package nào nếu chưa có Latest package.</div>
 {% set tat=target_agents %}
 <div class="rel-card" id="agentPackageCard">
-  <div class="rel-current"><h3 style="margin:0">Deploy Agent Package</h3>
-  <button id="buildAgentPackageButton" class="btn btn-primary" type="button" {% if not mes_build_enabled %}disabled{% endif %}>Build Agent Package</button></div>
-  <p class="sub">Source preflight → version validation → tests → package build → SHA256 → manifest → immutable artifact. Định dạng ZIP giống hệt định dạng Bootstrap <code>/updater/update</code> đã kiểm tra/cài đặt (không đổi).</p>
-  <p><input id="agentBumpVersionTarget" type="text" placeholder="Để trống = tự +1 (vd 2.24.7)" style="width:240px" {% if not mes_build_enabled %}disabled{% endif %}>
-  <button id="agentBumpVersionButton" class="secondary btn" type="button" {% if not mes_build_enabled %}disabled{% endif %} title="Chỉ sửa VERSION.txt/agent.py/Dockerfile/compose/README/docs -- không build">Nâng version (chưa build)</button>
-  {% if agent_version_bump %}<span class="label"> · Lần nâng gần nhất: {{agent_version_bump.before}} → <b>{{agent_version_bump.after}}</b> ({{agent_version_bump.at}})</span>{% endif %}</p>
+  <div class="rel-current" style="align-items:flex-start;gap:12px">
+    <div>
+      <h3 style="margin:0">Deploy Agent Package</h3>
+      <p class="sub" style="margin:5px 0 0">Một luồng duy nhất: kiểm tra version → test → build image → đóng gói ZIP → SHA256. Không restart Agent hiện tại.</p>
+    </div>
+    <button id="buildAgentPackageButton" class="btn btn-primary" type="button" {% if not mes_build_enabled %}disabled{% endif %}>Build &amp; Pack Agent</button>
+  </div>
+
+  <div class="row" style="margin-top:12px">
+    <span><b>Source version:</b> {{agent_source_version or '—'}}</span>
+    <span><b>Runtime version:</b> {{agent_version or '—'}}</span>
+  </div>
+
+  <details style="margin-top:10px">
+    <summary class="label">Đổi version trước khi build</summary>
+    <p style="margin-top:8px"><input id="agentBumpVersionTarget" type="text" placeholder="Để trống = tự +1" style="width:220px" {% if not mes_build_enabled %}disabled{% endif %}>
+    <button id="agentBumpVersionButton" class="secondary btn" type="button" {% if not mes_build_enabled %}disabled{% endif %}>Nâng version</button>
+    {% if agent_version_bump %}<span class="label"> · {{agent_version_bump.before}} → <b>{{agent_version_bump.after}}</b> ({{agent_version_bump.at}})</span>{% endif %}</p>
+    <p class="label">Version Doctor sẽ chặn build nếu VERSION.txt / agent.py / Docker / Compose không đồng nhất.</p>
+  </details>
+
   {% if latest_agent_release and latest_agent_release.package_exists %}
-  <div class="row">
-    <span><b>Phiên bản mới nhất:</b> {{latest_agent_release.version}}</span>
-    <span><b>Build lúc:</b> {{latest_agent_release.built_at or '—'}}</span>
-    <span><b>Kích thước:</b> {{'%.1f'|format((latest_agent_release.package_size or 0)/1048576)}} MB</span>
+  <div style="margin-top:14px;padding:12px;border:1px solid var(--ops-line);border-radius:10px">
+    <div class="row">
+      <span><b>Latest package:</b> {{latest_agent_release.version}}</span>
+      <span><b>Built:</b> {{latest_agent_release.built_at or '—'}}</span>
+      <span><b>Size:</b> {{'%.1f'|format((latest_agent_release.package_size or 0)/1048576)}} MB</span>
+    </div>
+    <p style="margin:8px 0 3px"><b>File:</b> <code>{{latest_agent_release.package.split('/')[-1]}}</code></p>
+    <p class="label" style="margin:3px 0"><b>Artifact path trên DEV:</b></p>
+    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+      <code id="agentArtifactPath" style="word-break:break-all">{{latest_agent_release.package}}</code>
+      <button id="copyAgentArtifactPath" class="secondary btn" type="button">Copy path</button>
+    </div>
+    <p class="label" style="margin-top:7px"><b>SHA256:</b> <span class="ops-id">{{latest_agent_release.package_sha256 or '—'}}</span></p>
+    <div class="row" style="margin-top:10px;gap:8px">
+      <a class="btn btn-primary" href="{{url_for('release_manager_agent_package_download')}}">Download ZIP</a>
+      <a class="secondary btn" href="{{bootstrap_open_url}}" target="_blank" rel="noopener">Mở Bootstrap :8098</a>
+    </div>
+    <p class="label" style="margin-top:8px">Để cập nhật Agent LOCAL: Download ZIP → mở Bootstrap → Agent Update → upload đúng ZIP này. Bootstrap chỉ verify/install/restart; không bump version và không sửa source.</p>
   </div>
-  <div class="row">
-    <span><b>Image digest:</b> <span class="ops-id">{{(latest_agent_release.image_digest or '')[:19]}}…</span></span>
-    <span><b>Source commit:</b> <span class="ops-id">{{(latest_agent_release.source_commit or '')[:12]}}</span></span>
-  </div>
-  <p class="label" style="margin-top:6px"><b>SHA256:</b> <span class="ops-id">{{latest_agent_release.package_sha256 or '—'}}</span></p>
-  <p style="margin-top:8px"><a class="btn secondary" href="{{url_for('release_manager_agent_package_download')}}">Download package</a></p>
   {% else %}
-  <div class="empty-state">Chưa build package nào. Bấm "Build Agent Package" để tạo artifact đầu tiên.</div>
+  <div class="empty-state" style="margin-top:12px">Chưa có artifact. Bấm <b>Build &amp; Pack Agent</b>; khi hoàn tất, file ZIP + SHA256 + đường dẫn sẽ hiện ngay tại đây.</div>
   {% endif %}
+
+  <div id="releaseBuildStatus" class="label upload-state" aria-live="polite" style="margin-top:10px"></div>
   {% if agent_package_build_job %}
   {% set apb_done = agent_package_build_job.status in ['SUCCESS','FAILED'] %}
+  {% set apb_historical = agent_package_build_job.version and agent_package_build_job.version != agent_source_version %}
   <div class="{{'' if apb_done else 'rel-inprogress'}}" style="margin-top:10px;padding-top:10px;border-top:1px solid var(--ops-line)">
-    <p><b>{{agent_package_build_job.status}}</b> — {{agent_package_build_job.message}}</p>
-    {# Honest pipeline explainer, not a fake live progress bar: BUILDING covers
-       source preflight/version validation/tests/docker build/SHA256/manifest
-       all inside this one job; a push afterwards (below) goes through
-       Bootstrap's single synchronous /updater/update call, which itself does
-       verify → install → restart → health check → version check and returns
-       one final PASS/FAILED/ROLLED_BACK -- Bootstrap does not expose
-       intermediate progress for that call, so this Agent cannot show it live
-       without inventing numbers it doesn't have. #}
+    <p><b>{{agent_package_build_job.status}}</b> — {{agent_package_build_job.message}}{% if apb_historical %} · <b>HISTORICAL</b> ({{agent_package_build_job.version}}; current {{agent_source_version}}){% endif %}</p>
     {% if agent_package_build_job.log_tail %}<details><summary>Xem build log</summary><pre>{{agent_package_build_job.log_tail}}</pre></details>{% endif %}
   </div>
   {% endif %}
@@ -42,8 +61,6 @@
   <div class="rel-current"><h3 style="margin:0">Target Agents</h3>
   <button id="targetAgentsButton" class="secondary btn" type="button">Làm mới</button></div>
   <p class="sub">Dùng chung cho MESFlow và QA Center. Đăng ký/khoẻ mạnh của từng Agent đích.</p>
-  <div id="releaseBuildStatus" class="label upload-state" aria-live="polite"></div>
-
   {% if tat and tat.rows %}
   {% for row in tat.rows %}
   {# Real bug found+fixed (reports/RELEASE_DEPLOY_UX_CLEANUP.md): role used
@@ -140,7 +157,18 @@
     };
   }
   runReleaseAction('targetAgentsButton','{{url_for("release_manager_target_agents")}}','Đang kiểm tra Target Agents…','Refresh failed',700);
-  runReleaseAction('buildAgentPackageButton','{{url_for("release_manager_build_agent_package")}}','Đang build Agent package (source preflight → version validation → tests → build → SHA256 → manifest)…','Build failed',1500);
+  runReleaseAction('buildAgentPackageButton','{{url_for("release_manager_build_agent_package")}}','Đang Build & Pack Agent: Version Doctor → tests → Docker image → ZIP → SHA256…','Build failed',1500);
+
+  const copyArtifactButton=document.getElementById('copyAgentArtifactPath');
+  if(copyArtifactButton){
+    copyArtifactButton.onclick=async()=>{
+      const text=(document.getElementById('agentArtifactPath')?.textContent||'').trim();
+      if(!text)return;
+      try{ await navigator.clipboard.writeText(text); copyArtifactButton.textContent='Đã copy'; }
+      catch(_err){ window.prompt('Copy artifact path:',text); }
+      window.setTimeout(()=>{copyArtifactButton.textContent='Copy path'},1200);
+    };
+  }
   (function(){
     // Same shape as Release Deploy's MESFlow/QA Center "Nâng version" --
     // only edits VERSION.txt/agent.py/Dockerfile/compose/README/docs via
@@ -231,3 +259,81 @@
   if(location.hash==='#securitySettings'){document.getElementById('securitySettings')?.scrollIntoView({block:'start'})}
 })();
 </script>
+
+
+{% if false %}{# Superseded duplicate card; canonical card and endpoints are above. #}
+<!-- AGENT PACKAGE COMPLETE UI v1 -->
+<section class="release-card" id="agentPackageCompleteCard" style="margin-top:16px">
+  <h3>Deploy Agent Package</h3>
+  <p class="muted">Build trên DEV → tạo ZIP immutable → tải ZIP để Bootstrap cài/update. Bootstrap không build source.</p>
+  <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px;margin:12px 0">
+    <div><b>Source version</b><div id="agentPkgSourceVersion">—</div></div>
+    <div><b>Runtime version</b><div id="agentPkgRuntimeVersion">—</div></div>
+    <div><b>Trạng thái</b><div id="agentPkgState">Đang đọc…</div></div>
+  </div>
+  <div id="agentPkgEmpty" class="muted">Chưa build package nào.</div>
+  <div id="agentPkgDetails" style="display:none">
+    <p><b>Latest package:</b> <span id="agentPkgFilename">—</span></p>
+    <p><b>Artifact path:</b> <code id="agentPkgPath">—</code></p>
+    <p><b>SHA256:</b> <code id="agentPkgSha">—</code></p>
+    <p><b>Built:</b> <span id="agentPkgBuilt">—</span> · <b>Size:</b> <span id="agentPkgSize">—</span></p>
+    <div style="display:flex;gap:8px;flex-wrap:wrap">
+      <a id="agentPkgDownload" class="btn btn-primary" href="/api/agent-package/download">Download ZIP cho Bootstrap</a>
+      <button id="agentPkgCopyPath" class="secondary btn" type="button">Copy path</button>
+      <button id="agentPkgCopySha" class="secondary btn" type="button">Copy SHA256</button>
+      <a id="agentPkgBootstrap" class="secondary btn" href="#" target="_blank" rel="noopener" style="display:none">Mở Bootstrap</a>
+    </div>
+    <p id="agentPkgBootstrapHint" class="muted" style="margin-top:8px"></p>
+  </div>
+</section>
+<script>
+(()=>{
+  const byId=id=>document.getElementById(id);
+  async function loadAgentPackage(){
+    const state=byId('agentPkgState');
+    try{
+      const r=await fetch('/api/agent-package/latest',{credentials:'same-origin',headers:{'X-Requested-With':'XMLHttpRequest'}});
+      const ct=(r.headers.get('content-type')||'').toLowerCase();
+      if(!ct.includes('application/json')){
+        const body=(await r.text()).replace(/\s+/g,' ').trim().slice(0,220);
+        throw new Error('HTTP '+r.status+' expected JSON, got '+(ct||'unknown')+(body?' — '+body:''));
+      }
+      const d=await r.json();
+      if(!r.ok||!d.ok) throw new Error(d.error||'Không đọc được Agent package');
+      byId('agentPkgSourceVersion').textContent=d.source_version||'—';
+      byId('agentPkgRuntimeVersion').textContent=d.runtime_version||'—';
+      const p=d.package;
+      if(!p){
+        state.textContent='CHƯA BUILD';
+        byId('agentPkgEmpty').style.display='';
+        byId('agentPkgDetails').style.display='none';
+        return;
+      }
+      state.textContent='PACKAGE VERIFIED';
+      byId('agentPkgEmpty').style.display='none';
+      byId('agentPkgDetails').style.display='';
+      byId('agentPkgFilename').textContent=p.filename||'—';
+      byId('agentPkgPath').textContent=p.path||'—';
+      byId('agentPkgSha').textContent=p.sha256||'—';
+      byId('agentPkgBuilt').textContent=p.built_at||'—';
+      byId('agentPkgSize').textContent=(p.size_mb==null?'—':p.size_mb+' MB');
+      byId('agentPkgCopyPath').onclick=async()=>{await navigator.clipboard.writeText(p.path||'');byId('agentPkgCopyPath').textContent='Đã copy path';};
+      byId('agentPkgCopySha').onclick=async()=>{await navigator.clipboard.writeText(p.sha256||'');byId('agentPkgCopySha').textContent='Đã copy SHA256';};
+      if(d.bootstrap_url){
+        const a=byId('agentPkgBootstrap'); a.href=d.bootstrap_url; a.style.display='';
+        byId('agentPkgBootstrapHint').textContent='Bootstrap: '+d.bootstrap_url;
+      }else{
+        byId('agentPkgBootstrapHint').textContent='Chưa cấu hình MESFLOW_BOOTSTRAP_URL. Có thể Download ZIP rồi upload vào Bootstrap.';
+      }
+    }catch(e){
+      state.textContent='ERROR';
+      byId('agentPkgBootstrapHint').textContent='Không đọc được package: '+e.message;
+    }
+  }
+  loadAgentPackage();
+  const b=byId('buildAgentPackageButton');
+  if(b) b.addEventListener('click',()=>setTimeout(loadAgentPackage,1500));
+  window.addEventListener('focus',loadAgentPackage);
+})();
+</script>
+{% endif %}
