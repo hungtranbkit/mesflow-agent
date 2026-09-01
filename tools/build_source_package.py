@@ -13,7 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 VERSION = (ROOT / "VERSION.txt").read_text(encoding="utf-8").strip()
 OUTPUT = Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else (ROOT.parent / "artifacts" / "deploy-agent" / "source" / f"mesflow-deploy-agent-source-{VERSION}.zip")
 PREFIX = f"mesflow-deploy-agent-source-{VERSION}"
-EXCLUDED_DIRS = {".git", ".venv", ".pytest_cache", ".mypy_cache", ".ruff_cache", "__pycache__", "node_modules", "dist", "build", "runtime", "artifacts", "logs", "tmp", "temp", "test-results", "playwright-report", "htmlcov"}
+EXCLUDED_DIRS = {".git", ".venv", ".test-venv", ".pytest_cache", ".mypy_cache", ".ruff_cache", "__pycache__", "node_modules", "dist", "build", "runtime", "artifacts", "logs", "tmp", "temp", "test-results", "playwright-report", "htmlcov"}
 EXCLUDED_SUFFIXES = {".pyc", ".pyo", ".log", ".db", ".sqlite", ".sqlite3", ".tar", ".zip", ".coverage"}
 SECRET_NAMES = {".env", "id_rsa", "id_ed25519", "credentials.json"}
 SECRET_SUFFIXES = {".pem", ".key", ".p12", ".pfx"}

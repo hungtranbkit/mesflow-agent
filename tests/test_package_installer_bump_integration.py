@@ -13,7 +13,7 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
-IGNORE = shutil.ignore_patterns(".venv", "__pycache__", ".git", "*.pyc", "node_modules", "runtime", "artifacts")
+IGNORE = shutil.ignore_patterns(".venv", ".test-venv", "__pycache__", ".pytest_cache", ".git", "*.pyc", "node_modules", "runtime", "artifacts")
 
 
 @pytest.fixture()

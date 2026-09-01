@@ -18,7 +18,18 @@ def _seed_source(root, version):
     (root / "app" / "mesflow").mkdir(parents=True, exist_ok=True)
     (root / "scripts").mkdir(parents=True, exist_ok=True)
     (root / "VERSION.txt").write_text(version)
-    (root / "app" / "mesflow" / "__init__.py").write_text(f"__version__='{version}'\n")
+    # Mirrors the real app/mesflow/__init__.py mechanism: __version__ is read
+    # dynamically from VERSION.txt at import time, not a hardcoded literal
+    # (see that file's own docstring). scripts/bump-version.sh's
+    # sync_and_verify() only checks the _VERSION_FILE marker stays intact;
+    # it never rewrites this file -- a static literal here always fails
+    # that check regardless of which version was bumped to.
+    (root / "app" / "mesflow" / "__init__.py").write_text(
+        "import os\n"
+        "_VERSION_FILE = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'VERSION.txt')\n"
+        "with open(_VERSION_FILE) as _f:\n"
+        "    __version__ = _f.read().strip()\n"
+    )
     (root / "release.json").write_text(json.dumps({"name": "MESFlow", "version": version, "phase": "x"}, indent=2) + "\n")
     (root / "compose.yml").write_text(f"services:\n  mesflow-app:\n    image: ${{MESFLOW_IMAGE:-mesflow-app:{version}}}\n")
     shutil.copy(REAL_SCRIPT, root / "scripts" / "bump-version.sh")
@@ -55,7 +66,9 @@ class VersionBumpTests(unittest.TestCase):
         self.assertEqual(entry["before"], "1.0.0.1")
         self.assertEqual(entry["after"], "1.0.0.2")
         self.assertEqual((self.src / "VERSION.txt").read_text().strip(), "1.0.0.2")
-        self.assertIn("__version__='1.0.0.2'", (self.src / "app" / "mesflow" / "__init__.py").read_text())
+        # __init__.py is deliberately never rewritten (it reads VERSION.txt
+        # dynamically); only its dynamic-read marker is required to survive.
+        self.assertIn("_VERSION_FILE", (self.src / "app" / "mesflow" / "__init__.py").read_text())
         self.assertIn('"version": "1.0.0.2"', (self.src / "release.json").read_text())
         self.assertIn("mesflow-app:1.0.0.2", (self.src / "compose.yml").read_text())
         # Never touches anything build-related.
