@@ -29,3 +29,11 @@ docker/.env
 .env
 .env.*
 !.env.example
+
+# Backup/scratch files that occasionally get swept into a commit by
+# accident -- never legitimate tracked source (see mesflow/AGENTS.md
+# RULE 8, and reports/RECONCILE_deploy_agent_20260901_192604.md for the
+# incident that motivated this).
+*.zip
+*.before-*
+.version-hardening-backup-*/
