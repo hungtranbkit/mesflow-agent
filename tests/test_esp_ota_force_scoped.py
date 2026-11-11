@@ -467,3 +467,34 @@ def test_list_targets_pagination_and_totals_include_blocked_offline(ota):
     page3 = ota.list_targets(A, batch_id=batch["batch_id"], page=3, per_page=10)
     assert page1["total"] == 26 and len(page1["items"]) == 10 and len(page3["items"]) == 6
     assert ota.list_targets(A, status="BLOCKED")["total"] == 1
+
+
+# ---------------------------------------------------------------- resources
+def _open_fds():
+    return len(os.listdir("/proc/self/fd"))
+
+
+@pytest.mark.skipif(not os.path.isdir("/proc/self/fd"), reason="needs /proc FD table")
+def test_store_calls_do_not_leak_file_descriptors(ota):
+    rel = _release(ota)
+    _bound(ota, A, [device("K", profile_id=M910["profile_id"])])
+    ota.create_batch(A, rel["release_id"], force=True)
+    for _ in range(3):  # warm-up
+        _check(ota, "K", profile_id=M910["profile_id"]); ota.list_releases(); ota.list_fleet(A)
+    before = _open_fds()
+    for _ in range(200):
+        _check(ota, "K", profile_id=M910["profile_id"])
+        ota.list_releases(); ota.list_fleet(A); ota.list_targets(A); ota.bound_instance(); ota.list_jobs()
+    assert _open_fds() - before <= 2
+
+
+def test_connect_rolls_back_on_error_and_commits_on_success(ota):
+    with pytest.raises(RuntimeError):
+        with ota._connect() as c:
+            c.execute("INSERT INTO ota2_meta(key,value,updated_at) VALUES('probe','x',0)")
+            raise RuntimeError("boom")
+    with ota._connect() as c:
+        assert c.execute("SELECT COUNT(*) FROM ota2_meta WHERE key='probe'").fetchone()[0] == 0
+        c.execute("INSERT INTO ota2_meta(key,value,updated_at) VALUES('probe','y',0)")
+    with ota._connect() as c:
+        assert c.execute("SELECT value FROM ota2_meta WHERE key='probe'").fetchone()[0] == "y"

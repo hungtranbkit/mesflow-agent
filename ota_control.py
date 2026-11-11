@@ -9,6 +9,7 @@ to devices.  There is still no draft/activate/stage/canary model.
 """
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import io
 import json
@@ -34,10 +35,22 @@ def readiness_allows_update(readiness):
 
 
 def _now(): return time.time()
+@contextlib.contextmanager
 def _connect():
+    """Short-lived connection: commit on success, rollback on error, ALWAYS close.
+
+    sqlite3.Connection's own context manager only commits/rolls back and
+    leaves the file (plus WAL/SHM handles) open, which leaked ~5 FDs per call
+    and exhausted RLIMIT_NOFILE=1024 under normal polling.
+    """
     OTA_ROOT.mkdir(parents=True, exist_ok=True); ARTIFACT_ROOT.mkdir(parents=True, exist_ok=True)
     c = sqlite3.connect(OTA_DB, timeout=15); c.row_factory = sqlite3.Row
-    c.execute("PRAGMA journal_mode=WAL"); return c
+    try:
+        c.execute("PRAGMA journal_mode=WAL")
+        with c:  # transaction: commit / rollback
+            yield c
+    finally:
+        c.close()
 def _row(row): return dict(row) if row else None
 def _version_key(value):
     nums = re.findall(r"\d+", str(value or "")); return tuple(int(x) for x in nums) if nums else (0,)
