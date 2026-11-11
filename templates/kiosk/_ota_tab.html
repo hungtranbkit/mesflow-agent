@@ -1,75 +1,176 @@
-<section class="kiosk-card">
-  <h3>Thiết bị</h3>
-  <p class="sub">Chọn kiosk online để tạo OTA job. Version, build và hardware được xác minh từ manifest trong ZIP.</p>
-  <div id="devices" class="device-list">Đang tải thiết bị…</div>
+<style>
+.ota-grid{display:grid;gap:12px}
+.ota-row{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+.ota-kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:8px}
+.ota-kpi{border:1px solid var(--ops-border,#ddd);border-radius:8px;padding:8px}
+.ota-kpi b{display:block;font-size:1.3em}
+.ota-table-wrap{overflow-x:auto;max-width:100%}
+.ota-table{width:100%;border-collapse:collapse;font-size:.92em}
+.ota-table th,.ota-table td{padding:6px 8px;border-bottom:1px solid var(--ops-border,#e5e5e5);text-align:left;vertical-align:top}
+.ota-muted{color:var(--ops-muted,#666);font-size:.9em}
+.ota-filters select,.ota-filters input{min-width:0;max-width:100%}
+.ota-danger{background:#b42318;color:#fff;border:0}
+@media (max-width:640px){.ota-table thead{display:none}.ota-table tr{display:block;border-bottom:1px solid var(--ops-border,#ddd);padding:6px 0}.ota-table td{display:flex;justify-content:space-between;gap:8px;border:0;padding:2px 4px}.ota-table td::before{content:attr(data-l);font-weight:600}}
+</style>
+
+<section class="kiosk-card ota-grid">
+  <div>
+    <h3>ESP OTA — MESFlow này</h3>
+    <p class="ota-muted" id="scopeLine">Đang xác định instance…</p>
+    <p class="ota-muted">Chỉ ESP Kiosk thuộc instance hiện tại. Không áp dụng cho PC (M910/HP/Dell) và không ảnh hưởng MESFlow của domain/khách hàng khác.</p>
+  </div>
+  <div class="ota-kpis" id="kpis"></div>
 </section>
 
-<section class="kiosk-card">
-  <h3>Phát hành OTA</h3>
-  <form id="flashForm">
-    <label for="firmware">OTA package (.zip)</label>
-    <input id="firmware" name="firmware" type="file" accept=".zip" required>
-    <p style="color:var(--ops-muted)">Version, build và hardware được xác minh từ manifest trong ZIP.</p>
-    <button type="submit" class="btn btn-primary">Tạo OTA job cho kiosk đã chọn</button>
+<section class="kiosk-card ota-grid">
+  <h3>1. Bản phát hành</h3>
+  <form id="releaseForm" class="ota-row">
+    <input id="package" name="package" type="file" accept=".zip" required>
+    <button type="submit" class="btn">Tải lên &amp; kiểm tra</button>
   </form>
+  <p class="ota-muted">Gói release (.ota.zip từ scripts/build-ota-release.sh): mỗi profile phần cứng một app.bin. Agent tự kiểm chip/app header/SHA256/identity/slot; từ chối merged/full-flash.</p>
+  <div class="ota-row"><label for="releaseSel">Release đích</label><select id="releaseSel"></select></div>
+  <div id="releaseInfo" class="ota-muted"></div>
+</section>
+
+<section class="kiosk-card ota-grid">
+  <h3>2. Xem trước &amp; cập nhật</h3>
+  <div class="ota-row">
+    <button id="forceAll" class="btn ota-danger" type="button">Cập nhật bắt buộc tất cả ESP của MESFlow này</button>
+    <button id="forceSel" class="btn" type="button">Cập nhật máy đã chọn</button>
+  </div>
+  <div id="preview" class="ota-muted">Chọn release để xem trước.</div>
+</section>
+
+<section class="kiosk-card ota-grid">
+  <h3>Thiết bị &amp; tiến trình</h3>
+  <div class="ota-row ota-filters">
+    <input id="fq" placeholder="Tìm tên/trạm/ID">
+    <select id="fOnline"><option value="">Online+Offline</option><option value="1">Online</option><option value="0">Offline</option></select>
+    <select id="fProfile"><option value="">Mọi profile</option></select>
+    <select id="fVersion"><option value="">Mọi version</option></select>
+    <select id="fStation"><option value="">Mọi trạm</option></select>
+    <select id="fStatus"><option value="">Mọi trạng thái</option></select>
+  </div>
+  <div class="ota-row">
+    <label><input type="checkbox" id="selAll"> Chọn tất cả (theo bộ lọc)</label>
+    <select id="assignProfile"><option value="">Gán profile cho máy đã chọn…</option></select>
+    <button id="assignBtn" class="btn" type="button">Gán profile</button>
+    <button id="retryBtn" class="btn" type="button">Thử lại máy lỗi/bị chặn</button>
+    <span id="selCount" class="ota-muted"></span>
+  </div>
+  <div class="ota-table-wrap"><table class="ota-table"><thead><tr>
+    <th></th><th>Tên</th><th>Trạm</th><th>Profile</th><th>Version hiện tại → đích</th><th>Last seen</th><th>Trạng thái</th><th>Tiến trình</th><th>Lần thử</th><th>Lỗi / lý do chờ</th>
+  </tr></thead><tbody id="rows"></tbody></table></div>
+  <div class="ota-row"><button id="prev" class="btn" type="button">‹</button><span id="pageInfo" class="ota-muted"></span><button id="next" class="btn" type="button">›</button></div>
   <div id="message" class="kiosk-card" hidden></div>
 </section>
 
-<section class="kiosk-card">
-  <h3>OTA jobs gần đây</h3>
-  <div id="jobs">Chưa có job.</div>
-</section>
-
 <script>
-{# Device list / flash form / job list logic carried over unchanged from
-   the old combined kiosk.html page (task: ESP_KIOSK_UI_SEPARATION) --
-   same endpoints (/api/esp-ota/devices, /api/esp-ota/jobs,
-   /api/esp-ota/upload, /api/esp-ota/jobs/<id>/cancel), same polling
-   cadence. Backend OTA logic is untouched; only the page this lives on
-   moved. #}
-async function loadDevices(){
-  const r=await fetch(SCRIPT_ROOT+'/api/esp-ota/devices');
-  const d=await r.json();
-  if(!r.ok)throw Error(friendlyError(d.error));
-  const items=d.items||[];
-  devices.innerHTML=items.map(x=>`<label class="device ${x.online?'':'offline'}"><input type="checkbox" value="${esc(x.kiosk_id)}" ${x.online?'':'disabled'}><span><b>${esc(x.kiosk_name||x.kiosk_id)}</b><small>${esc(x.kiosk_id)} · ${x.online?'ONLINE':'OFFLINE'} · firmware ${esc(x.firmware_version||'không rõ')}</small></span></label>`).join('')||'<p>Chưa có kiosk được cấu hình.</p>';
+const OTA_STATUSES=['QUEUED','WAITING_OFFLINE','WAITING_SAFE_POINT','DOWNLOADING','FLASHING','REBOOTING','VERIFYING','SUCCESS','FAILED','BLOCKED','CANCELLED','SKIPPED'];
+const STATUS_VI={QUEUED:'Chờ',WAITING_OFFLINE:'Chờ online',WAITING_SAFE_POINT:'Chờ điểm an toàn',DOWNLOADING:'Đang tải',FLASHING:'Đang ghi',REBOOTING:'Đang khởi động lại',VERIFYING:'Đang xác minh boot',SUCCESS:'Thành công (đã boot)',FAILED:'Lỗi',BLOCKED:'Bị chặn',CANCELLED:'Đã hủy',SKIPPED:'Bỏ qua (cùng artifact)',NONE:'Không có job'};
+const PROGRESS={QUEUED:0,WAITING_OFFLINE:0,WAITING_SAFE_POINT:5,DOWNLOADING:30,FLASHING:70,REBOOTING:85,VERIFYING:95,SUCCESS:100};
+let state={fleet:[],targets:{},releases:[],profiles:[],page:1,per:25,selected:new Set(),preview:null};
+fStatus.innerHTML+=OTA_STATUSES.concat(['NONE']).map(s=>`<option value="${s}">${esc(STATUS_VI[s])}</option>`).join('');
+function msg(t){message.hidden=!t;message.textContent=t||''}
+function badge(s){return `<span class="ops-badge ${s==='SUCCESS'?'pass':['FAILED','BLOCKED'].includes(s)?'failed':'warning'}">${esc(STATUS_VI[s]||s)}</span>`}
+async function api(path,opt={}){
+  const o={...opt,headers:{...(opt.headers||{}),'X-CSRF-Token':CSRF}};
+  if(o.json){o.body=JSON.stringify(o.json);o.headers['Content-Type']='application/json';delete o.json}
+  const r=await fetch(SCRIPT_ROOT+path,o);let d={};try{d=await r.json()}catch(e){}
+  if(!r.ok&&r.status!==409)throw Error(friendlyError(d.error)||d.error||('HTTP '+r.status));
+  return {ok:r.ok,status:r.status,d};
 }
-async function cancelJob(id){
-  if(!confirm('Hủy OTA job này?'))return;
-  await fetch(SCRIPT_ROOT+'/api/esp-ota/jobs/'+encodeURIComponent(id)+'/cancel',{method:'POST',headers:{'X-CSRF-Token':CSRF}});
-  await loadJobs();
+async function loadOverview(){
+  const {d}=await api('/api/esp-ota/overview');
+  if(!d.ok){scopeLine.textContent='Không xác định được instance: '+(d.error||'');return}
+  const c=d.config;
+  scopeLine.innerHTML=`Instance <b>${esc(c.instance_name||'')}</b> <code>${esc(c.instance_id)}</code> · ${esc(c.mesflow_public_url||'')}${d.warning?` · <b>${esc(d.warning)}</b> (chỉ đọc)`:''}`;
+  state.fleet=d.fleet.items||[];state.releases=d.releases||[];state.profiles=d.profiles||[];
+  const keep=releaseSel.value;
+  releaseSel.innerHTML='<option value="">— chọn release —</option>'+state.releases.map(r=>`<option value="${esc(r.release_id)}">${esc(r.version)} · ${esc(r.build_id)} · ${r.artifacts.length} profile</option>`).join('');
+  if(keep)releaseSel.value=keep;
+  assignProfile.innerHTML='<option value="">Gán profile cho máy đã chọn…</option><option value="__clear__">(xóa gán tay)</option>'+state.profiles.map(p=>`<option value="${esc(p.profile_id)}">${esc(p.profile_id)}</option>`).join('');
+  const uniq=(k)=>[...new Set(state.fleet.map(x=>x[k]).filter(Boolean))].sort();
+  for(const [sel,k] of [[fProfile,'effective_profile'],[fVersion,'firmware_version'],[fStation,'station_code']]){const v=sel.value;sel.innerHTML=sel.options[0].outerHTML+uniq(k).map(x=>`<option>${esc(x)}</option>`).join('');sel.value=v}
 }
-function drawJob(j){
-  const active=!['SUCCESS','FAILED','CANCELLED'].includes(j.status);
-  return `<div class="ota-job"><b>${esc(j.version)} · ${esc(j.id.slice(0,8))}</b> <span class="ops-badge ${j.status==='SUCCESS'?'pass':j.status==='FAILED'?'failed':'warning'}">${esc(j.status)}</span>${active?` <button onclick="cancelJob('${esc(j.id)}')">Hủy job</button>`:''}${(j.devices||[]).map(x=>`<div class="ota-device"><b>${esc(x.kiosk_id)}</b> — ${esc(x.status)}${x.error?` · ${esc(x.error)}`:''}</div>`).join('')}</div>`;
+async function loadTargets(){
+  const {d}=await api('/api/esp-ota/targets?per_page=200');
+  const latest={};for(const t of d.items||[]){if(!latest[t.kiosk_id])latest[t.kiosk_id]=t}
+  state.targets=latest;
 }
-async function loadJobs(){
-  const r=await fetch(SCRIPT_ROOT+'/api/esp-ota/jobs');
-  if(!r.ok)return;
-  const d=await r.json();
-  const items=d.items||[];
-  jobs.innerHTML=items.map(drawJob).join('')||'<p>Chưa có OTA job.</p>';
+function filtered(){
+  const q=fq.value.trim().toLowerCase();
+  return state.fleet.filter(x=>{const t=state.targets[x.kiosk_id];const st=t?t.status:'NONE';
+    return (!q||[x.kiosk_name,x.kiosk_id,x.station_code].join(' ').toLowerCase().includes(q))&&(!fOnline.value||String(x.online?1:0)===fOnline.value)
+      &&(!fProfile.value||x.effective_profile===fProfile.value)&&(!fVersion.value||x.firmware_version===fVersion.value)
+      &&(!fStation.value||x.station_code===fStation.value)&&(!fStatus.value||st===fStatus.value)});
 }
-flashForm.addEventListener('submit',async e=>{
-  e.preventDefault();
-  const ids=[...document.querySelectorAll('#devices input:checked')].map(x=>x.value);
-  if(!ids.length){message.hidden=false;message.textContent='Chọn ít nhất một kiosk online.';return}
-  const submit=e.submitter;
-  submit.disabled=true;submit.textContent='Đang upload và tạo job…';
-  const fd=new FormData(e.target);
-  fd.set('kiosk_ids',JSON.stringify(ids));
-  message.hidden=false;message.textContent='Đang kiểm tra manifest…';
-  try{
-    const r=await fetch(SCRIPT_ROOT+'/api/esp-ota/upload',{method:'POST',body:fd,headers:{'X-CSRF-Token':CSRF}});
-    const d=await r.json();
-    message.textContent=r.ok?`Đã tạo job ${d.job.id.slice(0,8)} cho firmware ${d.job.version}.`:friendlyError(d.error);
-    if(r.ok){e.target.reset();await loadJobs()}
-  }finally{
-    submit.disabled=false;submit.textContent='Tạo OTA job cho kiosk đã chọn';
-  }
-});
-loadDevices().catch(e=>{message.hidden=false;message.textContent=e.message});
-loadJobs();
-setInterval(loadJobs,3000);
-setInterval(()=>loadDevices().catch(()=>{}),15000);
+function render(){
+  const list=filtered();const pages=Math.max(1,Math.ceil(list.length/state.per));state.page=Math.min(state.page,pages);
+  const rows=list.slice((state.page-1)*state.per,state.page*state.per);
+  const rows_html=rows.map(x=>{const t=state.targets[x.kiosk_id];const st=t?t.status:'NONE';const pr=t?(PROGRESS[t.status]??''):'';
+    return `<tr><td data-l="Chọn"><input type="checkbox" data-id="${esc(x.kiosk_id)}" ${state.selected.has(x.kiosk_id)?'checked':''}></td>
+    <td data-l="Tên"><b>${esc(x.kiosk_name||x.kiosk_id)}</b><div class="ota-muted">${esc(x.kiosk_id)} · ${x.online?'ONLINE':'OFFLINE'}</div></td>
+    <td data-l="Trạm">${esc(x.station_code||'')}</td>
+    <td data-l="Profile">${esc(x.effective_profile||'—')}${x.profile_issue?`<div class="ota-muted">${esc(x.profile_issue)}</div>`:''}</td>
+    <td data-l="Version">${esc(x.firmware_version||'?')} → ${esc(t?t.target_version||'—':'—')}</td>
+    <td data-l="Last seen">${esc(x.last_seen_at||'')}</td>
+    <td data-l="Trạng thái">${badge(st)}</td>
+    <td data-l="Tiến trình">${pr===''?'':pr+'%'}</td>
+    <td data-l="Lần thử">${t?esc(t.attempt):''}</td>
+    <td data-l="Lỗi/chờ">${t?esc([t.error,t.wait_reason].filter(Boolean).join(' · ')):''}</td></tr>`}).join('');
+  document.getElementById('rows').innerHTML=rows_html||'<tr><td colspan="10">Không có thiết bị.</td></tr>';
+  pageInfo.textContent=`Trang ${state.page}/${pages} · ${list.length} thiết bị`;
+  selAll.checked=list.length>0&&list.every(x=>state.selected.has(x.kiosk_id));
+  selCount.textContent=state.selected.size?`${state.selected.size} máy đã chọn`:'';
+  const counts={};for(const x of state.fleet){const s=(state.targets[x.kiosk_id]||{}).status||'NONE';counts[s]=(counts[s]||0)+1}
+  const on=state.fleet.filter(x=>x.online).length;
+  kpis.innerHTML=[['Tổng ESP',state.fleet.length],['Online',on],['Offline',state.fleet.length-on]].concat(Object.entries(counts).map(([k,v])=>[STATUS_VI[k]||k,v])).map(([k,v])=>`<div class="ota-kpi"><span class="ota-muted">${esc(k)}</span><b>${v}</b></div>`).join('');
+}
+document.getElementById('rows').addEventListener('change',e=>{const id=e.target.dataset.id;if(!id)return;e.target.checked?state.selected.add(id):state.selected.delete(id);render()});
+selAll.addEventListener('change',()=>{for(const x of filtered()){selAll.checked?state.selected.add(x.kiosk_id):state.selected.delete(x.kiosk_id)}render()});
+for(const el of [fq,fOnline,fProfile,fVersion,fStation,fStatus])el.addEventListener('input',()=>{state.page=1;render()});
+prev.onclick=()=>{state.page=Math.max(1,state.page-1);render()};next.onclick=()=>{state.page++;render()};
+function drawPreview(p){
+  const c=p.counts||{};
+  return `<div><b>Instance:</b> <code>${esc(p.instance_id)}</code> · <b>Release:</b> ${esc(p.release.version)} (${esc(p.release.build_id)})</div>
+  <div><b>Tổng:</b> ${p.total} ESP (online ${p.online}, offline ${p.offline}) · sẽ cập nhật ${(c.QUEUED||0)+(c.WAITING_OFFLINE||0)} · bị chặn ${c.BLOCKED||0}${c.SKIPPED?` · bỏ qua ${c.SKIPPED}`:''}</div>
+  <div><b>Theo profile:</b> ${Object.entries(p.by_profile).map(([k,v])=>`${esc(k)}: ${v.total}${v.target_version?' → '+esc(v.target_version):''}`).join(' · ')}</div>
+  ${p.items.filter(i=>i.blocked_reason&&i.planned_status==='BLOCKED').map(i=>`<div>⛔ ${esc(i.kiosk_name||i.kiosk_id)}: ${esc(i.blocked_reason)}</div>`).join('')}`;
+}
+async function doPreview(ids){
+  if(!releaseSel.value){preview.textContent='Chọn release trước.';return null}
+  const {d}=await api('/api/esp-ota/preview',{method:'POST',json:{release_id:releaseSel.value,kiosk_ids:ids||'all'}});
+  if(!d.ok){preview.textContent=friendlyError(d.error)||d.error;return null}
+  preview.innerHTML=drawPreview(d.preview);return d.preview;
+}
+async function doForce(ids){
+  const p=await doPreview(ids);if(!p)return;
+  const n=(p.counts.QUEUED||0)+(p.counts.WAITING_OFFLINE||0);
+  if(!confirm(`Cập nhật bắt buộc ${n}/${p.total} ESP của instance này lên ${p.release.version}?\nMáy offline sẽ tự nhận khi online lại. ${p.counts.BLOCKED||0} máy bị chặn sẽ không được ghi.`))return;
+  const {d}=await api('/api/esp-ota/force',{method:'POST',json:{release_id:releaseSel.value,kiosk_ids:ids||'all',confirm:true,confirm_total:p.total}});
+  msg(d.ok?`Đã tạo batch ${d.batch.batch_id.slice(0,8)}: ${d.batch.total} máy.`:(d.error==='PREVIEW_STALE'?'Fleet vừa thay đổi — đã xem trước lại, hãy xác nhận lần nữa.':friendlyError(d.error)||d.error));
+  if(d.error==='PREVIEW_STALE'&&d.preview)preview.innerHTML=drawPreview(d.preview);
+  await refresh();
+}
+forceAll.onclick=()=>doForce(null).catch(e=>msg(e.message));
+forceSel.onclick=()=>{if(!state.selected.size){msg('Chọn ít nhất một máy.');return}doForce([...state.selected]).catch(e=>msg(e.message))};
+releaseSel.onchange=()=>{const r=state.releases.find(x=>x.release_id===releaseSel.value);releaseInfo.innerHTML=r?r.artifacts.map(a=>`${esc(a.profile_id)} · ${a.size} B · sha256 ${esc(a.sha256.slice(0,16))}…`).join('<br>'):'';doPreview(null).catch(e=>msg(e.message))};
+releaseForm.addEventListener('submit',async e=>{e.preventDefault();const fd=new FormData(e.target);msg('Đang kiểm tra gói…');
+  try{const r=await fetch(SCRIPT_ROOT+'/api/esp-ota/releases',{method:'POST',body:fd,headers:{'X-CSRF-Token':CSRF}});const d=await r.json();
+    if(!r.ok){msg(friendlyError(d.error)||d.error);return}
+    msg(`Release ${d.release.version} hợp lệ: ${d.release.artifacts.map(a=>a.profile_id).join(', ')}`);e.target.reset();await loadOverview();releaseSel.value=d.release.release_id;releaseSel.onchange();
+  }catch(err){msg(err.message)}});
+assignBtn.onclick=async()=>{if(!state.selected.size||!assignProfile.value){msg('Chọn máy và profile.');return}
+  if(!confirm(`Gán profile ${assignProfile.value} cho ${state.selected.size} máy? Chỉ gán khi đã xác minh phần cứng thật (pin/flash/partition/scanner).`))return;
+  const {d}=await api('/api/esp-ota/devices/profile',{method:'POST',json:{kiosk_ids:[...state.selected],profile_id:assignProfile.value==='__clear__'?'':assignProfile.value}});
+  msg(d.ok?`Đã gán ${d.updated} máy.`:friendlyError(d.error)||d.error);await refresh()};
+retryBtn.onclick=async()=>{const ids=Object.values(state.targets).filter(t=>['FAILED','BLOCKED'].includes(t.status)&&(!state.selected.size||state.selected.has(t.kiosk_id))).map(t=>t.id);
+  if(!ids.length){msg('Không có máy lỗi/bị chặn.');return}
+  const {d}=await api('/api/esp-ota/targets/retry',{method:'POST',json:{target_ids:ids}});msg(`Đã đưa lại ${d.retried} máy vào hàng chờ.`);await refresh()};
+async function refresh(){await loadOverview();await loadTargets();render()}
+refresh().catch(e=>msg(e.message));
+setInterval(()=>{if(document.visibilityState==='visible')Promise.all([loadTargets()]).then(render).catch(()=>{})},5000);
+setInterval(()=>{if(document.visibilityState==='visible')refresh().catch(()=>{})},30000);
 </script>
