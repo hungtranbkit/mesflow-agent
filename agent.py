@@ -5605,6 +5605,7 @@ def _ota_scope():
     if not inst: return None,"MESFLOW_UNAVAILABLE"
     if str(inst.get("state") or "")!="VERIFIED": return None,"INSTANCE_UNVERIFIED"
     res=ota.ensure_instance(inst.get("instance_id"))
+    if not res["ok"]: _instance_cache.update(at=0.0,value=None)  # never keep a refused identity cached
     return (res["bound_instance_id"],None) if res["ok"] else (None,res["reason"])
 
 def _ota_read_scope():
@@ -5627,10 +5628,20 @@ def _ota_device_scope(kiosk_id):
         return None,readiness,(jsonify(update_available=False,ok=False,reason=res.get("reason") or "INSTANCE_UNVERIFIED"),200)
     return res["bound_instance_id"],readiness,None
 
+_last_inventory_error={"code":"MESFLOW_UNAVAILABLE"}
 def _ota_sync_inventory(instance_id):
     payload=_mesflow_internal("/api/internal/kiosks")
-    if not isinstance(payload,dict) or payload.get("instance_id")!=instance_id: return None
+    if not isinstance(payload,dict):
+        _last_inventory_error["code"]="MESFLOW_UNAVAILABLE"; return None
+    if payload.get("instance_id")!=instance_id:
+        # MESFlow now answers for another instance: drop the cached identity so
+        # the next scope check sees it, and never sync a foreign fleet.
+        _instance_cache.update(at=0.0,value=None)
+        _last_inventory_error["code"]="INSTANCE_MISMATCH"; return None
     return ota.sync_fleet(instance_id, payload.get("items") or [])
+
+def _ota_inventory_error():
+    return _ota_error(_last_inventory_error["code"])
 
 def _ota_config(instance_id):
     inst=_mesflow_instance() or {}
@@ -5727,7 +5738,7 @@ def ota_preview():
     if gate:return gate
     iid,err=_ota_scope()
     if not iid:return _ota_error(err)
-    if _ota_sync_inventory(iid) is None:return _ota_error("MESFLOW_UNAVAILABLE")
+    if _ota_sync_inventory(iid) is None:return _ota_inventory_error()
     body,rid,ids=_ota_batch_args()
     try:return jsonify(ok=True,config=_ota_config(iid),preview=ota.preview_batch(iid,rid,ids,force=True))
     except ValueError as exc:return _ota_error(str(exc))
@@ -5739,14 +5750,14 @@ def ota_force_all():
     if gate:return gate
     iid,err=_ota_scope()
     if not iid:return _ota_error(err)
-    if _ota_sync_inventory(iid) is None:return _ota_error("MESFLOW_UNAVAILABLE")
+    if _ota_sync_inventory(iid) is None:return _ota_inventory_error()
     body,rid,ids=_ota_batch_args()
     try:
         preview=ota.preview_batch(iid,rid,ids,force=True)
         if body.get("confirm") is not True or int(body.get("confirm_total") or -1)!=preview["total"]:
             return jsonify(ok=False,error="PREVIEW_STALE",preview=preview),409
         batch=ota.create_batch(iid,rid,ids,force=True,actor=_ota_actor())
-        app.logger.info("OTA_FORCE_BATCH instance=%s batch=%s release=%s total=%s", iid, batch["batch_id"], rid, batch["total"])
+        app.logger.info("OTA_FORCE_BATCH instance=%s batch=%s release=%s total=%s reused=%s", iid, batch["batch_id"], rid, batch["total"], bool(batch.get("reused")))
         return jsonify(ok=True,batch=batch),201
     except ValueError as exc:return _ota_error(str(exc))
 
@@ -5837,7 +5848,7 @@ def ota_upload_and_flash():
         if not ids:return jsonify(ok=True,firmware=release,release=release),201
         iid,err=_ota_scope()
         if not iid:return _ota_error(err)
-        if _ota_sync_inventory(iid) is None:return _ota_error("MESFLOW_UNAVAILABLE")
+        if _ota_sync_inventory(iid) is None:return _ota_inventory_error()
         batch=ota.create_batch(iid,release["release_id"],ids,force=False,actor=_ota_actor())
         return jsonify(ok=True,firmware=release,release=release,job=batch,batch=batch),201
     except ValueError as exc:return _ota_error(str(exc))

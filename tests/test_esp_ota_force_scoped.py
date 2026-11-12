@@ -498,3 +498,18 @@ def test_connect_rolls_back_on_error_and_commits_on_success(ota):
         c.execute("INSERT INTO ota2_meta(key,value,updated_at) VALUES('probe','y',0)")
     with ota._connect() as c:
         assert c.execute("SELECT value FROM ota2_meta WHERE key='probe'").fetchone()[0] == "y"
+
+
+def test_repeated_force_while_waiting_returns_same_batch(ota):
+    rel = _release(ota)
+    _bound(ota, A, [device("K1", profile_id=M910["profile_id"]), device("K2", profile_id=M910["profile_id"], online=False)])
+    first = ota.create_batch(A, rel["release_id"], force=True)
+    again = ota.create_batch(A, rel["release_id"], force=True)
+    assert again["batch_id"] == first["batch_id"] and again.get("reused") is True
+    assert len(ota.list_batches(A)) == 1
+    assert {t["status"] for t in ota.list_targets(A)["items"]} == {"QUEUED", "WAITING_OFFLINE"}
+    # once K1 finished, a new force is a NEW command (re-installs once more)
+    offer = _check(ota, "K1", profile_id=M910["profile_id"])
+    _install(ota, "K1", offer)
+    third = ota.create_batch(A, rel["release_id"], force=True)
+    assert third["batch_id"] != first["batch_id"] and not third.get("reused")

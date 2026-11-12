@@ -195,3 +195,29 @@ def test_rebind_is_only_an_explicit_confirmed_owner_action(env):
     assert r.status_code == 200 and r.get_json()["previous_instance_id"] == A and r.get_json()["cancelled_targets"] == 1
     assert ota.bound_instance() == B
     assert ota.list_targets(A)["items"][0]["status"] == "CANCELLED"
+
+
+def test_inventory_from_another_instance_is_refused_as_mismatch(env):
+    agent, ota, fake, client = env
+    rel = _upload(client)
+    _force(client, rel["release_id"])
+    # MESFlow switches instance while the Agent still holds a cached identity
+    fake.instance = {"instance_id": B, "state": "VERIFIED"}
+    r = client.post("/api/esp-ota/force", headers={"X-CSRF-Token": "c"}, json={"release_id": rel["release_id"], "confirm": True, "confirm_total": 1})
+    assert r.status_code == 409 and r.get_json()["error"] == "INSTANCE_MISMATCH"
+    r = client.post("/api/esp-ota/preview", json={"release_id": rel["release_id"]})
+    assert r.status_code == 409 and r.get_json()["error"] == "INSTANCE_MISMATCH"
+    assert {t["kiosk_id"] for t in ota.list_targets(A)["items"]} == {"K1"} and ota.list_targets(B)["total"] == 0
+
+
+def test_scope_recovers_immediately_when_mesflow_returns_to_bound_instance(env):
+    agent, ota, fake, client = env
+    rel = _upload(client)
+    assert client.post("/api/esp-ota/preview", json={"release_id": rel["release_id"]}).status_code == 200  # binds A
+    fake.instance = {"instance_id": B, "state": "VERIFIED"}
+    agent._instance_cache.update(at=0.0, value=None)
+    r = client.post("/api/esp-ota/preview", json={"release_id": rel["release_id"]})
+    assert r.status_code == 409 and r.get_json()["error"] == "INSTANCE_MISMATCH"
+    fake.instance = {"instance_id": A, "state": "VERIFIED"}
+    r = client.post("/api/esp-ota/preview", json={"release_id": rel["release_id"]})
+    assert r.status_code == 200 and ota.bound_instance() == A

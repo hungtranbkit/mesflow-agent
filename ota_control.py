@@ -673,9 +673,34 @@ def preview_batch(instance_id, release_id, kiosk_ids=None, force=True, allow_dow
             "counts": counts, "by_profile": profiles, "items": plan}
 
 
+def _reusable_batch(c, instance_id, release_id, force, plan):
+    """The still-waiting batch of the same release/mode that already covers
+    every device this command would queue, pinned to the same artifacts."""
+    want = [i for i in plan if i["planned_status"] in WAITING]
+    if not want: return None
+    rows = c.execute(f"""SELECT t.kiosk_id,t.batch_id,t.artifact_id FROM ota2_targets t JOIN ota2_batches b ON b.batch_id=t.batch_id
+        WHERE t.instance_id=? AND b.release_id=? AND b.force=? AND t.status IN {_WAITING_SQL}""",
+                     (instance_id, release_id, 1 if force else 0)).fetchall()
+    open_ = {r["kiosk_id"]: (r["batch_id"], r["artifact_id"]) for r in rows}
+    bids = set()
+    for i in want:
+        o = open_.get(i["kiosk_id"])
+        if not o or o[1] != i["artifact_id"]: return None
+        bids.add(o[0])
+    return bids.pop() if len(bids) == 1 else None
+
+
 def create_batch(instance_id, release_id, kiosk_ids=None, force=True, allow_downgrade=False, actor=""):
     """Snapshot the current fleet (or a selection) into durable per-device targets."""
     init_ota_db(); now = _now(); bid = str(uuid.uuid4())
+    with _tx() as c:
+        plan = _plan(c, instance_id, release_id, kiosk_ids, force, allow_downgrade)
+        reuse = _reusable_batch(c, instance_id, release_id, force, plan)
+    if reuse:
+        # Double submit / repeated click while the same command is still
+        # waiting: return that batch instead of superseding it.
+        b = get_batch(instance_id, reuse); b["reused"] = True
+        return b
     with _tx() as c:
         plan = _plan(c, instance_id, release_id, kiosk_ids, force, allow_downgrade)
         c.execute("INSERT INTO ota2_batches(batch_id,instance_id,release_id,force,allow_downgrade,scope,created_by,created_at) VALUES(?,?,?,?,?,?,?,?)",
