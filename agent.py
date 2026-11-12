@@ -5820,7 +5820,7 @@ def ota_instance_rebind():
     if not inst or inst.get("state")!="VERIFIED": return _ota_error("INSTANCE_UNVERIFIED")
     body=request.get_json(silent=True) or {}
     if str(body.get("confirm_instance_id") or "")!=str(inst.get("instance_id")): return _ota_error("CONFIRMATION_REQUIRED")
-    return jsonify(ok=True,**ota.rebind_instance(inst["instance_id"],_ota_actor()))
+    return jsonify(**ota.rebind_instance(inst["instance_id"],_ota_actor()))
 
 @app.post("/api/esp-ota/upload")
 def ota_upload_and_flash():

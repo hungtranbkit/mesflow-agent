@@ -170,3 +170,28 @@ def test_legacy_bin_upload_is_rejected_and_legacy_job_routes_are_scoped(env):
     batch = _force(client, rel["release_id"])
     assert client.get(f"/api/esp-ota/status/{batch['batch_id']}").status_code == 200
     assert client.get("/api/esp-ota/jobs").get_json()["items"][0]["batch_id"] == batch["batch_id"]
+
+
+def test_rebind_is_only_an_explicit_confirmed_owner_action(env):
+    agent, ota, fake, client = env
+    rel = _upload(client)
+    _force(client, rel["release_id"])
+    # Agent now talks to another MESFlow instance: nothing rebinds implicitly.
+    fake.instance = {"instance_id": B, "state": "VERIFIED"}
+    agent._instance_cache.update(at=0.0, value=None)
+    assert client.post("/api/esp-ota/preview", json={"release_id": rel["release_id"]}).get_json()["error"] == "INSTANCE_MISMATCH"
+    client.get("/api/esp-ota/check?kiosk_id=K1&current_version=5.6.2", headers={"X-Kiosk-Token": "tok-b"})
+    client.get("/api/esp-ota/overview")
+    assert ota.bound_instance() == A
+    # no session / no CSRF / wrong or missing confirmation -> refused, still bound to A
+    anon = agent.app.test_client()
+    assert anon.post("/api/esp-ota/instance/rebind", json={"confirm_instance_id": B}).status_code in (302, 401)  # login gate
+    assert client.post("/api/esp-ota/instance/rebind", json={"confirm_instance_id": B}).status_code == 403
+    r = client.post("/api/esp-ota/instance/rebind", headers={"X-CSRF-Token": "c"}, json={"confirm_instance_id": A})
+    assert r.status_code == 400 and r.get_json()["error"] == "CONFIRMATION_REQUIRED"
+    assert ota.bound_instance() == A
+    # explicit confirmed owner action: bound to B, A's open targets cancelled
+    r = client.post("/api/esp-ota/instance/rebind", headers={"X-CSRF-Token": "c"}, json={"confirm_instance_id": B})
+    assert r.status_code == 200 and r.get_json()["previous_instance_id"] == A and r.get_json()["cancelled_targets"] == 1
+    assert ota.bound_instance() == B
+    assert ota.list_targets(A)["items"][0]["status"] == "CANCELLED"
