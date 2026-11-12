@@ -37,3 +37,4 @@ docker/.env
 *.zip
 *.before-*
 .version-hardening-backup-*/
+.venv/

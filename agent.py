@@ -2653,7 +2653,7 @@ def update_state(fn):
 def logged_in():return bool(session.get("authenticated"))
 @app.before_request
 def protect():
-    if request.endpoint in {"login","forgot_password","local_reset","static","live","health","ota_console","kiosk_ota_page","ota_firmware_list","ota_devices","ota_upload_and_flash","ota_job_status","ota_jobs","ota_cancel_job","ota_device_check","ota_device_download","ota_device_event","api_ops_summary","api_ops_docker","api_ops_logs","api_incidents","api_incident_detail","api_ops_predictions","api_ops_metric_trend","api_incident_ai_analysis","api_incident_notifications","api_notification_channels",
+    if request.endpoint in {"login","forgot_password","local_reset","static","live","health","ota_console","kiosk_ota_page","ota_firmware_list","ota_devices","ota_upload_and_flash","ota_job_status","ota_jobs","ota_cancel_job","ota_device_check","ota_device_download","ota_device_event","ota_overview","ota_assign_profile","ota_release_upload","ota_preview","ota_force_all","ota_targets","ota_target_events","ota_retry","api_ops_summary","api_ops_docker","api_ops_logs","api_incidents","api_incident_detail","api_ops_predictions","api_ops_metric_trend","api_incident_ai_analysis","api_incident_notifications","api_notification_channels",
         "api_ops_db_summary","api_ops_db_backups","api_ops_db_backup_detail","api_ops_restore_drills","api_ops_storage","api_ops_storage_retention_preview","api_ops_db_audit",
         "api_servers_list","api_server_detail","api_server_health","api_server_storage","api_server_backups","api_server_incidents","api_fleet_summary","api_releases",
         "api_recovery_services","api_recovery_service_detail","api_recovery_service_logs","api_recovery_service_ports","api_recovery_preflight","api_recovery_system_check","api_recovery_diagnose","api_recovery_audit",
@@ -2921,7 +2921,10 @@ def mes_status():
     # bare-process install) this still falls through to the full probe
     # exactly as before -- that's the only path able to detect a
     # non-Docker MESFlow at all.
-    docker_confirmed_not_running=docker_state.get("available") and not docker_state.get("running")
+    # Skip only when the MESFlow service itself is confirmed down. A stack whose
+    # database is outside this Compose project (services=["mesflow"]) must still
+    # be probed -- production reported MESFLOW_CONTAINER_NOT_RUNNING while live.
+    docker_confirmed_not_running=bool(docker_state.get("available")) and "mesflow" not in (docker_state.get("services") or [])
     if docker_confirmed_not_running:
         offline=({"ok":False,"error":"MESFLOW_CONTAINER_NOT_RUNNING"},0)
         v,vs=offline;h,hs=offline;ready,readys=offline
@@ -5520,7 +5523,12 @@ def qa_release_manager_promote_production():
     return jsonify(ok=False,error="PRODUCTION_DEPLOY_NOT_IMPLEMENTED",
                     detail=f"Gate passed for QA {version} and explicitly approved, but this Agent build does not execute production deploys yet."),501
 
-# ---------------- Minimal Deploy Agent ESP OTA ----------------
+# ---------------- Deploy Agent ESP OTA (v2: instance-scoped force engine) ----------------
+# MESFlow owns device identity/ownership/heartbeat; this Agent is the ONLY OTA
+# engine. Every query below is scoped to the MESFlow instance this Agent is
+# bound to (ota_control.ensure_instance). The scope is derived from MESFlow
+# (internal token for admin reads, the device's own X-Kiosk-Token for device
+# calls) -- never from a client-supplied instance id, Host or Origin.
 def _ota_admin_token_valid():
     auth=str(request.headers.get("Authorization") or "")
     supplied=auth[7:].strip() if auth.lower().startswith("bearer ") else str(request.headers.get("X-MESFlow-Deploy-Agent-Token") or "").strip()
@@ -5531,51 +5539,124 @@ def _ota_admin_required():
     if logged_in() or _ota_admin_token_valid(): return None
     return jsonify(ok=False,error="AUTH_REQUIRED"),401
 
+def _ota_admin_write_required():
+    """Mutations: admin token, or a login session WITH its CSRF token."""
+    if _ota_admin_token_valid(): return None
+    if not logged_in(): return jsonify(ok=False,error="AUTH_REQUIRED"),401
+    verify_csrf(); return None
+
+def _ota_actor():
+    return "token" if _ota_admin_token_valid() else str(session.get("user") or session.get("username") or "admin")
+
 def _ota_device_kiosk_id():
     token=str(request.headers.get("X-Kiosk-Token") or "").strip()
     kiosk_id=str((request.get_json(silent=True) or {}).get("kiosk_id") or request.args.get("kiosk_id") or "").strip()
-    if not token or not kiosk_id:return None
-    # The Agent never opens MESFlow's database. MESFlow validates this device
-    # token as part of the readiness request below.
+    if not token or not kiosk_id or len(kiosk_id)>80:return None
     return kiosk_id
 
-def _ota_download_url(artifact_id, kiosk_id):
-    """Advertise the externally reachable HTTPS origin to ESP devices."""
+def _ota_download_url(artifact_id, kiosk_id, claim_id=""):
+    """Same-origin download URL. The ESP refuses any other origin before it
+    attaches its X-Kiosk-Token, so a forged Host can never harvest tokens."""
     configured = str(os.environ.get("WORKSHOP_AGENT_PUBLIC_URL") or "").rstrip("/")
-    if configured:
-        return f"{configured}/api/esp-ota/file/{artifact_id}?kiosk_id={quote(kiosk_id, safe='')}"
-    host = request.headers.get("X-Forwarded-Host") or request.host
-    proto = (request.headers.get("X-Forwarded-Proto") or "").split(",", 1)[0].strip()
-    if not proto:
-        proto = "https" if str(host).split(":", 1)[0].endswith("mesflow.net") else request.scheme
-    return f"{proto}://{host}{request.script_root}/api/esp-ota/file/{artifact_id}?kiosk_id={quote(kiosk_id, safe='')}"
+    base = configured or request.url_root.rstrip("/")
+    q=f"kiosk_id={quote(kiosk_id, safe='')}"
+    if claim_id: q+=f"&claim_id={quote(claim_id, safe='')}"
+    return f"{base}/api/esp-ota/file/{quote(artifact_id, safe='')}?{q}"
 
-def _mesflow_readiness(kiosk_id,device_token,include_internal=True):
+def _mesflow_json(path, headers, timeout=5):
+    req=urllib.request.Request(MES_URL+path,headers={"X-Deploy-Agent":"1","User-Agent":"MESFlow-Deploy-Agent-OTA",**headers})
+    # MES_URL is operator configuration (WORKSHOP_MES_URL), never request
+    # input: no SSRF surface. Redirects are not followed with credentials.
+    opener=urllib.request.build_opener(_NoRedirect)
+    with opener.open(req,timeout=timeout) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *a, **k): return None
+
+def _mesflow_readiness(kiosk_id,device_token):
+    """Validate the DEVICE token at MESFlow (no internal bypass) and return the
+    owning instance + instantaneous safety state."""
     path=f"/api/internal/kiosks/{quote(kiosk_id,safe='')}/ota-readiness"
-    req=urllib.request.Request(MES_URL+path,headers={"X-Kiosk-Token":device_token,"X-Deploy-Agent":"1","User-Agent":"MESFlow-Deploy-Agent-OTA"})
-    internal=str(os.environ.get("MESFLOW_INTERNAL_API_TOKEN") or "") if include_internal else ""
-    if internal:req.add_header("X-MESFlow-Internal-Token",internal)
     try:
-        with urllib.request.urlopen(req,timeout=5) as response:
-            payload=json.loads(response.read().decode("utf-8")); return {"available":True,**payload}
+        payload=_mesflow_json(path,{"X-Kiosk-Token":device_token})
+        return {"available":True,**payload}
     except urllib.error.HTTPError as exc:
-        if exc.code in (401,403):
+        if exc.code in (401,403,404):
             return {"available":False,"auth_failed":True,"ota_ready":False,"reason":"AUTH_REQUIRED"}
-        return {"available":False,"ota_ready":False,"reason":"WAITING_MESFLOW_STATE","error":str(exc)}
-    except Exception as exc:
-        return {"available":False,"ota_ready":False,"reason":"WAITING_MESFLOW_STATE","error":str(exc)}
+        return {"available":False,"ota_ready":False,"reason":"WAITING_MESFLOW_STATE"}
+    except Exception:
+        return {"available":False,"ota_ready":False,"reason":"WAITING_MESFLOW_STATE"}
 
-def _mesflow_inventory():
+def _mesflow_internal(path):
     internal=str(os.environ.get("MESFLOW_INTERNAL_API_TOKEN") or "")
     if not internal: return None
-    req=urllib.request.Request(MES_URL+"/api/internal/kiosks",headers={"X-MESFlow-Internal-Token":internal,"X-Deploy-Agent":"1"})
-    try:
-        with urllib.request.urlopen(req,timeout=5) as response:
-            payload=json.loads(response.read().decode("utf-8")); return payload.get("items",payload if isinstance(payload,list) else [])
-    except Exception:return None
+    try: return _mesflow_json(path,{"X-MESFlow-Internal-Token":internal})
+    except Exception: return None
 
-def _device_token_valid(kiosk_id, token):
-    return bool(token and _mesflow_readiness(kiosk_id, token, include_internal=False).get("available"))
+_instance_cache={"at":0.0,"value":None}
+def _mesflow_instance(force=False):
+    now=time.time()
+    if not force and _instance_cache["value"] and now-_instance_cache["at"]<30: return _instance_cache["value"]
+    value=_mesflow_internal("/api/internal/instance")
+    if value: _instance_cache.update(at=now,value=value)
+    return value
+
+def _ota_scope():
+    """(instance_id, None) when MESFlow vouches for the instance this Agent is bound to."""
+    inst=_mesflow_instance()
+    if not inst: return None,"MESFLOW_UNAVAILABLE"
+    if str(inst.get("state") or "")!="VERIFIED": return None,"INSTANCE_UNVERIFIED"
+    res=ota.ensure_instance(inst.get("instance_id"))
+    if not res["ok"]: _instance_cache.update(at=0.0,value=None)  # never keep a refused identity cached
+    return (res["bound_instance_id"],None) if res["ok"] else (None,res["reason"])
+
+def _ota_read_scope():
+    """Reads may fall back to the bound instance during a MESFlow outage."""
+    iid,err=_ota_scope()
+    if iid: return iid,None
+    bound=ota.bound_instance()
+    if bound and err in {"MESFLOW_UNAVAILABLE"}: return bound,err
+    return None,err
+
+def _ota_device_scope(kiosk_id):
+    """Authenticate a device call. Returns (instance_id, readiness, error_response)."""
+    token=str(request.headers.get("X-Kiosk-Token") or "")
+    readiness=_mesflow_readiness(kiosk_id, token)
+    if readiness.get("auth_failed"): return None,readiness,(jsonify(update_available=False,ok=False,error="AUTH_REQUIRED",reason="AUTH_REQUIRED"),401)
+    if not readiness.get("available"): return None,readiness,(jsonify(update_available=False,ok=False,reason="WAITING_MESFLOW_STATE"),200)
+    res=ota.ensure_instance(readiness.get("instance_id"))
+    if not res["ok"] or str(readiness.get("instance_state") or "VERIFIED")!="VERIFIED":
+        app.logger.warning("OTA_SCOPE_REJECT kiosk_id=%s reason=%s", kiosk_id, res.get("reason") or "INSTANCE_UNVERIFIED")
+        return None,readiness,(jsonify(update_available=False,ok=False,reason=res.get("reason") or "INSTANCE_UNVERIFIED"),200)
+    return res["bound_instance_id"],readiness,None
+
+_last_inventory_error={"code":"MESFLOW_UNAVAILABLE"}
+def _ota_sync_inventory(instance_id):
+    payload=_mesflow_internal("/api/internal/kiosks")
+    if not isinstance(payload,dict):
+        _last_inventory_error["code"]="MESFLOW_UNAVAILABLE"; return None
+    if payload.get("instance_id")!=instance_id:
+        # MESFlow now answers for another instance: drop the cached identity so
+        # the next scope check sees it, and never sync a foreign fleet.
+        _instance_cache.update(at=0.0,value=None)
+        _last_inventory_error["code"]="INSTANCE_MISMATCH"; return None
+    return ota.sync_fleet(instance_id, payload.get("items") or [])
+
+def _ota_inventory_error():
+    return _ota_error(_last_inventory_error["code"])
+
+def _ota_config(instance_id):
+    inst=_mesflow_instance() or {}
+    return {"instance_id":instance_id,"bound_instance_id":ota.bound_instance(),"instance_state":inst.get("state",""),
+            "instance_name":inst.get("display_name",""),"mesflow_public_url":inst.get("public_url",""),
+            "agent_public_url":str(os.environ.get("WORKSHOP_AGENT_PUBLIC_URL") or ""),
+            "advertised_ota_agent_url":inst.get("ota_agent_url",""),
+            "max_concurrent":ota.MAX_CONCURRENT,"max_attempts":ota.MAX_ATTEMPTS,"device_poll_seconds":12}
+
+def _ota_error(code,status=None):
+    status=status or (409 if code in {"INSTANCE_MISMATCH","RELEASE_CONFLICT","PROFILE_DEFINITION_CONFLICT","PREVIEW_STALE","INSTANCE_UNVERIFIED"} else 503 if code=="MESFLOW_UNAVAILABLE" else 400)
+    return jsonify(ok=False,error=code),status
 
 @app.get("/ota")
 def ota_console():
@@ -5601,94 +5682,195 @@ def esp_builder_status():
     if not logged_in(): return jsonify(ok=False,error="AUTH_REQUIRED"),401
     return jsonify(ok=True,enabled=ESP_BUILD_ENABLED,source_path=str(ESP_KIOSK_SOURCE_DIR),job=load_state().get("esp_builder_job"))
 
+@app.get("/api/esp-ota/overview")
+def ota_overview():
+    gate=_ota_admin_required()
+    if gate:return gate
+    iid,warn=_ota_read_scope()
+    if not iid:return _ota_error(warn)
+    fleet=(_ota_sync_inventory(iid) if not warn else None) or ota.list_fleet(iid)
+    return jsonify(ok=True,warning=warn or "",config=_ota_config(iid),fleet=fleet,releases=ota.list_releases(20),
+                   profiles=ota.list_profiles(),batches=ota.list_batches(iid,20))
+
 @app.get("/api/esp-ota/devices")
 @app.get("/api/ota/devices")
 def ota_devices():
     gate=_ota_admin_required()
     if gate:return gate
-    items=_mesflow_inventory()
-    if items is None:return jsonify(ok=False,error="MESFLOW_UNAVAILABLE"),503
-    return jsonify(ok=True,items=ota.sync_devices(items))
+    iid,warn=_ota_read_scope()
+    if not iid:return _ota_error(warn)
+    fleet=None if warn else _ota_sync_inventory(iid)
+    if fleet is None and not warn: return _ota_error("MESFLOW_UNAVAILABLE")
+    return jsonify(ok=True,warning=warn or "",instance_id=iid,**(fleet or ota.list_fleet(iid)))
 
-@app.get("/api/esp-ota/status/<job_id>")
-@app.get("/api/ota/status/<job_id>")
-def ota_job_status(job_id):
-    gate=_ota_admin_required()
+@app.post("/api/esp-ota/devices/profile")
+def ota_assign_profile():
+    gate=_ota_admin_write_required()
     if gate:return gate
-    item=ota.get_job(job_id)
-    return (jsonify(ok=True,job=item),200) if item else (jsonify(ok=False,error="NOT_FOUND"),404)
+    iid,err=_ota_scope()
+    if not iid:return _ota_error(err)
+    body=request.get_json(silent=True) or {}
+    try:return jsonify(ok=True,**ota.assign_profile(iid,body.get("kiosk_ids") or [],body.get("profile_id") or ""))
+    except ValueError as exc:return _ota_error(str(exc))
 
-@app.get("/api/esp-ota/jobs")
-def ota_jobs():
-    gate=_ota_admin_required()
+@app.post("/api/esp-ota/releases")
+def ota_release_upload():
+    gate=_ota_admin_write_required()
     if gate:return gate
-    return jsonify(ok=True,items=ota.list_jobs())
+    upload=request.files.get("package") or request.files.get("firmware")
+    if not upload:return _ota_error("OTA_PACKAGE_REQUIRED")
+    try:return jsonify(ok=True,release=ota.save_release_package(upload.stream,upload.filename,_ota_actor())),201
+    except ValueError as exc:return _ota_error(str(exc))
 
-@app.post("/api/esp-ota/jobs/<job_id>/cancel")
-def ota_cancel_job(job_id):
-    if not (_ota_admin_token_valid() or logged_in()):return jsonify(ok=False,error="AUTH_REQUIRED"),401
-    item=ota.cancel_job(job_id)
-    return (jsonify(ok=True,job=item),200) if item else (jsonify(ok=False,error="NOT_FOUND"),404)
-
-@app.post("/api/esp-ota/upload")
-def ota_upload_and_flash():
-    if not (_ota_admin_token_valid() or logged_in()):return jsonify(ok=False,error="AUTH_REQUIRED"),401
-    upload=request.files.get("firmware"); form=request.form
-    if not upload:return jsonify(ok=False,error="OTA_REQUIRED_FIELDS"),400
-    try:
-        if str(upload.filename or "").lower().endswith(".zip"):
-            artifact=ota._save_firmware_package(upload.stream,upload.filename)
-        else:
-            version=str(form.get("version") or "").strip()
-            if not version:return jsonify(ok=False,error="VERSION_REQUIRED"),400
-            hardware=str(form.get("hardware_model") or "").strip()
-            artifact=ota._save_firmware(upload.stream,upload.filename,version,hardware)
-        ids=json.loads(form.get("kiosk_ids") or "[]")
-        job=ota.create_job(artifact,ids)
-        return jsonify(ok=True,firmware=artifact,job=job),201
-    except ValueError as exc:
-        code=str(exc); status=409 if code in {"VERSION_CONFLICT","OTA_ALREADY_RUNNING"} else 400
-        return jsonify(ok=False,error=code),status
-    except Exception as exc:return jsonify(ok=False,error="OTA_UPLOAD_FAILED",message=str(exc)),400
-
+@app.get("/api/esp-ota/releases")
 @app.get("/api/esp-ota/firmware")
 def ota_firmware_list():
     gate=_ota_admin_required()
     if gate:return gate
-    return jsonify(ok=True,items=ota.list_firmware())
+    return jsonify(ok=True,items=ota.list_releases(),profiles=ota.list_profiles())
+
+def _ota_batch_args():
+    body=request.get_json(silent=True) or {}
+    ids=body.get("kiosk_ids")
+    ids=None if ids in (None,"all") else [str(x) for x in ids]
+    return body,str(body.get("release_id") or ""),ids
+
+@app.post("/api/esp-ota/preview")
+def ota_preview():
+    gate=_ota_admin_required()
+    if gate:return gate
+    iid,err=_ota_scope()
+    if not iid:return _ota_error(err)
+    if _ota_sync_inventory(iid) is None:return _ota_inventory_error()
+    body,rid,ids=_ota_batch_args()
+    try:return jsonify(ok=True,config=_ota_config(iid),preview=ota.preview_batch(iid,rid,ids,force=True))
+    except ValueError as exc:return _ota_error(str(exc))
+
+@app.post("/api/esp-ota/force")
+def ota_force_all():
+    """'Cập nhật bắt buộc tất cả ESP của MESFlow này' -- one confirmation."""
+    gate=_ota_admin_write_required()
+    if gate:return gate
+    iid,err=_ota_scope()
+    if not iid:return _ota_error(err)
+    if _ota_sync_inventory(iid) is None:return _ota_inventory_error()
+    body,rid,ids=_ota_batch_args()
+    try:
+        preview=ota.preview_batch(iid,rid,ids,force=True)
+        if body.get("confirm") is not True or int(body.get("confirm_total") or -1)!=preview["total"]:
+            return jsonify(ok=False,error="PREVIEW_STALE",preview=preview),409
+        batch=ota.create_batch(iid,rid,ids,force=True,actor=_ota_actor())
+        app.logger.info("OTA_FORCE_BATCH instance=%s batch=%s release=%s total=%s reused=%s", iid, batch["batch_id"], rid, batch["total"], bool(batch.get("reused")))
+        return jsonify(ok=True,batch=batch),201
+    except ValueError as exc:return _ota_error(str(exc))
+
+@app.get("/api/esp-ota/jobs")
+@app.get("/api/esp-ota/batches")
+def ota_jobs():
+    gate=_ota_admin_required()
+    if gate:return gate
+    iid,err=_ota_read_scope()
+    if not iid:return _ota_error(err)
+    return jsonify(ok=True,items=ota.list_batches(iid))
+
+@app.get("/api/esp-ota/status/<job_id>")
+@app.get("/api/ota/status/<job_id>")
+@app.get("/api/esp-ota/batches/<job_id>")
+def ota_job_status(job_id):
+    gate=_ota_admin_required()
+    if gate:return gate
+    iid,err=_ota_read_scope()
+    if not iid:return _ota_error(err)
+    item=ota.get_batch(iid,job_id)
+    return (jsonify(ok=True,job=item,batch=item),200) if item else (jsonify(ok=False,error="NOT_FOUND"),404)
+
+@app.get("/api/esp-ota/targets")
+def ota_targets():
+    gate=_ota_admin_required()
+    if gate:return gate
+    iid,err=_ota_read_scope()
+    if not iid:return _ota_error(err)
+    a=request.args
+    online={"1":True,"0":False}.get(a.get("online",""))
+    return jsonify(ok=True,**ota.list_targets(iid,batch_id=a.get("batch_id") or None,kiosk_id=a.get("kiosk_id") or None,status=a.get("status") or None,
+                   profile_id=a.get("profile_id") or None,online=online,q=a.get("q") or None,page=a.get("page",1),per_page=a.get("per_page",50)))
+
+@app.get("/api/esp-ota/targets/<int:target_id>/events")
+def ota_target_events(target_id):
+    gate=_ota_admin_required()
+    if gate:return gate
+    iid,err=_ota_read_scope()
+    if not iid:return _ota_error(err)
+    return jsonify(ok=True,items=ota.list_events(iid,target_id))
+
+@app.post("/api/esp-ota/jobs/<job_id>/cancel")
+@app.post("/api/esp-ota/batches/<job_id>/cancel")
+def ota_cancel_job(job_id):
+    gate=_ota_admin_write_required()
+    if gate:return gate
+    iid,err=_ota_read_scope()
+    if not iid:return _ota_error(err)
+    item=ota.cancel_batch(iid,job_id)
+    return (jsonify(ok=True,job=item,batch=item),200) if item else (jsonify(ok=False,error="NOT_FOUND"),404)
+
+@app.post("/api/esp-ota/batches/<job_id>/retry")
+@app.post("/api/esp-ota/targets/retry")
+def ota_retry(job_id=None):
+    gate=_ota_admin_write_required()
+    if gate:return gate
+    iid,err=_ota_scope()
+    if not iid:return _ota_error(err)
+    body=request.get_json(silent=True) or {}
+    ids=body.get("target_ids")
+    return jsonify(ok=True,**ota.retry_targets(iid,batch_id=job_id,target_ids=ids))
+
+@app.post("/api/esp-ota/instance/rebind")
+def ota_instance_rebind():
+    """Explicit owner action after moving this Agent to another MESFlow
+    instance. Cancels every open target of the previous instance."""
+    if not logged_in(): return jsonify(ok=False,error="AUTH_REQUIRED"),401
+    verify_csrf()
+    inst=_mesflow_instance(force=True)
+    if not inst or inst.get("state")!="VERIFIED": return _ota_error("INSTANCE_UNVERIFIED")
+    body=request.get_json(silent=True) or {}
+    if str(body.get("confirm_instance_id") or "")!=str(inst.get("instance_id")): return _ota_error("CONFIRMATION_REQUIRED")
+    return jsonify(**ota.rebind_instance(inst["instance_id"],_ota_actor()))
+
+@app.post("/api/esp-ota/upload")
+def ota_upload_and_flash():
+    """Legacy API: upload a release package and (optionally) queue the
+    selected kiosks (non-force semantics). Same scope rules as v2."""
+    gate=_ota_admin_write_required()
+    if gate:return gate
+    upload=request.files.get("firmware") or request.files.get("package")
+    if not upload:return _ota_error("OTA_REQUIRED_FIELDS")
+    if not str(upload.filename or "").lower().endswith(".zip"):return _ota_error("OTA_RELEASE_PACKAGE_REQUIRED")
+    try:
+        release=ota.save_release_package(upload.stream,upload.filename,_ota_actor())
+        ids=json.loads(request.form.get("kiosk_ids") or "[]")
+        if not ids:return jsonify(ok=True,firmware=release,release=release),201
+        iid,err=_ota_scope()
+        if not iid:return _ota_error(err)
+        if _ota_sync_inventory(iid) is None:return _ota_inventory_error()
+        batch=ota.create_batch(iid,release["release_id"],ids,force=False,actor=_ota_actor())
+        return jsonify(ok=True,firmware=release,release=release,job=batch,batch=batch),201
+    except ValueError as exc:return _ota_error(str(exc))
 
 @app.get("/api/esp-ota/check")
 @app.get("/api/ota/check")
 def ota_device_check():
     kiosk_id=_ota_device_kiosk_id()
     if not kiosk_id:return jsonify(update_available=False,reason="AUTH_REQUIRED"),401
-    token=str(request.headers.get("X-Kiosk-Token") or "")
-    # Validate the device token without the Agent's internal bypass first.
-    # A temporary MESFlow outage must remain a safe WAITING state, not turn a
-    # still-valid pending job into a terminal failure.
-    token_check=_mesflow_readiness(kiosk_id, token, include_internal=False)
-    if token_check.get("auth_failed"): return jsonify(update_available=False,reason="AUTH_REQUIRED"),401
-    if not token_check.get("available"):
-        return jsonify(update_available=False,reason="WAITING_MESFLOW_STATE"),200
-    readiness=_mesflow_readiness(kiosk_id, token)
-    if readiness.get("auth_failed"): return jsonify(update_available=False,reason="AUTH_REQUIRED"),401
-    if not readiness.get("available"):
-        return jsonify(update_available=False,reason="WAITING_MESFLOW_STATE"),200
-    if not ota.readiness_allows_update(readiness):
-        # Leave the job device PENDING. The next normal ESP poll will retry and
-        # will claim the update as soon as the instantaneous readiness is safe.
-        reason=readiness.get("reason") or "WAITING_MESFLOW_STATE"
-        return jsonify(update_available=False,reason=reason,readiness={
-            "online":readiness.get("online"),
-            "ui_state":readiness.get("ui_state"),
-            "offline_queue_count":readiness.get("offline_queue_count"),
-            "health_state":readiness.get("health_state"),
-            "active_session":readiness.get("active_session",False),
-            "ota_ready":False,
-        })
-    result=ota.check_update(kiosk_id,str(request.args.get("current_version") or ""),str(request.args.get("hardware_model") or ""))
+    iid,readiness,err=_ota_device_scope(kiosk_id)
+    if err:return err
+    a=request.args
+    report={"current_version":a.get("current_version",""),"hardware_model":a.get("hardware_model",""),"hardware_profile":a.get("hardware_profile",""),
+            "running_artifact_id":a.get("artifact_id",""),"build_id":a.get("build_id",""),"api":a.get("api","1")}
+    result=ota.device_check(iid,kiosk_id,report,readiness=readiness)
     if result.get("update_available"):
-        result["url"]=_ota_download_url(result["firmware_id"], kiosk_id)
+        result["url"]=_ota_download_url(result["artifact_id"],kiosk_id,result["claim_id"])
+    elif result.get("reason"):
+        result["readiness"]={k:readiness.get(k) for k in ("online","ui_state","offline_queue_count","health_state","active_session")}
     return jsonify(result)
 
 @app.get("/api/ota/firmware/<artifact_id>/download")
@@ -5698,19 +5880,20 @@ def ota_device_download(artifact_id):
     if not kiosk_id:
         app.logger.warning("OTA_DOWNLOAD auth_missing artifact=%s", artifact_id)
         return jsonify(ok=False,error="AUTH_REQUIRED"),401
-    if not _device_token_valid(kiosk_id,str(request.headers.get("X-Kiosk-Token") or "")):
-        app.logger.warning("OTA_DOWNLOAD auth_failed kiosk_id=%s artifact=%s", kiosk_id, artifact_id)
-        return jsonify(ok=False,error="AUTH_REQUIRED"),401
-    row=ota.target_for_download(kiosk_id,artifact_id)
+    iid,_readiness,err=_ota_device_scope(kiosk_id)
+    if err:
+        app.logger.warning("OTA_DOWNLOAD scope_rejected kiosk_id=%s artifact=%s", kiosk_id, artifact_id)
+        return (jsonify(ok=False,error="AUTH_REQUIRED"),401) if err[1]==401 else (jsonify(ok=False,error="OTA_SCOPE_UNAVAILABLE"),403)
+    claim=request.args.get("claim_id")
+    row=ota.target_for_download(iid,kiosk_id,artifact_id,claim if claim else None)
     if not row:
         app.logger.warning("OTA_DOWNLOAD not_assigned kiosk_id=%s artifact=%s", kiosk_id, artifact_id)
         return jsonify(ok=False,error="DOWNLOAD_NOT_ASSIGNED"),403
     path=Path(row["storage_path"])
-    expected_size = row["file_size"] if "file_size" in row.keys() else row["size"]
-    if not path.is_file() or path.stat().st_size!=expected_size:
-        app.logger.error("OTA_DOWNLOAD artifact_invalid kiosk_id=%s artifact=%s path=%s", kiosk_id, artifact_id, path)
+    if not path.is_file() or path.stat().st_size!=row["size"] or hashlib.sha256(path.read_bytes()).hexdigest()!=row["sha256"]:
+        app.logger.error("OTA_DOWNLOAD artifact_invalid kiosk_id=%s artifact=%s", kiosk_id, artifact_id)
         return jsonify(ok=False,error="OTA_ARTIFACT_INVALID"),410
-    app.logger.info("OTA_DOWNLOAD serve kiosk_id=%s job_id=%s artifact=%s bytes=%s", kiosk_id, row["job_id"], artifact_id, expected_size)
+    app.logger.info("OTA_DOWNLOAD serve instance=%s kiosk_id=%s target=%s artifact=%s bytes=%s", iid, kiosk_id, row["target_id"], artifact_id, row["size"])
     return send_file(path,mimetype="application/octet-stream",as_attachment=True,download_name=row["filename"],conditional=True,etag=row["sha256"])
 
 @app.post("/api/esp-ota/event")
@@ -5718,9 +5901,10 @@ def ota_device_download(artifact_id):
 def ota_device_event():
     kiosk_id=_ota_device_kiosk_id()
     if not kiosk_id:return jsonify(ok=False,error="AUTH_REQUIRED"),401
-    if not _device_token_valid(kiosk_id,str(request.headers.get("X-Kiosk-Token") or "")): return jsonify(ok=False,error="AUTH_REQUIRED"),401
-    body=request.get_json(silent=True) or {}; body["kiosk_id"]=kiosk_id
-    return jsonify(ok=True,**ota.record_event(body)),201
+    iid,_readiness,err=_ota_device_scope(kiosk_id)
+    if err:return err
+    body=dict(request.get_json(silent=True) or {})
+    return jsonify(ok=True,**ota.record_device_event(iid,kiosk_id,body)),201
 
 
 # ---------------- Server Operations Console ----------------
