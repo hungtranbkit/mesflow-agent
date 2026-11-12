@@ -7,7 +7,7 @@ STATE = {"instance": "smoke-inst-A"}
 def dev(k, prof, ver, online=True):
     return {"kiosk_id": k, "kiosk_name": k, "station_code": "ST-" + k, "hardware_model": "ES3C28P", "hardware_profile": prof,
             "firmware_version": ver, "firmware_build": "", "firmware_artifact_id": "", "online": online, "ota_capable": True}
-FLEET = {"smoke-inst-A": [dev("K1", M910, "5.6.2"), dev("K2", M910, "5.6.3"), dev("K3", M910, "5.6.2", online=False),
+FLEET = {"smoke-inst-A": [dev("K1", M910, "5.6.2"), dev("K2", M910, os.environ.get("SMOKE_RELEASE_VERSION", "5.6.3")), dev("K3", M910, "5.6.2", online=False),
                           dev("K4", "", "5.6.2"), dev("K5", LINUX, "5.6.0"), dev("DUP", M910, "5.6.2")],
          "smoke-inst-B": [dev("DUP", M910, "5.6.2")]}
 # device token -> (kiosk_id, owning instance). DUP exists in both instances.

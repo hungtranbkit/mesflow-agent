@@ -2,6 +2,10 @@
 Not staging, not hardware: proves server behaviour only. Never prints secrets."""
 import hashlib, http.cookiejar, json, os, re, sys, urllib.error, urllib.parse, urllib.request, uuid
 BASE, FAKE, PKG = sys.argv[1], sys.argv[2], sys.argv[3]
+import zipfile
+with zipfile.ZipFile(PKG) as _z:
+    _rel = json.loads(_z.read("release.json")); _art = _rel["artifacts"][0]
+    VER = _rel["version"]; EXPECT_SHA = hashlib.sha256(_z.read(_art["path"])).hexdigest()
 ADMIN = {"Authorization": "Bearer " + os.environ["SMOKE_ADMIN_TOKEN"]}
 TOK = {k: os.environ["SMOKE_TOK_" + k] for k in ("K1", "K2", "K3", "DUP", "DUPB")}
 M910 = "es3c28p-n16r8-m910-gm65uart1"
@@ -32,7 +36,7 @@ def dev_check(kid, tok, ver, prof=M910, art=""):
     return req("GET", "/api/esp-ota/check?" + q, headers={"X-Kiosk-Token": tok})
 def event(kid, tok, offer, status, **extra):
     body = {"kiosk_id": kid, "status": status, "firmware_id": offer["artifact_id"], "target_id": offer["target_id"], "claim_id": offer["claim_id"],
-            "to_version": offer.get("version") or "5.6.3", "client_event_id": uuid.uuid4().hex, **extra}
+            "to_version": offer.get("version") or VER, "client_event_id": uuid.uuid4().hex, **extra}
     return req("POST", "/api/esp-ota/event", body, {"X-Kiosk-Token": tok})
 def local(url):  # the advertised (public) origin is fixed by config; fetch the same path locally
     return "/api/esp-ota/file/" + url.split("/api/esp-ota/file/", 1)[1]
@@ -49,10 +53,10 @@ c, b = req("GET", "/api/esp-ota/overview", headers=ADMIN)
 check("overview bound to MESFlow instance A", c == 200 and json.dumps(b).count("smoke-inst-A") > 0, f"{c} {str(b)[:160]}")
 with open(PKG, "rb") as f: zipdata = f.read()
 c, b = req("POST", "/api/esp-ota/releases", headers=ADMIN, multipart=(os.path.basename(PKG), zipdata))
-check("upload real ec60eed release accepted", c == 201, f"{c} {str(b)[:200]}")
+check("upload real release accepted", c == 201, f"{c} {str(b)[:200]}")
 rel = b.get("release") or {}; rid = rel.get("release_id")
 arts = rel.get("artifacts") or []
-check("release has exactly the M910 artifact, sha 2bf1475b...", len(arts) == 1 and arts[0].get("sha256", "").startswith("2bf1475b") and arts[0].get("profile_id") == M910, str(arts)[:200])
+check(f"release has exactly the M910 artifact, sha {EXPECT_SHA[:8]}...", len(arts) == 1 and arts[0].get("sha256", "") == EXPECT_SHA and arts[0].get("profile_id") == M910, str(arts)[:200])
 
 # 1. preview: server-side fleet, offline + blocked counts
 c, b = req("POST", "/api/esp-ota/preview", {"release_id": rid}, ADMIN); p = b.get("preview") or {}
@@ -62,7 +66,7 @@ check("preview online/offline counts 5/1", p.get("online") == 5 and p.get("offli
 check("preview counts QUEUED3 WAITING_OFFLINE1 BLOCKED2", p.get("counts") == {"QUEUED": 3, "WAITING_OFFLINE": 1, "BLOCKED": 2}, str(p.get("counts")))
 check("K4 without profile blocked PROFILE_REQUIRED (no latest fallback)", items.get("K4", {}).get("blocked_reason") == "PROFILE_REQUIRED")
 check("Kiosk Linux K5 blocked INCOMPATIBLE_FIRMWARE (no cross-profile binary)", items.get("K5", {}).get("blocked_reason") == "INCOMPATIBLE_FIRMWARE")
-check("K2 already on 5.6.3 is still QUEUED under force", items.get("K2", {}).get("planned_status") == "QUEUED")
+check("K2 already on the release version is still QUEUED under force", items.get("K2", {}).get("planned_status") == "QUEUED")
 
 # 2. one confirmation, matching preview
 c, b = req("POST", "/api/esp-ota/force", {"release_id": rid, "confirm": True, "confirm_total": 99}, ADMIN)
@@ -84,14 +88,14 @@ check("K1 after BOOT_NEW_VERSION is VERIFYING, not SUCCESS", t["items"][0]["stat
 event("K1", TOK["K1"], offer, "OTA_HEALTHCHECK_OK", hardware_profile=M910)
 c, t = req("GET", "/api/esp-ota/targets?kiosk_id=K1", headers=ADMIN)
 check("K1 SUCCESS only after HEALTHCHECK_OK for pinned artifact", t["items"][0]["status"] == "SUCCESS")
-c, again = dev_check("K1", TOK["K1"], "5.6.3", art=offer["artifact_id"])
+c, again = dev_check("K1", TOK["K1"], VER, art=offer["artifact_id"])
 check("K1 not offered again after SUCCESS", again.get("update_available") is False, str(again)[:120])
 
-# 4. force same version installs exactly once (K2 already 5.6.3)
-ok_dl, offer2 = install("K2", TOK["K2"], "5.6.3")
+# 4. force same version installs exactly once (K2 already on the release version)
+ok_dl, offer2 = install("K2", TOK["K2"], VER)
 check("K2 (same version) offered once under force", bool(offer2.get("update_available")) and ok_dl)
 event("K2", TOK["K2"], offer2, "OTA_HEALTHCHECK_OK", hardware_profile=M910)
-c, again = dev_check("K2", TOK["K2"], "5.6.3", art=offer2["artifact_id"])
+c, again = dev_check("K2", TOK["K2"], VER, art=offer2["artifact_id"])
 check("K2 same-version not reinstalled after SUCCESS", again.get("update_available") is False)
 
 # 5. device-id collision across instances
