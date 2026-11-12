@@ -32,7 +32,7 @@ jobs:
           T=$(mktemp -d)
           WORKSHOP_AGENT_HOME="$T/home" python -m pytest -q -p no:cacheprovider --basetemp="$T/bt" -rfE \
             tests/test_esp_ota_force_scoped.py tests/test_esp_ota_routes_scoped.py \
-            tests/test_ota_readiness_gate.py tests/test_ota_package_upload.py tests/test_it_operations_ui.py \
+            tests/test_ota_readiness_gate.py tests/test_ota_package_upload.py tests/test_it_operations_ui.py tests/test_mes_status_partial_compose.py \
             2>&1 | tee ota-gate.log
       - name: No credentials in test output
         run: |

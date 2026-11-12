@@ -2921,7 +2921,10 @@ def mes_status():
     # bare-process install) this still falls through to the full probe
     # exactly as before -- that's the only path able to detect a
     # non-Docker MESFlow at all.
-    docker_confirmed_not_running=docker_state.get("available") and not docker_state.get("running")
+    # Skip only when the MESFlow service itself is confirmed down. A stack whose
+    # database is outside this Compose project (services=["mesflow"]) must still
+    # be probed -- production reported MESFLOW_CONTAINER_NOT_RUNNING while live.
+    docker_confirmed_not_running=bool(docker_state.get("available")) and "mesflow" not in (docker_state.get("services") or [])
     if docker_confirmed_not_running:
         offline=({"ok":False,"error":"MESFLOW_CONTAINER_NOT_RUNNING"},0)
         v,vs=offline;h,hs=offline;ready,readys=offline
