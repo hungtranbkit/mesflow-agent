@@ -900,6 +900,13 @@ def target_for_download(instance_id, kid, artifact_id, claim_id=None):
 BOOT_EVENTS = {"OTA_BOOT_NEW_VERSION", "OTA_HEALTHCHECK_OK", "OTA_BOOT_OK"}
 
 
+def _boot_identity_matches(target, body, artifact):
+    return (artifact == target["artifact_id"]
+            and str(body.get("to_version") or "") == target["target_version"]
+            and str(body.get("build_id") or "") == target["target_build"]
+            and str(body.get("hardware_profile") or "") == target["profile_id"])
+
+
 def record_device_event(instance_id, kid, body):
     init_ota_db(); now = _now(); body = body or {}
     event = str(body.get("status") or body.get("event") or "").upper().strip()[:48]
@@ -911,8 +918,17 @@ def record_device_event(instance_id, kid, body):
     fw = str(body.get("firmware_id") or body.get("artifact_id") or "").strip()
     applied, new_status, tid = False, "", None
     with _tx() as c:
-        if client and c.execute("SELECT 1 FROM ota2_events WHERE instance_id=? AND kiosk_id=? AND client_event_id=?", (instance_id, kid, client)).fetchone():
-            return {"applied": False, "duplicate": True}
+        # A successful ACK response can be lost. Confirm only that exact,
+        # already-completed target; never apply the replay to a newer batch.
+        if event in ("OTA_HEALTHCHECK_OK", "OTA_BOOT_OK") and body.get("target_id"):
+            done = c.execute("SELECT * FROM ota2_targets WHERE instance_id=? AND kiosk_id=? AND id=? AND status='SUCCESS'",
+                             (instance_id, kid, body["target_id"])).fetchone()
+            if done and _boot_identity_matches(done, body, fw):
+                return {"applied": True, "duplicate": True, "status": "SUCCESS"}
+        previous = c.execute("SELECT applied FROM ota2_events WHERE instance_id=? AND kiosk_id=? AND client_event_id=?",
+                             (instance_id, kid, client)).fetchone() if client else None
+        if previous:
+            return {"applied": bool(previous["applied"]), "duplicate": True}
         t = _open_target(c, instance_id, kid)
         stale = not t
         if t:
@@ -921,10 +937,7 @@ def record_device_event(instance_id, kid, body):
             if body.get("claim_id") and t["claim_id"] and str(body["claim_id"]) != t["claim_id"]: stale = True
             if fw and fw != t["artifact_id"]: stale = True
             if event in BOOT_EVENTS:
-                if fw != t["artifact_id"]: stale = True
-                if body.get("to_version") and str(body["to_version"]) != t["target_version"]: stale = True
-                if body.get("build_id") and str(body["build_id"]) != t["target_build"]: stale = True
-                if body.get("hardware_profile") and str(body["hardware_profile"]) != t["profile_id"]: stale = True
+                if not _boot_identity_matches(t, body, fw): stale = True
         if not stale:
             if event in ("OTA_WAITING_IDLE", "OTA_BLOCKED_TRANSACTION") and st in WAITING:
                 reason = error or ("BLOCKED_TRANSACTION" if event == "OTA_BLOCKED_TRANSACTION" else "") or detail or "DEVICE_BUSY"

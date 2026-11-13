@@ -112,7 +112,8 @@ def test_device_check_download_event_end_to_end_same_origin(env):
     assert dl.status_code == 200 and len(dl.data) == offer["size"]
     for e in ("OTA_DOWNLOAD_START", "OTA_DOWNLOAD_COMPLETE", "OTA_REBOOTING", "OTA_BOOT_NEW_VERSION", "OTA_HEALTHCHECK_OK"):
         ev = client.post("/api/esp-ota/event", headers=h, json={"kiosk_id": "K1", "status": e, "firmware_id": offer["artifact_id"],
-                                                               "to_version": "5.6.3", "target_id": offer["target_id"], "claim_id": offer["claim_id"]})
+                                                               "to_version": "5.6.3", "target_id": offer["target_id"], "claim_id": offer["claim_id"],
+                                                               "build_id": offer["build"], "hardware_profile": offer["hardware_profile"]})
         assert ev.status_code == 201
     t = client.get("/api/esp-ota/targets").get_json()["items"][0]
     assert t["status"] == "SUCCESS"

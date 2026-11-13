@@ -32,11 +32,11 @@ def req(method, path, body=None, headers=None, raw=False, base=BASE, multipart=N
     try: return code, json.loads(payload or b"{}")
     except Exception: return code, {"_raw": payload[:200].decode("utf-8", "replace")}
 def dev_check(kid, tok, ver, prof=M910, art=""):
-    q = urllib.parse.urlencode({"kiosk_id": kid, "current_version": ver, "hardware_model": "ES3C28P", "hardware_profile": prof, "firmware_artifact_id": art, "api": 2})
+    q = urllib.parse.urlencode({"kiosk_id": kid, "current_version": ver, "hardware_model": "ES3C28P", "hardware_profile": prof, "artifact_id": art, "api": 2})
     return req("GET", "/api/esp-ota/check?" + q, headers={"X-Kiosk-Token": tok})
 def event(kid, tok, offer, status, **extra):
     body = {"kiosk_id": kid, "status": status, "firmware_id": offer["artifact_id"], "target_id": offer["target_id"], "claim_id": offer["claim_id"],
-            "to_version": offer.get("version") or VER, "client_event_id": uuid.uuid4().hex, **extra}
+            "to_version": offer.get("version") or VER, "build_id": offer["build"], "hardware_profile": offer["hardware_profile"], "client_event_id": uuid.uuid4().hex, **extra}
     return req("POST", "/api/esp-ota/event", body, {"X-Kiosk-Token": tok})
 def local(url):  # the advertised (public) origin is fixed by config; fetch the same path locally
     return "/api/esp-ota/file/" + url.split("/api/esp-ota/file/", 1)[1]

@@ -379,6 +379,10 @@ def test_legacy_firmware_flow_without_profile_reporting(ota):
         ota.record_device_event(A, "LEG", {"status": e, "firmware_id": offer["firmware_id"], "to_version": "5.6.3"})
     ota.record_device_event(A, "LEG", {"status": "OTA_BOOT_NEW_VERSION", "firmware_id": offer["firmware_id"], "to_version": "5.6.3"})
     ota.record_device_event(A, "LEG", {"status": "OTA_HEALTHCHECK_OK", "firmware_id": offer["firmware_id"], "to_version": "5.6.3"})
+    assert _target(ota, "LEG")["status"] == "REBOOTING"  # old image cannot prove new build
+    # New image has compile-time identity even when legacy NVS has no claim/target.
+    ota.record_device_event(A, "LEG", {"status": "OTA_HEALTHCHECK_OK", "firmware_id": offer["firmware_id"],
+        "to_version": offer["version"], "build_id": offer["build"], "hardware_profile": offer["hardware_profile"]})
     assert _target(ota, "LEG")["status"] == "SUCCESS"
 
 
@@ -513,3 +517,49 @@ def test_repeated_force_while_waiting_returns_same_batch(ota):
     _install(ota, "K1", offer)
     third = ota.create_batch(A, rel["release_id"], force=True)
     assert third["batch_id"] != first["batch_id"] and not third.get("reused")
+
+@pytest.mark.parametrize('missing', ['build_id', 'hardware_profile', 'to_version'])
+def test_boot_ack_requires_running_identity(ota, missing):
+    rel = _release(ota, profiles=(M910,))
+    _bound(ota, A, [device('K', profile_id=M910['profile_id'])])
+    ota.create_batch(A, rel['release_id'])
+    offer = _check(ota, 'K', profile_id=M910['profile_id'])
+    ota.target_for_download(A, 'K', offer['artifact_id'], offer['claim_id'])
+    _ev(ota, 'K', 'OTA_REBOOTING', offer)
+    body = dict(status='OTA_HEALTHCHECK_OK', firmware_id=offer['artifact_id'],
+                target_id=offer['target_id'], claim_id=offer['claim_id'],
+                to_version=offer['version'], build_id=offer['build'], hardware_profile=offer['hardware_profile'])
+    del body[missing]
+    assert ota.record_device_event(A, 'K', body)['applied'] is False
+    assert _target(ota, 'K')['status'] == 'REBOOTING'
+
+
+def test_success_ack_retry_after_response_loss_is_confirmed_without_touching_next_batch(ota):
+    rel = _release(ota, profiles=(M910,))
+    _bound(ota, A, [device('K', profile_id=M910['profile_id'])])
+    ota.create_batch(A, rel['release_id'])
+    offer = _check(ota, 'K', profile_id=M910['profile_id'])
+    _install(ota, 'K', offer)
+    ota.create_batch(A, rel['release_id'], force=True)
+    result = _ev(ota, 'K', 'OTA_HEALTHCHECK_OK', offer,
+                 build_id=offer['build'], hardware_profile=offer['hardware_profile'])
+    assert result['applied'] is True and result['duplicate'] is True
+    assert _target(ota, 'K')['status'] == 'QUEUED'
+    bad = _ev(ota, 'K', 'OTA_HEALTHCHECK_OK', offer,
+              build_id='wrong-image', hardware_profile=offer['hardware_profile'])
+    assert bad['applied'] is False
+
+
+def test_lost_rollback_response_retry_confirms_prior_event(ota):
+    rel = _release(ota, profiles=(M910,))
+    _bound(ota, A, [device('K', profile_id=M910['profile_id'])])
+    ota.create_batch(A, rel['release_id'])
+    offer = _check(ota, 'K', profile_id=M910['profile_id'])
+    ota.target_for_download(A, 'K', offer['artifact_id'], offer['claim_id'])
+    _ev(ota, 'K', 'OTA_REBOOTING', offer)
+    first = _ev(ota, 'K', 'OTA_ROLLBACK', offer, client_event_id='stable-boot-event')
+    assert first['applied'] is True
+    before = _target(ota, 'K')
+    retry = _ev(ota, 'K', 'OTA_ROLLBACK', offer, client_event_id='stable-boot-event')
+    assert retry['duplicate'] is True and retry['applied'] is True
+    assert _target(ota, 'K') == before
