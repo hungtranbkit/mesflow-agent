@@ -54,7 +54,12 @@ def test_release_deploy_tab_never_shows_the_next_action_stage_twice():
     # A fresh install's Next Action is Build (nothing built yet) -- the
     # real bug: "Build Release" rendered as both the primary button
     # (mesNextBuild) and again inside "Thao tác khác" (releaseBuildButton).
-    with patch.object(agent,"_release_contamination",return_value={"contaminated":False}):
+    # Other integration tests persist terminal job states in the shared
+    # WORKSHOP_AGENT_HOME. Give this fresh-install scenario its own empty
+    # in-memory state so test order cannot make a prior SUCCESS look like a
+    # release built by this scenario.
+    with patch.object(agent,"load_state",return_value={"job":None,"history":[]}), \
+         patch.object(agent,"_release_contamination",return_value={"contaminated":False}):
         body=authenticated_client().get("/releases?tab=deploy").get_data(as_text=True)
     assert 'id="mesNextBuild"' in body
     assert 'id="releaseBuildButton"' not in body
