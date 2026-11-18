@@ -46,10 +46,15 @@ def throwaway_container():
     try:
         deadline = time.time() + 30
         ready = False
+        consecutive_ready = 0
         while time.time() < deadline:
             if _docker("exec", name, "pg_isready", "-U", "mesflow").returncode == 0:
-                ready = True
-                break
+                consecutive_ready += 1
+                if consecutive_ready >= 2:
+                    ready = True
+                    break
+            else:
+                consecutive_ready = 0
             time.sleep(1)
         if not ready:
             pytest.skip("throwaway postgres never became ready")
