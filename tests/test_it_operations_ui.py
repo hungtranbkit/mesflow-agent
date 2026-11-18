@@ -54,7 +54,12 @@ def test_release_deploy_tab_never_shows_the_next_action_stage_twice():
     # A fresh install's Next Action is Build (nothing built yet) -- the
     # real bug: "Build Release" rendered as both the primary button
     # (mesNextBuild) and again inside "Thao tác khác" (releaseBuildButton).
-    with patch.object(agent,"_release_contamination",return_value={"contaminated":False}):
+    # Other integration tests persist terminal job states in the shared
+    # WORKSHOP_AGENT_HOME. Give this fresh-install scenario its own empty
+    # in-memory state so test order cannot make a prior SUCCESS look like a
+    # release built by this scenario.
+    with patch.object(agent,"load_state",return_value={"job":None,"history":[]}), \
+         patch.object(agent,"_release_contamination",return_value={"contaminated":False}):
         body=authenticated_client().get("/releases?tab=deploy").get_data(as_text=True)
     assert 'id="mesNextBuild"' in body
     assert 'id="releaseBuildButton"' not in body
@@ -95,8 +100,10 @@ def test_kiosk_ota_workspace_reuses_existing_ota_contracts():
     body=response.get_data(as_text=True)
     assert response.status_code==200
     assert "ESP Kiosk" in body and "OTA" in body
-    for path in ("/api/esp-ota/devices","/api/esp-ota/jobs","/api/esp-ota/upload"):
+    # v2 scoped flow: overview -> release upload -> preview -> one forced batch
+    for path in ("/api/esp-ota/overview","/api/esp-ota/targets","/api/esp-ota/releases","/api/esp-ota/preview","/api/esp-ota/force"):
         assert path in body
+    assert "Cập nhật bắt buộc tất cả ESP của MESFlow này" in body
 
 
 def test_unknown_operations_view_falls_back_safely():
@@ -251,6 +258,6 @@ def test_kiosk_pages_are_now_real_separate_routes():
     tutorial=authenticated_client().get("/kiosk/tutorial").get_data(as_text=True)
     assert overview.status_code==200
     assert 'data-local-tab' not in ota
-    assert 'id="devices"' in ota and 'id="flashForm"' in ota
+    assert 'id="devices"' in ota and 'id="releaseForm"' in ota and 'id="forceAll"' in ota
     assert 'id="espBuildButton"' in firmware
     assert 'id="espTutorialUploadForm"' in tutorial

@@ -12,7 +12,6 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"; cd "$ROOT"
 die(){ echo "ERROR: $*" >&2; exit 1; }
 
 # --- 1. source preflight ---
-command -v docker >/dev/null || die "DOCKER_NOT_FOUND"
 for f in agent.py VERSION.txt docker/Dockerfile; do
   [[ -f "$ROOT/$f" ]] || die "SOURCE_PREFLIGHT_FAILED: missing $f"
 done
@@ -35,6 +34,9 @@ dist="$ROOT/../artifacts/deploy-agent/releases/${agent_version}"
 if [[ -f "$dist/agent-release.json" ]]; then
   die "VERSION_ALREADY_RELEASED: artifacts/deploy-agent/releases/${agent_version}/agent-release.json already exists (frozen). A version may be built only once. Bump VERSION.txt to a new version and rebuild."
 fi
+
+# Defer Docker detection until source/version preflight has reported deterministic errors.
+command -v docker >/dev/null || die "DOCKER_NOT_FOUND"
 
 # --- 3. tests ---
 # Isolated WORKSHOP_AGENT_HOME (never the real workspace state) -- same

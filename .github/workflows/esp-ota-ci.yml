@@ -1,0 +1,73 @@
+name: Agent CI
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: agent-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  PYTHON_VERSION: "3.13"   # same as docker/Dockerfile (python:3.13-alpine)
+
+jobs:
+  esp-ota-gate:
+    name: ESP OTA gate (scope/force/profile resolver/FD @ soft 1024)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - run: python -m pip install -r requirements.txt pytest==9.2.0
+      - name: OTA suites under soft RLIMIT_NOFILE=1024, isolated tmp
+        run: |
+          set -o pipefail
+          ulimit -Sn 1024; echo "soft nofile=$(ulimit -Sn)"
+          T=$(mktemp -d)
+          WORKSHOP_AGENT_HOME="$T/home" python -m pytest -q -p no:cacheprovider --basetemp="$T/bt" -rfE \
+            tests/test_esp_ota_force_scoped.py tests/test_esp_ota_routes_scoped.py \
+            tests/test_ota_readiness_gate.py tests/test_ota_package_upload.py tests/test_it_operations_ui.py tests/test_mes_status_partial_compose.py \
+            2>&1 | tee ota-gate.log
+      - name: No credentials in test output
+        run: |
+          if grep -E -i '(X-Kiosk-Token|X-MESFlow-Internal-Token|Authorization|password)["'"'"']?[:=] *["'"'"']?[A-Za-z0-9+/_-]{6,}' ota-gate.log; then
+            echo "credential-like value in log"; exit 1; fi
+
+  full-suite:
+    name: Full suite (workspace layout with sibling repos)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with: { path: ws/deploy-agent }
+      - uses: actions/checkout@v4
+        with: { repository: hungtranbkit/mesflow, path: ws/mesflow }
+      - uses: actions/checkout@v4
+        with: { repository: hungtranbkit/mesflow-qa-center, path: ws/qa-center }
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - run: python -m pip install -r ws/deploy-agent/requirements.txt pytest==9.2.0
+      - name: Full suite under soft RLIMIT_NOFILE=1024
+        working-directory: ws/deploy-agent
+        # The one deselected test reads <workspace>/artifacts/releases/TEMPLATE/PROMOTION.json,
+        # a release-runtime directory that is not in any repository; it is reported
+        # as NOT VERIFIED in the release checklist, never counted as passed.
+        run: |
+          ulimit -Sn 1024
+          T=$(mktemp -d)
+          WORKSHOP_AGENT_HOME="$T/home" python -m pytest -q -p no:cacheprovider --basetemp="$T/bt" -rfE \
+            --ignore=tests/browser \
+            --deselect tests/test_promotion_metadata_v2154.py::test_promotion_template_contains_no_credential_and_starts_unverified \
+            --junitxml="$GITHUB_WORKSPACE/agent-junit.xml"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: agent-junit
+          path: agent-junit.xml
